@@ -1,4 +1,4 @@
-import { StrictMode, useRef, useState } from 'react';
+import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 import logoUrl from './assets/novamind-logo.png';
@@ -10,6 +10,7 @@ import AuditWorkspace from './AuditWorkspace.jsx';
 import DiagnosticsWorkspace from './DiagnosticsWorkspace.jsx';
 import CustomerPortal from './CustomerPortal.jsx';
 import { createApi } from './api.js';
+import { applyTheme, readThemePreference, resolveTheme, storeThemePreference } from './theme.js';
 
 // Internal staff views — never shown to CUSTOMER role.
 const staffViews = [
@@ -33,6 +34,26 @@ const staffViews = [
     icon: 'M3 12h4l3-7 4 14 3-7h4' },
 ];
 
+const themeOptions = [
+  { id: 'light', label: 'Light', icon: 'M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z' },
+  { id: 'dark', label: 'Dark', icon: 'M20 15.3A8 8 0 0 1 8.7 4 8 8 0 1 0 20 15.3z' },
+  { id: 'system', label: 'System', icon: 'M4 5h16v11H4zM9 20h6M12 16v4' },
+];
+
+function ThemeSwitcher({ value, onChange }) {
+  return <div className="theme-switcher" role="group" aria-label="Color theme">
+    {themeOptions.map((option) => <button key={option.id} type="button"
+      className="theme-option" aria-pressed={value === option.id}
+      title={`${option.label} theme`} onClick={() => onChange(option.id)}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
+        strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d={option.icon} />
+      </svg>
+      <span>{option.label}</span>
+    </button>)}
+  </div>;
+}
+
 function App() {
   const [health, setHealth] = useState('idle');
   const [activeView, setActiveView] = useState('cases');
@@ -40,6 +61,9 @@ function App() {
   const [sessionVersion, setSessionVersion] = useState(0);
   const [identityStatus, setIdentityStatus] = useState('signed-out');
   const [identityMessage, setIdentityMessage] = useState('Enter your existing local access token to confirm your identity.');
+  const [themePreference, setThemePreference] = useState(() => readThemePreference());
+  const [systemDark, setSystemDark] = useState(() => globalThis.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const identityClient = useRef(null);
 
   // Derive whether this session is a customer; drives what is shown/hidden.
@@ -47,6 +71,23 @@ function App() {
 
   // Staff view state — only relevant when not a customer.
   const view = staffViews.find((entry) => entry.id === activeView) ?? staffViews[0];
+
+  useEffect(() => {
+    const query = globalThis.matchMedia?.('(prefers-color-scheme: dark)');
+    if (!query) return undefined;
+    const update = (event) => setSystemDark(event.matches);
+    query.addEventListener?.('change', update);
+    return () => query.removeEventListener?.('change', update);
+  }, []);
+
+  useEffect(() => {
+    storeThemePreference(themePreference);
+    applyTheme(resolveTheme(themePreference, systemDark));
+  }, [themePreference, systemDark]);
+
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [activeView, isCustomer]);
 
   function clearIdentity() {
     identityClient.current?.dispose();
@@ -129,25 +170,25 @@ function App() {
       <a className="skip-link" href="#workspace">Skip to workspace</a>
 
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="sidebar" aria-label="Workspace navigation">
+      <aside className={`sidebar${mobileNavOpen ? ' sidebar--open' : ''}`} aria-label="Workspace navigation">
 
-        {/* Brand / logo — vertical stack: logo → title → subtitle */}
-        <a className="brand" href="#workspace" aria-label="NovaMind AI — go to workspace">
-          <img
-            src={logoUrl}
-            alt="NovaMind AI logo"
-            className="brand-logo"
-            width="130"
-            height="65"
-          />
-          <span className="brand-text">
-            NovaMind <span className="brand-ai">AI</span>
-            <span className="brand-caption">Customer resolution</span>
-          </span>
-        </a>
+        <div className="sidebar-head">
+          <a className="brand" href="#workspace" aria-label="NovaMind AI — go to workspace">
+            <img src={logoUrl} alt="NovaMind AI" className="brand-logo" width="130" height="65" />
+          </a>
+          <button type="button" className="mobile-nav-toggle" aria-expanded={mobileNavOpen}
+            aria-controls="workspace-navigation" onClick={() => setMobileNavOpen((open) => !open)}>
+            <span className="sr-only">{mobileNavOpen ? 'Close navigation' : 'Open navigation'}</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+              strokeLinecap="round" aria-hidden="true">
+              {mobileNavOpen ? <path d="M6 6l12 12M18 6 6 18" /> : <path d="M4 7h16M4 12h16M4 17h16" />}
+            </svg>
+          </button>
+        </div>
 
         {/* Navigation */}
-        <nav className="workspace-nav" aria-label="Main navigation">
+        <nav id="workspace-navigation" className={`workspace-nav${mobileNavOpen ? ' workspace-nav--open' : ''}`}
+          aria-label="Main navigation">
           {isCustomer ? (
             <>
               <p className="nav-label">My account</p>
@@ -170,7 +211,7 @@ function App() {
                   <button key={entry.id} type="button" className="nav-item"
                     aria-current={activeView === entry.id ? 'page' : undefined}
                     aria-controls="workspace"
-                    onClick={() => setActiveView(entry.id)}>
+                    onClick={() => { setActiveView(entry.id); setMobileNavOpen(false); }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"
                       strokeLinejoin="round" strokeLinecap="round" aria-hidden="true">
                       <path d={entry.icon} />
@@ -202,9 +243,9 @@ function App() {
             </div>
           </div>
 
-          {/* Attribution + social links */}
+          {/* The logo artwork contains the single "Built by Aamir" attribution. */}
           <div className="sidebar-attribution">
-            <span className="sidebar-built-by">Built by Aamir</span>
+            <span className="sr-only">Built by Aamir</span>
             <div className="sidebar-social">
               <a
                 href="https://github.com/aamir490"
@@ -245,6 +286,7 @@ function App() {
           </p>
           <div className="topbar-end">
             <span className="environment-label">Local environment</span>
+            <ThemeSwitcher value={themePreference} onChange={setThemePreference} />
           </div>
         </header>
 
@@ -252,7 +294,7 @@ function App() {
         <main id="workspace" className="workspace" tabIndex={-1}>
 
           {/* Identity panel */}
-          <section className="identity-panel" aria-labelledby="identity-title">
+          <section className={`identity-panel${session ? ' identity-panel--authenticated' : ''}`} aria-labelledby="identity-title">
             <div className="identity-heading">
               <h2 id="identity-title">Workspace identity</h2>
               <span className={`badge ${session ? 'identity-role' : ''}`}>
@@ -267,15 +309,16 @@ function App() {
             </p>
             {session
               ? <div className="identity-details">
-                  <dl>
-                    <dt>User ID</dt><dd>{session.identity.user_id}</dd>
-                    {session.identity.customer_id && (
-                      <><dt>Customer ID</dt><dd>{session.identity.customer_id}</dd></>
-                    )}
-                  </dl>
-                  <button type="button" className="button-secondary" onClick={signOut}>
-                    Sign out
-                  </button>
+                  <details className="identity-technical">
+                    <summary>Identity details</summary>
+                    <dl>
+                      <dt>User ID</dt><dd>{session.identity.user_id}</dd>
+                      {session.identity.customer_id && (
+                        <><dt>Customer ID</dt><dd>{session.identity.customer_id}</dd></>
+                      )}
+                    </dl>
+                  </details>
+                  <button type="button" className="button-secondary" onClick={signOut}>Sign out</button>
                 </div>
               : <form className="identity-form" onSubmit={confirmIdentity} autoComplete="off">
                   <label htmlFor="local-access-token">Local access token
