@@ -18,10 +18,10 @@ function CatalogImage({ product }) {
  * Props
  * -----
  * api          — createApi() instance (required)
- * onPlaceOrder — called with { sku, name, quantity } when customer clicks
- *                "Add to order" so the parent can navigate to the order form
+ * onAddToCart  — adds the selected product and quantity to the portal cart
+ * onOpenCart   — opens the cart and checkout review
  */
-export default function CustomerCatalog({ api, onPlaceOrder }) {
+export default function CustomerCatalog({ api, cartItems = [], onAddToCart, onOpenCart }) {
   const [products, setProducts] = useState(null);   // null = not loaded
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -29,6 +29,7 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
   const [category, setCategory] = useState('all');
   const [availability, setAvailability] = useState('all');
   const [sort, setSort] = useState('featured');
+  const [announcement, setAnnouncement] = useState('');
   // Per-product quantity inputs, keyed by sku.
   const [quantities, setQuantities] = useState({});
   const requestRef = useRef(0);
@@ -64,10 +65,13 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
     setQuantities((prev) => ({ ...prev, [product.sku]: value }));
   }
 
-  function handleAddToOrder(product) {
+  function handleAddToCart(product) {
     const quantity = quantities[product.sku] ?? 1;
-    onPlaceOrder?.({ sku: product.sku, name: product.name, quantity });
+    onAddToCart?.(product, quantity);
+    setAnnouncement(`${quantity} ${quantity === 1 ? 'unit' : 'units'} of ${product.name} added to cart.`);
   }
+
+  const cartQuantity = cartItems.reduce((total, item) => total + item.quantity, 0);
 
   const visibleProducts = useMemo(() => products
     ? selectCatalogProducts(products, { query, category, availability, sort })
@@ -94,16 +98,23 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
           <h2 id="catalog-heading">Browse products</h2>
           <p className="catalog-intro">Explore the current catalog and start an order from any in-stock product.</p>
         </div>
-        <button
-          type="button"
-          className="button-secondary"
-          onClick={load}
-          disabled={loading}
-          aria-busy={loading}
-        >
-          {loading ? 'Loading…' : 'Refresh catalog'}
-        </button>
+        <div className="catalog-header-actions">
+          <button type="button" className="button-secondary catalog-cart-button" onClick={onOpenCart}>
+            Cart <span aria-label={`${cartQuantity} items in cart`}>{cartQuantity}</span>
+          </button>
+          <button
+            type="button"
+            className="button-secondary"
+            onClick={load}
+            disabled={loading}
+            aria-busy={loading}
+          >
+            {loading ? 'Loading…' : 'Refresh catalog'}
+          </button>
+        </div>
       </div>
+
+      <p className="sr-only" role="status" aria-live="polite">{announcement}</p>
 
       {products !== null && !error && (
         <div className="catalog-controls" aria-label="Catalog filters">
@@ -235,10 +246,10 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
                   </label>
                   <button
                     type="button"
-                    onClick={() => handleAddToOrder(product)}
-                    aria-label={`Place order for ${product.name}`}
+                    onClick={() => handleAddToCart(product)}
+                    aria-label={`Add ${product.name} to cart`}
                   >
-                    Place order
+                    Add to cart
                   </button>
                 </div>
               )}

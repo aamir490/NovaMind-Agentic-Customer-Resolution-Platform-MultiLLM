@@ -1,66 +1,46 @@
 import { useState } from 'react';
+import { cartLineTotal, cartTotals, formatCartMoney, normalizeCartQuantity } from './cart.js';
 
-/**
- * Order placement form.
- *
- * Receives a pre-filled item (sku, name, quantity) from the catalog selection.
- * Customers can adjust quantity before submitting.
- *
- * SECURITY: customer_id is NEVER included in the request body.
- * The backend derives it exclusively from the authenticated identity.
- *
- * Props
- * -----
- * api          — createApi() instance
- * item         — { sku, name, quantity } selected from the catalog
- * onSuccess    — called with the created Order object on success
- * onCancel     — called when the customer clicks "Back to catalog"
- */
-export default function PlaceOrder({ api, item, onSuccess, onCancel }) {
-  const [quantity, setQuantity] = useState(item?.quantity ?? 1);
+const RETRYABLE_STATUSES = new Set([400, 403, 404, 409, 422]);
+
+/** Cart review and simulated checkout. The request remains {items:[{sku,quantity}]}. */
+export default function PlaceOrder({ api, items, onSuccess, onCancel, onUpdateQuantity,
+  onRemove, onViewOrders }) {
   const [submitting, setSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(false);   // prevent duplicate POST
-  const [result, setResult]     = useState(null);
-  const [error, setError]       = useState(null);
-
-  // Guard against stale item prop — reset form if item changes.
-  const [lastSku, setLastSku] = useState(item?.sku);
-  if (item?.sku !== lastSku) {
-    setLastSku(item?.sku);
-    setQuantity(item?.quantity ?? 1);
-    setResult(null);
-    setError(null);
-    setSubmitting(false);
-    setSubmitted(false);
-  }
+  const [submitted, setSubmitted] = useState(false);
+  const [result, setResult] = useState(null);
+  const [submittedItems, setSubmittedItems] = useState([]);
+  const [error, setError] = useState(null);
+  const [uncertain, setUncertain] = useState(false);
 
   async function handleSubmit(event) {
     event.preventDefault();
-    // Strict single-submission guard: once submitted, block all further clicks
-    // until the response arrives and we reset, or the user goes back.
-    if (submitting || submitted) return;
+    if (submitting || submitted || uncertain || items.length === 0) return;
 
-    const qty = Math.max(1, Math.min(1000, parseInt(quantity, 10) || 1));
-    setQuantity(qty);
+    const snapshot = items.map((item) => ({ ...item }));
     setSubmitting(true);
     setSubmitted(true);
+    setSubmittedItems(snapshot);
     setError(null);
 
     try {
-      // No customer_id field — the backend owns it.
-      const order = await api.createMyOrder([{ sku: item.sku, quantity: qty }]);
+      const order = await api.createMyOrder(snapshot.map(({ sku, quantity }) => ({ sku, quantity })));
       setResult(order);
       onSuccess?.(order);
     } catch (err) {
-      setError(err.message || 'Order could not be placed. Please try again.');
-      // Allow resubmit after an error by clearing the submitted guard.
-      setSubmitted(false);
+      const retryable = RETRYABLE_STATUSES.has(err?.status);
+      if (retryable) {
+        setError(err.message || 'Order could not be placed. Review the cart and try again.');
+        setSubmitted(false);
+      } else {
+        setUncertain(true);
+        setError('The checkout result could not be confirmed. Check My Orders before attempting another checkout.');
+      }
     } finally {
       setSubmitting(false);
     }
   }
 
-  // Success state
   if (result) {
     return (
       <section className="place-order" aria-labelledby="order-success-heading">
@@ -72,19 +52,36 @@ export default function PlaceOrder({ api, item, onSuccess, onCancel }) {
             </svg>
           </span>
           <h2 id="order-success-heading">Order placed</h2>
-          <p>Your order has been received. Here's a summary:</p>
+          <p>Your demo order has been received.</p>
           <dl className="case-facts order-summary-facts">
             <div><dt>Order ID</dt><dd className="order-id">{result.id}</dd></div>
-            {result.items.map((it, i) => (
-              <div key={i}>
-                <dt>{it.name}</dt>
-                <dd>SKU: {it.sku} · Qty: {it.quantity}</dd>
-              </div>
+            {result.items.map((item) => (
+              <div key={item.sku}><dt>{item.name}</dt><dd>SKU: {item.sku} · Qty: {item.quantity}</dd></div>
             ))}
           </dl>
+          <CartTotals items={submittedItems} label="Order total" />
           <div className="order-success-actions">
-            <button type="button" onClick={onCancel}>Back to catalog</button>
+            <button type="button" onClick={onViewOrders}>View My Orders</button>
+            <button type="button" className="button-secondary" onClick={onCancel}>Continue shopping</button>
           </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (items.length === 0) {
+    return (
+      <section className="place-order" aria-labelledby="empty-cart-heading">
+        <div className="customer-empty cart-empty" role="status">
+          <span className="customer-empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
+              strokeLinejoin="round" strokeLinecap="round">
+              <path d="M3 3h2l2.4 11.2a2 2 0 002 1.6h7.8a2 2 0 001.9-1.4L21 7H6M10 20h.01M18 20h.01" />
+            </svg>
+          </span>
+          <h2 id="empty-cart-heading">Your cart is empty</h2>
+          <p>Add in-stock products from the catalog to start a demo order.</p>
+          <button type="button" onClick={onCancel}>Browse catalog</button>
         </div>
       </section>
     );
@@ -93,65 +90,66 @@ export default function PlaceOrder({ api, item, onSuccess, onCancel }) {
   return (
     <section className="place-order" aria-labelledby="place-order-heading">
       <div className="order-form-header">
-        <div>
-          <p className="eyebrow">Place order</p>
-          <h2 id="place-order-heading">Confirm your order</h2>
-        </div>
-        <button type="button" className="button-secondary" onClick={onCancel}>
-          ← Back to catalog
+        <div><p className="eyebrow">Shopping cart</p><h2 id="place-order-heading">Review checkout</h2>
+          <p className="catalog-intro">Confirm products and quantities before placing one demo order.</p></div>
+        <button type="button" className="button-secondary" onClick={onCancel} disabled={submitting}>
+          ← Continue shopping
         </button>
       </div>
 
-      <div className="order-product-summary case-panel">
-        <div className="catalog-card-meta">
-          <span className="catalog-sku">{item?.sku}</span>
+      <form className="cart-checkout" onSubmit={handleSubmit} noValidate>
+        <div className="cart-lines" aria-label="Cart items">
+          {items.map((item) => {
+            const lineTotal = cartLineTotal(item);
+            return <article key={item.sku} className="cart-line">
+              <img src={item.image_path} alt="" width="96" height="72" />
+              <div className="cart-line-details">
+                <span className="catalog-sku">{item.sku}</span>
+                <h3>{item.name}</h3>
+                <p>{formatCartMoney(item.unit_price)} each · {item.stock_quantity} in stock</p>
+              </div>
+              <label className="cart-line-quantity">
+                <span>Quantity</span>
+                <input type="number" min="1" max={Math.min(item.stock_quantity, 1000)} step="1"
+                  value={item.quantity} disabled={submitting || submitted}
+                  aria-label={`Quantity for ${item.name}`}
+                  onChange={(event) => onUpdateQuantity?.(item.sku,
+                    normalizeCartQuantity(item.stock_quantity, event.target.value))} />
+              </label>
+              <strong className="cart-line-total">{formatCartMoney(lineTotal)}</strong>
+              <button type="button" className="cart-remove" disabled={submitting || submitted}
+                onClick={() => onRemove?.(item.sku)} aria-label={`Remove ${item.name} from cart`}>
+                Remove
+              </button>
+            </article>;
+          })}
         </div>
-        <h3 className="catalog-card-name">{item?.name}</h3>
-        <p className="case-caption">
-          Review the quantity below and click "Place demo order" to submit.
-        </p>
-      </div>
 
-      <form className="order-form case-panel" onSubmit={handleSubmit} noValidate>
-        <fieldset disabled={submitting}>
-          <label>
-            Quantity
-            <input
-              type="number"
-              min="1"
-              max="1000"
-              step="1"
-              required
-              value={quantity}
-              onChange={(e) => setQuantity(e.target.value)}
-              aria-describedby="qty-help"
-            />
-          </label>
-          <p id="qty-help" className="case-caption">Enter a quantity between 1 and 1000.</p>
-
-          {/* Explicit note: customer_id is NOT sent — this is intentional */}
+        <aside className="cart-review case-panel" aria-label="Order summary">
+          <div><p className="eyebrow">Order summary</p>
+            <h3>{items.reduce((total, item) => total + item.quantity, 0)} items</h3></div>
+          <CartTotals items={items} label="Order total" />
           <p className="order-ownership-note case-caption">
-            Your account is identified automatically. No personal ID is transmitted in this request.
+            Your account is identified automatically. This is a simulated checkout with no payment or shipping.
           </p>
-        </fieldset>
-
-        {error && (
-          <p className="customer-error" role="alert">{error}</p>
-        )}
-
-        <div className="order-form-actions">
-          <button
-            type="submit"
-            disabled={submitting || submitted}
-            aria-busy={submitting}
-          >
+          {error && <div className={uncertain ? 'checkout-uncertain' : 'customer-error'} role="alert">
+            <strong>{uncertain ? 'Confirmation needed' : 'Checkout failed'}</strong><span>{error}</span>
+          </div>}
+          <button type="submit" disabled={submitting || submitted || uncertain} aria-busy={submitting}>
             {submitting ? 'Placing order…' : 'Place demo order'}
           </button>
-          <span className="case-caption">
-            {submitting ? 'Your order is being submitted…' : 'Demo order · no real transaction'}
-          </span>
-        </div>
+          {uncertain && <button type="button" className="button-secondary" onClick={onViewOrders}>Check My Orders</button>}
+          <span className="case-caption">One order request · no real transaction</span>
+        </aside>
       </form>
     </section>
   );
+}
+
+function CartTotals({ items, label }) {
+  const totals = cartTotals(items);
+  return <dl className="cart-totals">
+    {totals.map((total) => <div key={total.currency}><dt>{label}</dt>
+      <dd>{formatCartMoney(total)}</dd></div>)}
+  </dl>;
 }
