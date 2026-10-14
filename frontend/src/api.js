@@ -13,9 +13,28 @@ const runStatuses = ['RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMP
 const eventStates = [...runStatuses, 'STARTED', 'PAUSED'];
 const eventNodes = ['load_case', 'reason', 'execute_tool', 'record_result', 'finalize',
   'fail_safely', 'prepare_review', 'human_review'];
+const productCategories = ['laptops', 'displays', 'docks_hubs', 'input_devices',
+  'audio', 'storage', 'bags_protection', 'warranties_services'];
+const localProductImage = /^\/products\/[a-z0-9-]+\.(?:svg|webp)$/;
 
 function requireResponse(valid, resource) {
   if (!valid) throw new Error(`The API returned an invalid ${resource} response. No result was loaded`);
+}
+
+function catalogProduct(product) {
+  requireResponse(isUuid(product?.id) && isText(product.sku) && isText(product.name)
+    && isText(product.description) && typeof product.available === 'boolean'
+    && productCategories.includes(product.category)
+    && typeof product.image_path === 'string' && localProductImage.test(product.image_path)
+    && isCount(product.stock_quantity) && product.stock_quantity <= 1000
+    && product.available === (product.stock_quantity > 0)
+    && product.unit_price != null && isText(product.unit_price.currency)
+    && typeof product.unit_price.amount === 'string' && product.unit_price.amount.length <= 20,
+  'catalog product');
+  return { id: product.id, sku: product.sku, name: product.name, description: product.description,
+    category: product.category, image_path: product.image_path, stock_quantity: product.stock_quantity,
+    available: product.available,
+    unit_price: { amount: product.unit_price.amount, currency: product.unit_price.currency } };
 }
 
 function myCase(supportCase) {
@@ -222,28 +241,12 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
       const params = availableOnly ? '?available_only=true' : '';
       const products = await get(`/catalog${params}`);
       requireResponse(Array.isArray(products) && products.length <= 1000, 'catalog list');
-      return products.map((p) => {
-        requireResponse(isUuid(p?.id) && isText(p.sku) && isText(p.name) && isText(p.description)
-          && typeof p.available === 'boolean'
-          && p.unit_price != null && isText(p.unit_price.currency)
-          && typeof p.unit_price.amount === 'string' && p.unit_price.amount.length <= 20,
-          'catalog product');
-        return { id: p.id, sku: p.sku, name: p.name, description: p.description,
-          available: p.available,
-          unit_price: { amount: p.unit_price.amount, currency: p.unit_price.currency } };
-      });
+      return products.map(catalogProduct);
     },
 
     async getCatalogProduct(id) {
       requireResponse(isUuid(id), 'product id');
-      const p = await get(`/catalog/${encodeURIComponent(id)}`);
-      requireResponse(isUuid(p?.id) && isText(p.sku) && isText(p.name) && isText(p.description)
-        && typeof p.available === 'boolean'
-        && p.unit_price != null && isText(p.unit_price.currency)
-        && typeof p.unit_price.amount === 'string', 'catalog product');
-      return { id: p.id, sku: p.sku, name: p.name, description: p.description,
-        available: p.available,
-        unit_price: { amount: p.unit_price.amount, currency: p.unit_price.currency } };
+      return catalogProduct(await get(`/catalog/${encodeURIComponent(id)}`));
     },
 
     async createMyOrder(items) {

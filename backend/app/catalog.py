@@ -9,10 +9,11 @@ Persistence belongs to Phase 20; this module is intentionally process-local.
 from decimal import Decimal
 from threading import RLock
 from typing import Annotated
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import Field, StringConstraints, computed_field
 
+from .catalog_seed import PRODUCT_SEEDS, ProductCategory
 from .domain import Name, Record
 from .service import NotFoundError
 
@@ -36,7 +37,17 @@ class Product(Record):
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)
     ]
     unit_price: Money
-    available: bool = True
+    category: ProductCategory
+    image_path: Annotated[str, StringConstraints(
+        pattern=r"^/products/[a-z0-9-]+\.(?:svg|webp)$", max_length=160,
+    )]
+    stock_quantity: int = Field(strict=True, ge=0, le=1000)
+
+    @computed_field(return_type=bool)
+    @property
+    def available(self) -> bool:
+        """Backward-compatible availability derived from authoritative stock."""
+        return self.stock_quantity > 0
 
 
 # ---------------------------------------------------------------------------
@@ -45,48 +56,16 @@ class Product(Record):
 # SKUs deliberately mirror those in operations.py (LAP-1, LAP-2) and
 # the knowledge base (ACC-1, WAR-1) so existing tests remain coherent.
 
-_SEED_PRODUCTS: tuple[Product, ...] = (
-    Product(
-        id=UUID("10000000-0000-4000-8000-000000000001"),
-        sku="LAP-1",
-        name="ProBook Laptop 15",
-        description="15-inch business laptop with Intel Core i7, 16 GB RAM, 512 GB SSD.",
-        unit_price=Money(amount=Decimal("1299.99")),
-        available=True,
-    ),
-    Product(
-        id=UUID("10000000-0000-4000-8000-000000000002"),
-        sku="LAP-2",
-        name="ProBook Laptop 13",
-        description="13-inch ultrabook with Intel Core i5, 8 GB RAM, 256 GB SSD.",
-        unit_price=Money(amount=Decimal("999.99")),
-        available=False,  # Out of stock — matches available_quantity=0 in operations
-    ),
-    Product(
-        id=UUID("10000000-0000-4000-8000-000000000003"),
-        sku="ACC-1",
-        name="USB-C Docking Station",
-        description="7-port USB-C dock with HDMI, DisplayPort, Ethernet, and 100 W PD.",
-        unit_price=Money(amount=Decimal("149.99")),
-        available=True,
-    ),
-    Product(
-        id=UUID("10000000-0000-4000-8000-000000000004"),
-        sku="WAR-1",
-        name="Extended Warranty (3 Year)",
-        description="Three-year extended hardware warranty covering parts and labour.",
-        unit_price=Money(amount=Decimal("199.99")),
-        available=True,
-    ),
-    Product(
-        id=UUID("10000000-0000-4000-8000-000000000005"),
-        sku="BAG-1",
-        name="Laptop Sleeve 15\"",
-        description="Water-resistant neoprene sleeve for 15-inch laptops.",
-        unit_price=Money(amount=Decimal("29.99")),
-        available=True,
-    ),
-)
+_SEED_PRODUCTS: tuple[Product, ...] = tuple(Product(
+    id=seed.id,
+    sku=seed.sku,
+    name=seed.name,
+    description=seed.description,
+    unit_price=Money(amount=seed.amount),
+    category=seed.category,
+    image_path=seed.image_path,
+    stock_quantity=seed.stock_quantity,
+) for seed in PRODUCT_SEEDS)
 
 
 # ---------------------------------------------------------------------------

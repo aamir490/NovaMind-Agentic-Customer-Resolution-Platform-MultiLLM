@@ -191,10 +191,22 @@ class CatalogTests(CommerceTestBase):
         status, body = self.admin("GET", "/api/catalog")
         self.assertEqual(status, 200)
         self.assertIsInstance(body, list)
-        self.assertGreaterEqual(len(body), 5)
+        self.assertEqual(len(body), 100)
         skus = {p["sku"] for p in body}
         for expected in ("LAP-1", "LAP-2", "ACC-1", "WAR-1", "BAG-1"):
             self.assertIn(expected, skus)
+        self.assertEqual(len({p["category"] for p in body}), 8)
+        for product in body:
+            self.assertTrue(product["image_path"].startswith("/products/"))
+            self.assertEqual(product["available"], product["stock_quantity"] > 0)
+
+    def test_catalog_and_operational_inventory_share_stock(self):
+        status, products = self.admin("GET", "/api/catalog")
+        self.assertEqual(status, 200)
+        operations = self.client.app.state.business_operations
+        for product in products:
+            inventory = operations.get_inventory(product["sku"])
+            self.assertEqual(inventory.available_quantity, product["stock_quantity"])
 
     def test_list_products_customer(self):
         """Customers can also browse the catalog."""
@@ -368,17 +380,24 @@ class CustomerOrderCreationTests(CommerceTestBase):
         status, _ = self.no_auth("POST", "/api/my/orders", json=self.VALID_BODY)
         self.assertEqual(status, 401)
 
-    def test_unavailable_product_still_orderable(self):
-        """
-        LAP-2 is marked available=False but can still be ordered
-        (availability is informational in Phase 17B.1; stock blocking belongs later).
-        This test documents the current behaviour explicitly.
-        """
+    def test_unavailable_product_is_rejected(self):
+        """Authoritative zero stock prevents checkout without changing its request shape."""
         status, body = self.customer_a("POST", "/api/my/orders", json={
             "items": [{"sku": "LAP-2", "quantity": 1}]
         })
-        self.assertEqual(status, 201, body)
-        self.assertEqual(body["items"][0]["sku"], "LAP-2")
+        self.assertEqual(status, 409, body)
+
+    def test_quantity_cannot_exceed_stock(self):
+        status, body = self.customer_a("POST", "/api/my/orders", json={
+            "items": [{"sku": "LAP-1", "quantity": 6}]
+        })
+        self.assertEqual(status, 409, body)
+
+    def test_duplicate_lines_are_validated_in_aggregate(self):
+        status, body = self.customer_a("POST", "/api/my/orders", json={
+            "items": [{"sku": "LAP-1", "quantity": 3}, {"sku": "LAP-1", "quantity": 3}]
+        })
+        self.assertEqual(status, 409, body)
 
 
 # ---------------------------------------------------------------------------

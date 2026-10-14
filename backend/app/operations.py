@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import Field
 
+from .catalog_seed import PRODUCT_SEEDS
 from .domain import Name, Record
 from .service import CaseService, ConflictError, NotFoundError
 from .observability import observed
@@ -100,8 +101,12 @@ class BusinessOperations:
             ),
         }
         self._inventory = {
-            "LAP-1": InventoryItem(sku="LAP-1", available_quantity=5, policy_id="standard-return"),
-            "LAP-2": InventoryItem(sku="LAP-2", available_quantity=0, policy_id="standard-return"),
+            product.sku: InventoryItem(
+                sku=product.sku,
+                available_quantity=product.stock_quantity,
+                policy_id="standard-return",
+            )
+            for product in PRODUCT_SEEDS
         }
 
     def get_inventory(self, sku: str) -> InventoryItem:

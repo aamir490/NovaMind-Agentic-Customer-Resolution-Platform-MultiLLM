@@ -26,7 +26,7 @@ from pydantic import ConfigDict, Field
 from .catalog import CatalogService
 from .domain import Name, OrderItem
 from .schemas import RequestModel
-from .service import CaseService, NotFoundError
+from .service import CaseService, ConflictError, NotFoundError
 from .security import AuthenticatedIdentity, Role, SecurityError
 
 
@@ -87,6 +87,7 @@ class CustomerOrderService:
         SecurityError(403)  if identity is not CUSTOMER role
         NotFoundError       if the customer record does not exist
         NotFoundError       if any SKU does not exist in the catalog
+        ConflictError       if aggregate requested quantity exceeds stock
         ValueError          propagated from OrderItem if quantity is out of range
                             (should be caught by Pydantic before reaching here)
         """
@@ -99,13 +100,22 @@ class CustomerOrderService:
         # Verify the customer record exists (guard against stale identities).
         self._cases.get_customer(customer_id)
 
-        # Validate every SKU against the catalog and resolve the product name.
+        # Resolve every SKU and validate aggregate quantities against the
+        # authoritative catalog stock. This demo remains read-only: creating an
+        # order does not reserve or decrement inventory.
         resolved_items: list[OrderItem] = []
+        requested_by_sku: dict[str, int] = {}
+        products_by_sku = {}
         for line in request.items:
             product = self._catalog.get_by_sku(line.sku)   # raises NotFoundError
+            products_by_sku[line.sku] = product
+            requested_by_sku[line.sku] = requested_by_sku.get(line.sku, 0) + line.quantity
             resolved_items.append(
                 OrderItem(sku=line.sku, name=product.name, quantity=line.quantity)
             )
+        for sku, requested in requested_by_sku.items():
+            if requested > products_by_sku[sku].stock_quantity:
+                raise ConflictError("Requested quantity exceeds available stock")
 
         # Delegate persistence to the existing CaseService.
         # We build the OrderCreate manually to inject the server-derived customer_id.

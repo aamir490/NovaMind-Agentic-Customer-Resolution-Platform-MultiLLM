@@ -1,5 +1,10 @@
 export const CATALOG_AVAILABILITY = Object.freeze(['all', 'available', 'unavailable']);
 export const CATALOG_SORTS = Object.freeze(['featured', 'name-asc', 'name-desc', 'price-asc', 'price-desc']);
+export const CATALOG_CATEGORY_LABELS = Object.freeze({
+  laptops: 'Laptops', displays: 'Displays', docks_hubs: 'Docks and hubs',
+  input_devices: 'Input devices', audio: 'Audio', storage: 'Storage',
+  bags_protection: 'Bags and protection', warranties_services: 'Warranties and services',
+});
 
 const normalize = (value) => String(value ?? '').trim().toLocaleLowerCase();
 
@@ -27,13 +32,14 @@ function comparePrice(left, right) {
 }
 
 export function selectCatalogProducts(products, {
-  query = '', availability = 'all', sort = 'featured',
+  query = '', category = 'all', availability = 'all', sort = 'featured',
 } = {}) {
   const safeAvailability = CATALOG_AVAILABILITY.includes(availability) ? availability : 'all';
   const safeSort = CATALOG_SORTS.includes(sort) ? sort : 'featured';
   const term = normalize(query);
 
   const selected = products.filter((product) => {
+    if (category !== 'all' && product.category !== category) return false;
     if (safeAvailability === 'available' && !product.available) return false;
     if (safeAvailability === 'unavailable' && product.available) return false;
     if (!term) return true;

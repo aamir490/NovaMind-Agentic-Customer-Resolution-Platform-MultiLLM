@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { formatCatalogPrice, selectCatalogProducts } from './catalogView.js';
+import { CATALOG_CATEGORY_LABELS, formatCatalogPrice, selectCatalogProducts } from './catalogView.js';
+
+const FALLBACK_IMAGE = '/products/fallback.svg';
+
+function CatalogImage({ product }) {
+  const [failed, setFailed] = useState(false);
+  return <div className="catalog-card-visual">
+    <img src={failed ? FALLBACK_IMAGE : product.image_path}
+      alt={`${product.name} product illustration`} width="640" height="420" loading="lazy"
+      onError={() => setFailed(true)} />
+  </div>;
+}
 
 /**
  * Product catalog browser for authenticated customers.
@@ -15,6 +26,7 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [query, setQuery] = useState('');
+  const [category, setCategory] = useState('all');
   const [availability, setAvailability] = useState('all');
   const [sort, setSort] = useState('featured');
   // Per-product quantity inputs, keyed by sku.
@@ -47,9 +59,9 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
       .finally(() => { if (requestRef.current === version) setLoading(false); });
   }
 
-  function handleQtyChange(sku, raw) {
-    const value = Math.max(1, Math.min(1000, parseInt(raw, 10) || 1));
-    setQuantities((prev) => ({ ...prev, [sku]: value }));
+  function handleQtyChange(product, raw) {
+    const value = Math.max(1, Math.min(product.stock_quantity, 1000, parseInt(raw, 10) || 1));
+    setQuantities((prev) => ({ ...prev, [product.sku]: value }));
   }
 
   function handleAddToOrder(product) {
@@ -58,12 +70,18 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
   }
 
   const visibleProducts = useMemo(() => products
-    ? selectCatalogProducts(products, { query, availability, sort })
-    : [], [products, query, availability, sort]);
-  const filtersActive = query.trim().length > 0 || availability !== 'all' || sort !== 'featured';
+    ? selectCatalogProducts(products, { query, category, availability, sort })
+    : [], [products, query, category, availability, sort]);
+  const categories = useMemo(() => products
+    ? [...new Set(products.map((product) => product.category))].sort((a, b) =>
+        CATALOG_CATEGORY_LABELS[a].localeCompare(CATALOG_CATEGORY_LABELS[b]))
+    : [], [products]);
+  const filtersActive = query.trim().length > 0 || category !== 'all'
+    || availability !== 'all' || sort !== 'featured';
 
   function clearFilters() {
     setQuery('');
+    setCategory('all');
     setAvailability('all');
     setSort('featured');
   }
@@ -102,8 +120,11 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
           </label>
           <label>
             <span>Category</span>
-            <select disabled aria-describedby="catalog-category-note">
-              <option>All categories</option>
+            <select value={category} onChange={(event) => setCategory(event.target.value)}>
+              <option value="all">All categories</option>
+              {categories.map((value) => <option key={value} value={value}>
+                {CATALOG_CATEGORY_LABELS[value]}
+              </option>)}
             </select>
           </label>
           <label>
@@ -125,7 +146,7 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
             </select>
           </label>
           <div className="catalog-controls-footer">
-            <p id="catalog-category-note">Categories are not supplied by the catalog API.</p>
+            <p>Showing authoritative catalog data and current demo stock.</p>
             <p className="catalog-result-count" role="status" aria-live="polite">
               {visibleProducts.length} of {products.length} {products.length === 1 ? 'product' : 'products'}
             </p>
@@ -182,18 +203,14 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
         <ul className="catalog-grid" aria-label="Product list">
           {visibleProducts.map((product) => (
             <li key={product.id} className={`catalog-card${product.available ? '' : ' catalog-card--unavailable'}`}>
-              <div className="catalog-card-visual" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.3"
-                  strokeLinejoin="round" strokeLinecap="round">
-                  <path d="m4 7 8-4 8 4-8 4zM4 7v10l8 4 8-4V7M12 11v10" />
-                </svg>
-                <span>Image unavailable</span>
-              </div>
+              <CatalogImage product={product} />
               <div className="catalog-card-body">
                 <div className="catalog-card-meta">
                   <span className="catalog-sku">{product.sku}</span>
                   {product.available
-                    ? <span className="catalog-badge catalog-badge--available">In stock</span>
+                    ? <span className="catalog-badge catalog-badge--available">
+                        {product.stock_quantity} in stock
+                      </span>
                     : <span className="catalog-badge catalog-badge--unavailable">Out of stock</span>}
                 </div>
                 <h3 className="catalog-card-name">{product.name}</h3>
@@ -209,11 +226,11 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
                     <input
                       type="number"
                       min="1"
-                      max="1000"
+                      max={Math.min(1000, product.stock_quantity)}
                       step="1"
                       value={quantities[product.sku] ?? 1}
                       aria-label={`Quantity for ${product.name}`}
-                      onChange={(e) => handleQtyChange(product.sku, e.target.value)}
+                      onChange={(e) => handleQtyChange(product, e.target.value)}
                     />
                   </label>
                   <button

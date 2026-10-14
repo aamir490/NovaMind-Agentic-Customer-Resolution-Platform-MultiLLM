@@ -69,6 +69,9 @@ function product(overrides = {}) {
     name: 'ProBook Laptop 15',
     description: '15-inch business laptop.',
     available: true,
+    category: 'laptops',
+    image_path: '/products/laptops.svg',
+    stock_quantity: 5,
     unit_price: { amount: '1299.99', currency: 'USD' },
     ...overrides,
   };
@@ -117,14 +120,16 @@ function recordingClient(responses, { token = 'customer-test-token-xxxx' } = {})
 // ---------------------------------------------------------------------------
 
 test('listCatalog returns a validated product array', async () => {
-  const products = [product(), product({ id: uuid(11), sku: 'ACC-1', name: 'Dock', available: false })];
+  const products = [product(), product({ id: uuid(11), sku: 'ACC-1', name: 'Dock',
+    available: false, stock_quantity: 0 })];
   const result = await client(products).listCatalog();
   assert.equal(result.length, 2);
   assert.equal(result[0].sku, 'LAP-1');
   assert.equal(result[1].available, false);
   // Projection: only expected fields present
   assert.deepEqual(Object.keys(result[0]).sort(),
-    ['available', 'description', 'id', 'name', 'sku', 'unit_price'].sort());
+    ['available', 'category', 'description', 'id', 'image_path', 'name', 'sku',
+      'stock_quantity', 'unit_price'].sort());
   assert.deepEqual(Object.keys(result[0].unit_price).sort(), ['amount', 'currency'].sort());
 });
 
@@ -146,6 +151,15 @@ test('listCatalog available field must be a boolean', async () => {
     client([product({ available: 'true' })]).listCatalog(),
     /catalog product/,
   );
+});
+
+test('listCatalog validates category, local image path, stock, and derived availability', async () => {
+  await assert.rejects(client([product({ category: 'unknown' })]).listCatalog(), /catalog product/);
+  await assert.rejects(client([product({ image_path: 'https://example.com/product.jpg' })]).listCatalog(), /catalog product/);
+  await assert.rejects(client([product({ stock_quantity: -1 })]).listCatalog(), /catalog product/);
+  await assert.rejects(client([product({ stock_quantity: 0, available: true })]).listCatalog(), /catalog product/);
+  const unavailable = await client([product({ stock_quantity: 0, available: false })]).listCatalog();
+  assert.equal(unavailable[0].stock_quantity, 0);
 });
 
 test('listCatalog rejects non-array response', async () => {
@@ -523,7 +537,7 @@ test('customer API calls never hit internal staff URLs', async () => {
 
 test('listCatalog distinguishes available and unavailable products correctly', async () => {
   const available = product({ available: true });
-  const unavailable = product({ id: uuid(11), sku: 'LAP-2', available: false });
+  const unavailable = product({ id: uuid(11), sku: 'LAP-2', available: false, stock_quantity: 0 });
   const result = await client([available, unavailable]).listCatalog();
   const avail = result.filter((p) => p.available);
   const unavail = result.filter((p) => !p.available);
