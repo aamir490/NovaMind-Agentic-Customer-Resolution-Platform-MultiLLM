@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { formatCatalogPrice, selectCatalogProducts } from './catalogView.js';
 
 /**
  * Product catalog browser for authenticated customers.
@@ -13,6 +14,9 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
   const [products, setProducts] = useState(null);   // null = not loaded
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [query, setQuery] = useState('');
+  const [availability, setAvailability] = useState('all');
+  const [sort, setSort] = useState('featured');
   // Per-product quantity inputs, keyed by sku.
   const [quantities, setQuantities] = useState({});
   const requestRef = useRef(0);
@@ -53,13 +57,16 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
     onPlaceOrder?.({ sku: product.sku, name: product.name, quantity });
   }
 
-  // Stable sort: available first, then alphabetically by name.
-  const sorted = products
-    ? [...products].sort((a, b) => {
-        if (a.available !== b.available) return a.available ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      })
-    : [];
+  const visibleProducts = useMemo(() => products
+    ? selectCatalogProducts(products, { query, availability, sort })
+    : [], [products, query, availability, sort]);
+  const filtersActive = query.trim().length > 0 || availability !== 'all' || sort !== 'featured';
+
+  function clearFilters() {
+    setQuery('');
+    setAvailability('all');
+    setSort('featured');
+  }
 
   return (
     <section className="customer-catalog" aria-labelledby="catalog-heading">
@@ -67,6 +74,7 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
         <div>
           <p className="eyebrow">Product catalog</p>
           <h2 id="catalog-heading">Browse products</h2>
+          <p className="catalog-intro">Explore the current catalog and start an order from any in-stock product.</p>
         </div>
         <button
           type="button"
@@ -79,6 +87,52 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
         </button>
       </div>
 
+      {products !== null && !error && (
+        <div className="catalog-controls" aria-label="Catalog filters">
+          <label className="catalog-search">
+            <span>Search products</span>
+            <span className="catalog-search-input">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
+                strokeLinecap="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" />
+              </svg>
+              <input type="search" value={query} placeholder="Search name, SKU or description"
+                onChange={(event) => setQuery(event.target.value)} />
+            </span>
+          </label>
+          <label>
+            <span>Category</span>
+            <select disabled aria-describedby="catalog-category-note">
+              <option>All categories</option>
+            </select>
+          </label>
+          <label>
+            <span>Availability</span>
+            <select value={availability} onChange={(event) => setAvailability(event.target.value)}>
+              <option value="all">All products</option>
+              <option value="available">In stock</option>
+              <option value="unavailable">Out of stock</option>
+            </select>
+          </label>
+          <label>
+            <span>Sort by</span>
+            <select value={sort} onChange={(event) => setSort(event.target.value)}>
+              <option value="featured">Availability, then name</option>
+              <option value="name-asc">Name: A to Z</option>
+              <option value="name-desc">Name: Z to A</option>
+              <option value="price-asc">Price: low to high</option>
+              <option value="price-desc">Price: high to low</option>
+            </select>
+          </label>
+          <div className="catalog-controls-footer">
+            <p id="catalog-category-note">Categories are not supplied by the catalog API.</p>
+            <p className="catalog-result-count" role="status" aria-live="polite">
+              {visibleProducts.length} of {products.length} {products.length === 1 ? 'product' : 'products'}
+            </p>
+          </div>
+        </div>
+      )}
+
       {loading && (
         <p className="customer-notice" role="status" aria-live="polite">
           Loading product catalog…
@@ -86,7 +140,10 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
       )}
 
       {error && (
-        <p className="customer-error" role="alert">{error}</p>
+        <div className="customer-error catalog-error" role="alert">
+          <div><strong>Catalog unavailable</strong><span>{error}</span></div>
+          <button type="button" className="button-secondary" onClick={load}>Try again</button>
+        </div>
       )}
 
       {!loading && !error && products === null && (
@@ -102,28 +159,47 @@ export default function CustomerCatalog({ api, onPlaceOrder }) {
         </div>
       )}
 
-      {!loading && products !== null && products.length === 0 && (
+      {!loading && !error && products !== null && products.length === 0 && (
         <div className="customer-empty" role="status">
           <h3>No products available</h3>
           <p>The catalog returned no products. Try again later.</p>
         </div>
       )}
 
-      {sorted.length > 0 && (
+      {!loading && !error && products !== null && products.length > 0 && visibleProducts.length === 0 && (
+        <div className="customer-empty" role="status">
+          <span className="customer-empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
+              strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></svg>
+          </span>
+          <h3>No matching products</h3>
+          <p>Adjust your search or availability filter to see more of the catalog.</p>
+          {filtersActive && <button type="button" className="button-secondary" onClick={clearFilters}>Clear filters</button>}
+        </div>
+      )}
+
+      {!error && visibleProducts.length > 0 && (
         <ul className="catalog-grid" aria-label="Product list">
-          {sorted.map((product) => (
+          {visibleProducts.map((product) => (
             <li key={product.id} className={`catalog-card${product.available ? '' : ' catalog-card--unavailable'}`}>
+              <div className="catalog-card-visual" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.3"
+                  strokeLinejoin="round" strokeLinecap="round">
+                  <path d="m4 7 8-4 8 4-8 4zM4 7v10l8 4 8-4V7M12 11v10" />
+                </svg>
+                <span>Image unavailable</span>
+              </div>
               <div className="catalog-card-body">
                 <div className="catalog-card-meta">
                   <span className="catalog-sku">{product.sku}</span>
                   {product.available
-                    ? <span className="catalog-badge catalog-badge--available">Available</span>
+                    ? <span className="catalog-badge catalog-badge--available">In stock</span>
                     : <span className="catalog-badge catalog-badge--unavailable">Out of stock</span>}
                 </div>
                 <h3 className="catalog-card-name">{product.name}</h3>
                 <p className="catalog-card-description">{product.description}</p>
                 <p className="catalog-card-price" aria-label={`Price: ${product.unit_price.amount} ${product.unit_price.currency}`}>
-                  <strong>{product.unit_price.currency} {product.unit_price.amount}</strong>
+                  <strong>{formatCatalogPrice(product.unit_price)}</strong>
                 </p>
               </div>
               {product.available && (
