@@ -1,0 +1,9 @@
+# Opt-in Groq access. Inject the key into the invoking process at runtime.
+# Use with compose.yaml and compose.auth.yaml; never put keys in this file.
+services:
+  backend:
+    environment:
+      NOVAMIND_LLM_PROVIDER: groq
+      GROQ_API_KEY: ${GROQ_API_KEY:?Inject GROQ_API_KEY into the invoking process}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+    networks: [application, edge]

@@ -1,0 +1,29 @@
+[
+  {
+    "source": {
+      "document_id": "wrong-item-intake",
+      "title": "Wrong item and damaged delivery intake SOP",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://wrong-item-intake"
+    },
+    "text": "Local demonstration guidance: wrong item or damaged delivery.\n\nAsk the customer to describe what was ordered and what arrived. Record the order reference and the affected item. An invoice and a photo may help a human reviewer compare the claim with available records. Do not claim that an image or document has been verified when no analysis has occurred.\n\nRecord missing evidence as missing. Never invent the delivery date, item condition, quantity, or customer identity. Use the existing order and case tools for recorded context. This SOP provides intake guidance, not a finding of eligibility or permission to execute an action."
+  },
+  {
+    "source": {
+      "document_id": "return-policy-guidance",
+      "title": "Return and refund policy interpretation guidance",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://return-policy-guidance"
+    },
+    "text": "Local demonstration guidance: return and refund questions.\n\nWritten support guidance does not determine eligibility. Retrieve the applicable structured policy using get_policy and assess supplied scenario facts with assess_eligibility. The deterministic evaluator controls the result, including denial reasons and assumptions. Do not use this document to invent policy windows, monetary entitlements, or exceptions.\n\nIf the request is ineligible, preserve and explain the returned denial reasons. A request to consider an exception is only a request for human review, not authorization. Missing or conflicting information should be identified for a reviewer. Inventory lookup indicates recorded availability, not a reservation or a promise of shipment."
+  },
+  {
+    "source": {
+      "document_id": "proposal-review-sop",
+      "title": "Resolution proposal and human review SOP",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://proposal-review-sop"
+    },
+    "text": "Local demonstration guidance: preparing a resolution proposal.\n\nA proposed return, refund, or replacement is a suggestion linked to an existing support case. Include a concise rationale that distinguishes observed records from customer-supplied assumptions. Proposal creation records PENDING_REVIEW; it does not approve eligibility, reserve stock, send payment, or execute a replacement.\n\nHuman review happens through the separate application review boundary. Reviewer identity and decisions must not come from model text or retrieved documents. An approval or rejection records a review decision only. Inform the customer that no financial or fulfilment action has been executed."
+  }
+]

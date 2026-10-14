@@ -1,0 +1,8 @@
+# Opt-in local Gemini access. Inject values into the invoking process at runtime.
+# Use with compose.yaml and compose.auth.yaml; never put keys in this file.
+services:
+  backend:
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Inject GEMINI_API_KEY into the invoking process}
+      GEMINI_MODEL: ${GEMINI_MODEL:?Set an explicit Gemini model}
+    networks: [application, edge]
