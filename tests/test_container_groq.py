@@ -134,6 +134,8 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         invoke = self.enterContext(patch.object(app.state.local_tools, "invoke", wraps=app.state.local_tools.invoke))
         async with app.router.lifespan_context(app):
+            identity = await self.request(app, "GET", "/api/identity")
+            self.assertEqual(identity.json()["provider"], "groq")
             service = app.state.case_service
             customer = service.create_customer(CustomerCreate(name="Groq wiring fixture"))
             order = service.create_order(OrderCreate(customer_id=customer.id,
@@ -150,8 +152,12 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.calls, [])
             started = await self.request(app, "POST", "/api/runs", body)
             self.assertEqual(started.status_code, 202, started.text)
+            self.assertEqual(started.json()["provider"], "groq")
         snapshot = await self.request(app, "GET", f"/api/runs/{started.json()['run_id']}")
         self.assertEqual(snapshot.json()["status"], "COMPLETED", snapshot.text)
+        self.assertEqual(snapshot.json()["provider"], "groq")
+        runs = await self.request(app, "GET", f"/api/cases/{case.id}/runs?offset=0&limit=50")
+        self.assertEqual(runs.json()["items"][0]["provider"], "groq")
         self.assertFalse(snapshot.json()["actions_executed"])
         self.assertNotIn(CONFIG["GROQ_API_KEY"], snapshot.text)
         self.assertTrue(runtime._closed)

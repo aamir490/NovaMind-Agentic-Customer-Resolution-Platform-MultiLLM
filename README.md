@@ -316,6 +316,10 @@ The ALB spans two AZs and the VPC has a two-AZ network layout. This provides a f
 6. The agent may gather further evidence, evaluate rules or create a pending proposal.
 7. A reviewer/admin performs the review step if required; the application returns the recorded result to the UI.
 
+The identity and run APIs label an explicitly selected Groq provider `groq`; the
+diagnostics API uses the same provider category. Scripted local runs retain their
+`local_scripted` identity/run label.
+
 ### D. Backend image deployment
 
 ```text

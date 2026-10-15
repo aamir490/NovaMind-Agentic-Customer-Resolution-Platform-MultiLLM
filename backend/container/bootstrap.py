@@ -76,6 +76,7 @@ def create_container_app():
     try:
         app = create_app(auth_provider=auth_provider,
                          local_provider_factory=(lambda: provider) if provider is not None else None,
+                         provider_label="groq" if provider is not None else "local_scripted",
                          startup_customers=startup_customers)
     except Exception:
         if provider is not None:

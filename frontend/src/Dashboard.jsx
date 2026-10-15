@@ -138,7 +138,7 @@ function ReviewTile({ reviews }) {
 // ─── Section: System / provider status ────────────────────────────────────────
 
 function SystemStatus({ identity }) {
-  const providerOk = identity.provider === 'local_scripted';
+  const providerOk = identity.provider !== 'unavailable';
   return (
     <div className="db-system-row">
       <div className={`db-system-pill db-system-pill--${providerOk ? 'ok' : 'error'}`}>
@@ -149,7 +149,8 @@ function SystemStatus({ identity }) {
             ? 'M5 13l4 4L19 7'
             : 'M18 6L6 18M6 6l12 12'} />
         </svg>
-        Provider: {providerOk ? 'Local scripted' : 'Unavailable'}
+        Provider: {identity.provider === 'groq' ? 'Groq'
+          : providerOk ? 'Local scripted' : 'Unavailable'}
       </div>
       <div className={`db-system-pill db-system-pill--${identity.memory_available ? 'ok' : 'muted'}`}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"

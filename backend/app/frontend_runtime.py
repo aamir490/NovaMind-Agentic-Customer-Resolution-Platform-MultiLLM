@@ -48,12 +48,16 @@ class _Run:
 class FrontendRuntime:
     # No run eviction: deduplication keys and checkpoints live for this process.
     # Once full, refuse new starts rather than silently replaying an evicted write.
-    def __init__(self, cases, tools, proposals, *, local_provider_factory=None, memory=None,
+    def __init__(self, cases, tools, proposals, *, local_provider_factory=None,
+                 provider_label="local_scripted", memory=None,
                  max_runs=128, max_active=2, event_capacity=128):
         if not (1 <= max_runs <= 1024 and 1 <= max_active <= 8 and 1 <= event_capacity <= 1024):
             raise ValueError("Invalid local runtime bounds")
+        if provider_label not in ("local_scripted", "groq"):
+            raise ValueError("Invalid provider label")
         self.instance_id = uuid4()
         self.provider_factory = local_provider_factory
+        self.provider_label = provider_label
         self.memory = memory
         self._cases, self._tools, self._proposals = cases, tools, proposals
         self._max_runs, self._max_active, self._event_capacity = max_runs, max_active, event_capacity
@@ -144,7 +148,8 @@ class FrontendRuntime:
             self._reserve()
             timestamp = now()
             run = _Run(RunSnapshot(instance_id=self.instance_id, run_id=uuid4(), case_id=body.case_id,
-                conversation_id=body.conversation_id, status="RUNNING", created_at=timestamp, updated_at=timestamp,
+                conversation_id=body.conversation_id, provider=self.provider_label,
+                status="RUNNING", created_at=timestamp, updated_at=timestamp,
                 trace_id=trace_id),
                 identity.user_id, fingerprint, events=deque(maxlen=self._event_capacity))
             self._runs[run.snapshot.run_id] = run

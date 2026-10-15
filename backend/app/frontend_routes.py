@@ -47,7 +47,7 @@ def identity(runtime: Runtime):
     subject = current_identity()
     privileged = subject.role in (Role.REVIEWER, Role.ADMIN)
     return IdentityResponse(identity=subject, can_review=privileged, can_view_diagnostics=privileged,
-        instance_id=runtime.instance_id, provider="local_scripted" if runtime.provider_factory else "unavailable",
+        instance_id=runtime.instance_id, provider=runtime.provider_label if runtime.provider_factory else "unavailable",
         memory_available=runtime.memory is not None)
 
 

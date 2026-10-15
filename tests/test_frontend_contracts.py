@@ -96,6 +96,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         response = await self.request("POST", "/api/runs", body or self.body())
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["trace_id"], response.headers["X-Trace-ID"])
+        self.assertEqual(response.json()["provider"], "local_scripted")
         return response.json()
 
     async def finished(self, run_id):
@@ -208,6 +209,8 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unavailable_configuration_and_restart_epoch(self):
         self.runtime.provider_factory = None
+        identity = await self.request("GET", "/api/identity")
+        self.assertEqual(identity.json()["provider"], "unavailable")
         response = await self.request("POST", "/api/runs", self.body())
         self.assertEqual((response.status_code, response.json()["detail"]), (503, "PROVIDER_UNAVAILABLE"))
         response = await self.request("POST", "/api/runs", self.body(instance_id=str(uuid4())))

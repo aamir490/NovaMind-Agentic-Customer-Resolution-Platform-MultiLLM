@@ -38,11 +38,15 @@ test('diagnostics accepts empty records and safe fallback vocabularies', async (
   assert.deepEqual((await client(raw).diagnostics()).metrics, []);
   raw.events = [{ ...diagnosticsFixture().events[0], error: 'ERROR', tool: 'unknown' }];
   assert.equal((await client(raw).diagnostics()).events[0].error, 'ERROR');
+  for (const provider of ['groq', 'fake', 'other', null]) {
+    raw.events[0].provider = provider;
+    assert.equal((await client(raw).diagnostics()).events[0].provider, provider);
+  }
 });
 
 test('diagnostics rejects unsafe text and invalid values rather than rendering payloads', async () => {
   for (const change of [{ operation: '__proto__' }, { operation: 'PRIVATE' }, { error: 'PRIVATE' },
-    { provider: 'PRIVATE' }, { tool: 'PRIVATE' }, { status: 'PRIVATE' }, { method: 'PRIVATE' },
+    { provider: 'PRIVATE' }, { provider: 'gemini' }, { tool: 'PRIVATE' }, { status: 'PRIVATE' }, { method: 'PRIVATE' },
     { trace_id: 'PRIVATE' }, { reviewer_user_id: 'PRIVATE' }, { timestamp: 'PRIVATE' },
     { duration_ms: -1 }, { duration_ms: Infinity }, { input_tokens: -1 }, { input_tokens: 1e9 + 1 },
     { provider_called: 'true' }, { provider_status_code: 600 }, { invalid_response_stage: 'PRIVATE' }]) {

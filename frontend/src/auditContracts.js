@@ -48,7 +48,7 @@ export function auditRuns(page, binding, offset) {
     check(item?.instance_id === binding.instance_id && item.case_id === binding.case_id
       && uuid(item.run_id) && !seen.has(item.run_id) && optionalUuid(item.workflow_id)
       && statuses.includes(item.status) && timestamp(item.created_at) && timestamp(item.updated_at)
-      && item.provider === 'local_scripted' && item.actions_executed === false);
+      && ['local_scripted', 'groq'].includes(item.provider) && item.actions_executed === false);
     seen.add(item.run_id);
     return { run_id: item.run_id, workflow_id: item.workflow_id, status: item.status,
       created_at: item.created_at, updated_at: item.updated_at };

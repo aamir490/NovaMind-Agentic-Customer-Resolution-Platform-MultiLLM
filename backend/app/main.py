@@ -40,6 +40,7 @@ def health() -> HealthResponse:
 
 def create_app(*, auth_provider: AuthenticationProvider | None = None,
                observer: LocalObserver | None = None, local_provider_factory: Callable[[], LLMProvider] | None = None,
+               provider_label: Literal["local_scripted", "groq"] = "local_scripted",
                conversation_store: ConversationStore | None = None,
                startup_customers: tuple[Customer, ...] = ()) -> FastAPI:
     @asynccontextmanager
@@ -75,7 +76,8 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     app.state.observer = observer if observer is not None else LocalObserver()
     memory = ConversationService(conversation_store, app.state.case_service) if conversation_store is not None else None
     app.state.frontend_runtime = FrontendRuntime(app.state.case_service, app.state.local_tools,
-        app.state.proposal_service, local_provider_factory=local_provider_factory, memory=memory)
+        app.state.proposal_service, local_provider_factory=local_provider_factory,
+        provider_label=provider_label, memory=memory)
 
     @app.middleware("http")
     async def authentication(request: Request, call_next):

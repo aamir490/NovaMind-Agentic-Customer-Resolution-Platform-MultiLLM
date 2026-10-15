@@ -131,6 +131,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metric["total_tokens_known"], 15)
         self.assertEqual(metric["total_tokens_unknown_calls"], 2)
         self.assertNotIn("secret", json.dumps(self.snapshot()))
+        self.assertTrue(all(event["provider"] == "groq" for event in self.snapshot()["events"]))
 
     def test_usage_contract_rejects_coercion_and_negative_counts(self):
         for value in (True, -1, "12", 10**9 + 1):

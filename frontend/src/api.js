@@ -80,7 +80,7 @@ function knowledgeEvidence(event) {
 function runSnapshot(result, { instance_id, case_id, run_id }) {
   requireResponse(result?.instance_id === instance_id && result.case_id === case_id && isUuid(result.run_id)
     && (run_id === undefined || result.run_id === run_id) && runStatuses.includes(result.status)
-    && result.provider === 'local_scripted' && result.actions_executed === false
+    && ['local_scripted', 'groq'].includes(result.provider) && result.actions_executed === false
     && isOptionalUuid(result.workflow_id) && isOptionalUuid(result.conversation_id) && isOptionalUuid(result.trace_id)
     && isTimestamp(result.created_at) && isTimestamp(result.updated_at)
     && isCount(result.last_sequence) && isOptionalText(result.message) && isOptionalText(result.error), 'run snapshot');
@@ -141,7 +141,7 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
           || (identity.role === 'CUSTOMER'
             ? !isUuid(identity.customer_id)
             : identity.customer_id !== null)
-          || !isUuid(payload.instance_id) || !['unavailable', 'local_scripted'].includes(payload.provider)
+          || !isUuid(payload.instance_id) || !['unavailable', 'local_scripted', 'groq'].includes(payload.provider)
           || typeof payload.memory_available !== 'boolean') {
         throw new Error('Unexpected identity response.');
       }

@@ -62,3 +62,25 @@ test('empty case list is preserved and network failure is not hidden', async () 
   assert.deepEqual(await createApi(async () => ({ ok: true, json: async () => [] })).listCases(), []);
   await assert.rejects(createApi(async () => { throw new Error('Offline'); }).listCases(), /Offline/);
 });
+
+test('identity and run snapshots accept Groq and scripted labels but reject retired providers', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const instance_id = id(1), case_id = id(2), run_id = id(3);
+  const identity = { identity: { user_id: id(4), role: 'ADMIN', customer_id: null },
+    instance_id, provider: 'groq', memory_available: false };
+  const snapshot = { instance_id, case_id, run_id, provider: 'groq', status: 'RUNNING',
+    workflow_id: null, conversation_id: null, trace_id: null, reviewed_status: null,
+    created_at: '2026-10-15T00:00:00Z', updated_at: '2026-10-15T00:00:00Z',
+    last_sequence: 0, message: null, error: null, review: null, actions_executed: false };
+  const api = createApi(async (url) => ({ ok: true, json: async () => url.endsWith('/identity') ? identity : snapshot }));
+  for (const provider of ['groq', 'local_scripted']) {
+    identity.provider = provider;
+    snapshot.provider = provider;
+    assert.equal((await api.identity()).provider, provider);
+    assert.equal((await api.startRun({ instance_id, request_id: id(5), case_id, message: 'Review' })).provider, provider);
+  }
+  identity.provider = 'gemini';
+  await assert.rejects(api.identity(), /Unexpected identity response/);
+  snapshot.provider = 'gemini';
+  await assert.rejects(api.startRun({ instance_id, request_id: id(5), case_id, message: 'Review' }), /invalid run snapshot/);
+});

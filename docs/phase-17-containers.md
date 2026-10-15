@@ -54,6 +54,10 @@ egress and runtime configuration. See [Groq configuration, JSON compatibility, t
 limitations](phase-17b5a-groq.md). Live Groq and Docker execution are not verified
 by the mocked tests; Bedrock is not implemented.
 
+With Groq selected, identity and run snapshots report `groq`, and model diagnostics
+use the `groq` category. Scripted local providers retain `local_scripted` in
+identity and run snapshots; an absent provider reports `unavailable` in identity.
+
 ## Health and local verification
 
 The backend Docker health check calls only `http://127.0.0.1:8000/api/health`, with a two-second timeout, bounded response, disabled environment proxies, and no redirects. It validates the existing health response. It does not check a model, database, external service, authorization readiness, or workflow recovery.

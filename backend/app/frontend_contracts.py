@@ -19,7 +19,7 @@ class IdentityResponse(Contract):
     can_review: bool
     can_view_diagnostics: bool
     instance_id: UUID
-    provider: Literal["unavailable", "local_scripted"]
+    provider: Literal["unavailable", "local_scripted", "groq"]
     memory_available: bool
 
 
@@ -38,7 +38,7 @@ class RunSnapshot(Contract):
     case_id: UUID
     workflow_id: UUID | None = None
     conversation_id: UUID | None = None
-    provider: Literal["local_scripted"] = "local_scripted"
+    provider: Literal["local_scripted", "groq"] = "local_scripted"
     status: Literal["RUNNING", "RESUMING", "REVIEW_REQUIRED", "REVIEWED", "COMPLETED", "FAILED"]
     created_at: datetime
     updated_at: datetime
@@ -162,7 +162,7 @@ class TelemetryEvent(Contract):
     reviewer_user_id: UUID | None = None
     tool: str | None = None
     status: str | None = None
-    provider: Literal["gemini", "fake", "other"] | None = None
+    provider: Literal["groq", "fake", "other"] | None = None
     invalid_response_stage: Literal["provider_envelope", "json_guardrail", "output_schema"] | None = None
     output_schema_errors: tuple[OutputSchemaError, ...] | None = Field(default=None, max_length=MAX_SCHEMA_ERRORS)
     output_schema_errors_truncated: bool | None = Field(default=None, strict=True)

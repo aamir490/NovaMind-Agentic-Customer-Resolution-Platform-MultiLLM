@@ -118,9 +118,12 @@ failure. The logging addition does not change request construction, API/telemetr
 response contracts, or agent behavior.
 
 No business rules, ownership checks, tools, graph/HITL flow, proposals, RAG, memory,
-audit contracts, or customer portal code changed. Existing telemetry labels Groq
-as `other`; the HTTP local-factory label remains `local_scripted`. These compatibility
-labels are unchanged deliberately, and do not identify the actual provider.
+audit contracts, or customer portal code changed in this phase. At that time,
+telemetry labeled Groq `other` and the HTTP local-factory label was `local_scripted`.
+AI-01C later changed Groq telemetry and identity/run labels to `groq`, while
+preserving the scripted local labels and workflow behavior. Container bootstrap
+sets the Groq label explicitly; direct `create_app(local_provider_factory=...)`
+compositions using Groq must pass `provider_label="groq"` as a trusted argument.
 
 ## Verification and limits
 
