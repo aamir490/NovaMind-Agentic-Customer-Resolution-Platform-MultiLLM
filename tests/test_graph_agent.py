@@ -36,7 +36,7 @@ class GraphAgentTests(baseline.AgentTests):
             return {"stopReason": "tool_use", "output": {"message": {
                 "role": "assistant", "content": [{"toolUse": {
                     "toolUseId": "tooluse_offline", "name": "submit_json_response",
-                    "input": {"response": value}}}]}},
+                    "input": value}}]}},
                 "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
 
         client = Mock()
@@ -61,7 +61,7 @@ class GraphAgentTests(baseline.AgentTests):
         client.converse.side_effect = [{"stopReason": "tool_use", "output": {"message": {
             "role": "assistant", "content": [{"toolUse": {
                 "toolUseId": "tooluse_offline", "name": "submit_json_response",
-                "input": {"response": value}}}]}},
+                "input": value}}]}},
             "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
             for value in (self.proposal(), baseline.FINAL)]
         provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=client)

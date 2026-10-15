@@ -17,7 +17,9 @@ test('diagnostics uses authenticated bounded same-origin GET and a closed displa
   const raw = diagnosticsFixture();
   raw.secret = 'PRIVATE'; raw.metrics.llm.payload = 'PRIVATE';
   Object.assign(raw.events[0], { prompt: 'PRIVATE', reasoning: 'PRIVATE', credentials: 'PRIVATE',
-    model: 'PRIVATE', output_schema_errors: [{ input: 'PRIVATE' }], raw_payload: 'PRIVATE' });
+    model: 'PRIVATE', raw_payload: 'PRIVATE',
+    output_schema_errors: [{ type: 'dict_type', location: ['decision', 'tool', 'arguments'] }],
+    output_schema_errors_truncated: false });
   const api = createApi(async (url, options) => {
     assert.equal(url, '/api/diagnostics?limit=50');
     assert.equal(options.method, 'GET'); assert.equal(options.body, undefined);
@@ -30,6 +32,9 @@ test('diagnostics uses authenticated bounded same-origin GET and a closed displa
   assert.equal(value.events[0].input_tokens, null);
   assert.equal(value.events[0].output_tokens, 0);
   assert.equal(value.events[0].invalid_response_category, null);
+  assert.deepEqual(value.events[0].output_schema_errors,
+    [{ type: 'dict_type', location: ['decision', 'tool', 'arguments'] }]);
+  assert.equal(value.events[0].output_schema_errors_truncated, false);
   assert.equal(value.metrics[0].input_tokens_unknown_calls, 1);
 });
 
@@ -47,6 +52,7 @@ test('diagnostics accepts empty records and safe fallback vocabularies', async (
     raw.events[0].invalid_response_category = category;
     assert.equal((await client(raw).diagnostics()).events[0].invalid_response_category, category);
   }
+  assert.equal((await client(raw).diagnostics()).events[0].output_schema_errors, null);
 });
 
 test('diagnostics rejects unsafe text and invalid values rather than rendering payloads', async () => {
@@ -55,8 +61,19 @@ test('diagnostics rejects unsafe text and invalid values rather than rendering p
     { trace_id: 'PRIVATE' }, { reviewer_user_id: 'PRIVATE' }, { timestamp: 'PRIVATE' },
     { duration_ms: -1 }, { duration_ms: Infinity }, { input_tokens: -1 }, { input_tokens: 1e9 + 1 },
     { provider_called: 'true' }, { provider_status_code: 600 }, { invalid_response_stage: 'PRIVATE' },
-    { invalid_response_category: 'PRIVATE' }]) {
+    { invalid_response_category: 'PRIVATE' }, { output_schema_errors_truncated: 'true' }]) {
     const raw = diagnosticsFixture(); Object.assign(raw.events[0], change);
+    await assert.rejects(client(raw).diagnostics(), { code: 'INVALID_DIAGNOSTICS_RESPONSE' });
+  }
+  for (const errors of [
+    [{ type: 'PRIVATE', location: ['decision'] }],
+    [{ type: 'dict_type', location: ['PRIVATE'] }],
+    [{ type: 'dict_type', location: ['decision'], input: 'PRIVATE' }],
+    [{ type: 'dict_type', location: Array(9).fill('decision') }],
+    Array(9).fill({ type: 'dict_type', location: ['decision'] }),
+    'PRIVATE',
+  ]) {
+    const raw = diagnosticsFixture(); raw.events[0].output_schema_errors = errors;
     await assert.rejects(client(raw).diagnostics(), { code: 'INVALID_DIAGNOSTICS_RESPONSE' });
   }
   for (const change of [{ errors: 3 }, { provider_calls: 3 }, { input_tokens_unknown_calls: 3 },

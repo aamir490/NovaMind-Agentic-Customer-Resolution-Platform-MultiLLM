@@ -22,9 +22,11 @@ def completion(text=FINAL, reason="end_turn", usage=None):
     return result
 
 
-def tool_completion(value, *, name="submit_json_response", reason="tool_use", blocks=None):
+def tool_completion(value, *, name="submit_json_response", reason="tool_use", blocks=None,
+                    wrapped=False):
     content = blocks if blocks is not None else [{"toolUse": {
-        "toolUseId": "tooluse_offline", "name": name, "input": {"response": value}}}]
+        "toolUseId": "tooluse_offline", "name": name,
+        "input": {"response": value} if wrapped else value}}]
     return {"stopReason": reason, "output": {"message": {
         "role": "assistant", "content": content}},
         "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
@@ -120,7 +122,12 @@ class BedrockTests(unittest.TestCase):
                 spec = config["tools"][0]["toolSpec"]
                 self.assertEqual(spec["name"], "submit_json_response")
                 self.assertEqual(set(spec["inputSchema"]["json"]), {"type", "properties", "required"})
-                self.assertEqual(spec["inputSchema"]["json"]["required"], ["response"])
+                tool_schema = spec["inputSchema"]["json"]
+                self.assertEqual(tool_schema["required"], ["decision"])
+                decision = tool_schema["properties"]["decision"]
+                self.assertEqual(decision["required"], ["kind"])
+                self.assertEqual(decision["properties"]["kind"]["enum"], ["tool", "final"])
+                self.assertEqual(decision["properties"]["arguments"]["type"], "object")
                 self.assertEqual(json.loads(body["system"][-1]["text"].split("JSON Schema: ", 1)[1]),
                                  AgentDecision.model_json_schema())
                 self.assertIn("formatting tool does not execute application actions",
@@ -140,7 +147,7 @@ class BedrockTests(unittest.TestCase):
                      "input": {"response": json.loads(FINAL), "extra": "PRIVATE"}}}]),
                  tool_completion(json.loads(FINAL), blocks=[{"toolUse": {
                      "toolUseId": "tooluse_offline", "name": "submit_json_response",
-                     "input": {"response": FINAL}}}]),
+                     "input": FINAL}}]),
                  tool_completion(json.loads(FINAL), blocks=[correct, {"toolUse": {
                      "toolUseId": "tooluse_other", "name": "approve", "input": {}}}]),
                  tool_completion(json.loads(FINAL), blocks=[correct, {"unknown": "PRIVATE"}]))
@@ -167,8 +174,42 @@ class BedrockTests(unittest.TestCase):
         self.client.converse.return_value = tool_completion(json.loads(FINAL), blocks=[
             {"text": "PRIVATE model preamble"},
             {"toolUse": {"toolUseId": "tooluse_offline", "name": "submit_json_response",
-                         "input": {"response": json.loads(FINAL)}}}])
+                         "input": json.loads(FINAL)}}])
         self.assertTrue(StructuredLLM(provider).generate(self.request, AgentDecision).ok)
+
+    def test_nova_lite_schema_projection_rejects_stringified_arguments_without_coercion(self):
+        schema = AgentDecision.model_json_schema()
+        self.assertEqual(schema["$defs"]["JsonValue"], {})
+        self.assertEqual(schema["$defs"]["ToolCall"]["properties"]["arguments"]["type"], "object")
+        self.client.converse.return_value = tool_completion({"decision": {"kind": "tool",
+            "name": "get_case", "arguments": '{"case_id":"PRIVATE"}'}})
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+        result = StructuredLLM(provider).generate(self.request, AgentDecision)
+        self.assertEqual(result.code, "INVALID_RESPONSE")
+        self.assertNotIn("PRIVATE", result.model_dump_json())
+        tool_schema = self.client.converse.call_args.kwargs["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
+        self.assertEqual(tool_schema["properties"]["decision"]["properties"]["arguments"], {"type": "object"})
+
+    def test_nova_lite_other_response_models_keep_wrapped_tool_contract(self):
+        from pydantic import BaseModel
+
+        class Summary(BaseModel):
+            summary: str
+
+        self.client.converse.return_value = tool_completion({"summary": "done"}, wrapped=True)
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+        result = StructuredLLM(provider).generate(self.request, Summary)
+        self.assertTrue(result.ok)
+        schema = self.client.converse.call_args.kwargs["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
+        self.assertEqual(schema["required"], ["response"])
+
+    def test_nova_lite_agent_schema_drift_fails_before_client_call(self):
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+        schema = AgentDecision.model_json_schema()
+        schema["$defs"]["ToolCall"]["properties"]["arguments"]["type"] = "string"
+        with self.assertRaisesRegex(ValueError, "Unsupported AgentDecision schema"):
+            provider.generate(self.request, response_schema=schema)
+        self.client.converse.assert_not_called()
 
     def test_safe_errors_without_retry(self):
         class ServiceError(Exception):

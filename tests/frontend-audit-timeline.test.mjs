@@ -144,6 +144,21 @@ test('Diagnostics renders known zero, unknown usage, trace identifiers and reten
   assert.match(empty, /No recent operational events are available/);
 });
 
+test('Diagnostics renders only closed output schema field and error categories', () => {
+  const snapshot = diagnosticsSnapshot({ scope: 'process_metadata_only', snapshot_at: '2026-10-05T01:00:00Z',
+    events: [{ timestamp: '2026-10-05T00:00:00Z', operation: 'llm', trace_id: id(1), span_id: id(2),
+      parent_span_id: null, duration_ms: 8, error: 'INVALID_RESPONSE', provider: 'bedrock',
+      invalid_response_stage: 'output_schema', output_schema_errors: [
+        { type: 'dict_type', location: ['decision', 'tool', 'arguments'] }],
+      output_schema_errors_truncated: true, prompt: 'PRIVATE' }],
+    metrics: {}, evicted_events: 0, omitted_events: 0, logging_failures: 0 });
+  const html = renderToStaticMarkup(createElement(DiagnosticsSnapshot, { snapshot }));
+  assert.match(html, /decision\.tool\.arguments/);
+  assert.match(html, /dict_type/);
+  assert.match(html, /Additional issues omitted/);
+  assert.doesNotMatch(html, /PRIVATE/);
+});
+
 test('Cases, AI Workspace, Reviews, RAG and reviewed results remain renderable with shared frontend imports', () => {
   for (const name of ['CaseReview', 'AIWorkspace', 'ReviewQueue']) {
     const html = renderToStaticMarkup(createElement(integratedViews[name], { active: false }));

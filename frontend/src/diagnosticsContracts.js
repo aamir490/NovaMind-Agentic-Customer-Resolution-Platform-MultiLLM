@@ -10,6 +10,18 @@ const duration = (value) => typeof value === 'number' && Number.isFinite(value) 
 const uuid = (value) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const timestamp = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
 const oneOf = (values) => (value) => values.includes(value);
+const schemaErrorTypes = oneOf(['missing', 'extra_forbidden', 'union_tag_invalid', 'union_tag_not_found',
+  'literal_error', 'string_type', 'int_type', 'float_type', 'bool_type', 'dict_type', 'list_type',
+  'tuple_type', 'model_type', 'model_attributes_type', 'json_type', 'enum', 'uuid_type', 'uuid_parsing',
+  'string_too_short', 'string_too_long', 'string_pattern_mismatch', 'greater_than', 'greater_than_equal',
+  'less_than', 'less_than_equal', 'too_short', 'too_long', 'finite_number', 'value_error', 'assertion_error', 'other']);
+const schemaLocation = oneOf(['decision', 'kind', 'name', 'arguments', 'tool', 'final',
+  '<field>', '<index>', '<unknown>', '<truncated>']);
+const schemaErrors = (value) => Array.isArray(value) && value.length <= 8 && value.every((item) =>
+  item && typeof item === 'object' && !Array.isArray(item)
+  && Object.keys(item).length === 2 && Object.hasOwn(item, 'type') && Object.hasOwn(item, 'location')
+  && schemaErrorTypes(item.type) && Array.isArray(item.location) && item.location.length <= 8
+  && item.location.every(schemaLocation));
 const optionalFields = {
   workflow_id: uuid, case_id: uuid, proposal_id: uuid, reviewer_user_id: uuid,
   tool: oneOf([...auditTools, 'unknown']), status: oneOf(['INFORMATIONAL', 'HUMAN_REVIEW_REQUIRED', 'FAILED',
@@ -17,6 +29,7 @@ const optionalFields = {
   provider: oneOf(['groq', 'bedrock', 'fake', 'other']),
   invalid_response_stage: oneOf(['provider_envelope', 'json_guardrail', 'output_schema']),
   invalid_response_category: oneOf(['bedrock_empty_output', 'bedrock_nonempty_json_rejected']),
+  output_schema_errors_truncated: (value) => typeof value === 'boolean',
   method: oneOf(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']),
   status_code: (value) => count(value) && value >= 100 && value <= 599,
   provider_status_code: (value) => count(value) && value >= 100 && value <= 599,
@@ -62,7 +75,10 @@ export function diagnosticsSnapshot(payload) {
       check(value === null || validate(value));
       projected[key] = value;
     }
-    // No schema error objects, model text, headers, credentials or generic payloads.
+    const errors = event.output_schema_errors ?? null;
+    check(errors === null || schemaErrors(errors));
+    projected.output_schema_errors = errors?.map((item) => ({ type: item.type, location: [...item.location] })) ?? null;
+    // No model text, headers, credentials or generic payloads.
     return projected;
   });
   return { snapshot_at: payload.snapshot_at, metrics, events, evicted_events: payload.evicted_events,

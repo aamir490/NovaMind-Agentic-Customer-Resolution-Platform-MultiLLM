@@ -136,6 +136,24 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value_type=type(value).__name__):
                 self.assert_failure(self.generate(self.response(json.dumps(value))), "output_schema")
 
+    def test_nova_lite_stringified_arguments_report_only_closed_field_categories(self):
+        client = Mock()
+        client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
+            "role": "assistant", "content": [{"toolUse": {"toolUseId": "tooluse_offline",
+                "name": "submit_json_response", "input": {"decision": {"kind": "tool",
+                    "name": "get_case", "arguments": json.dumps({"case_id": OUTPUT})}}}}]}},
+            "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}}
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=client)
+        result = StructuredLLM(provider).generate(self.request, AgentDecision)
+        self.assert_failure(result, "output_schema")
+        event = self.observer.snapshot()["events"][-1]
+        self.assertEqual(event["provider"], "bedrock")
+        self.assertEqual(event["output_schema_errors"],
+                         [{"type": "dict_type", "location": ["decision", "tool", "arguments"]}])
+        self.assertFalse(event["output_schema_errors_truncated"])
+        self.assertNotIn(OUTPUT, self.output.getvalue())
+        client.converse.assert_called_once()
+
     def test_success_and_other_failures_do_not_inherit_validation_stage(self):
         self.assert_failure(self.generate(self.response(json.dumps({"summary": OUTPUT}))), "output_schema")
         valid = json.dumps({"summary": OUTPUT, "count": 1})

@@ -15,16 +15,48 @@ def _uses_format_tool(model_id: str) -> bool:
     return model_id == "amazon.nova-lite-v1:0" or model_id.endswith(".amazon.nova-lite-v1:0")
 
 
-def _format_tool_config() -> dict:
+def _decision_tool_schema(response_schema: dict) -> dict | None:
+    """Project AgentDecision's two variants into Nova's shallow tool schema."""
+    if response_schema.get("title") != "AgentDecision":
+        return None
+    definitions = response_schema.get("$defs", {})
+    decision = response_schema.get("properties", {}).get("decision", {})
+    if (response_schema.get("required") != ["decision"]
+            or {part.get("$ref") for part in decision.get("oneOf", [])}
+            != {"#/$defs/ToolCall", "#/$defs/Finish"}):
+        raise ValueError("Unsupported AgentDecision schema for Nova Lite")
+    tool = definitions.get("ToolCall", {})
+    finish = definitions.get("Finish", {})
+    tool_fields = tool.get("properties", {})
+    finish_fields = finish.get("properties", {})
+    if (set(tool.get("required", [])) != {"kind", "name", "arguments"}
+            or finish.get("required") != ["kind"]
+            or tool_fields.get("kind", {}).get("const") != "tool"
+            or finish_fields.get("kind", {}).get("const") != "final"
+            or tool_fields.get("name", {}).get("type") != "string"
+            or tool_fields.get("arguments", {}).get("type") != "object"):
+        raise ValueError("Unsupported AgentDecision schema for Nova Lite")
+    # JsonValue is recursive and renders as {} in Pydantic's schema. Do not send
+    # its unrestricted recursive definition to Nova; local validation stays exact.
+    return {"type": "object", "properties": {"decision": {"type": "object",
+        "properties": {"kind": {"type": "string", "enum": ["tool", "final"]},
+                       "name": {"type": "string"}, "arguments": {"type": "object"}},
+        "required": ["kind"]}}, "required": ["decision"]}
+
+
+def _format_tool_config(response_schema: dict) -> tuple[dict, bool]:
     # Nova tool schemas permit only type, properties, and required at the top level.
     # The full caller schema remains in the system instruction and is enforced locally.
+    decision_schema = _decision_tool_schema(response_schema)
+    wrapped = decision_schema is None
+    input_schema = decision_schema or {"type": "object", "properties": {
+        "response": {"type": "object", "description": "The JSON object matching the supplied schema."}},
+        "required": ["response"]}
     return {"tools": [{"toolSpec": {
         "name": _FORMAT_TOOL,
         "description": "Submit the requested JSON response as data. This formatting tool has no side effects.",
-        "inputSchema": {"json": {"type": "object", "properties": {
-            "response": {"type": "object", "description": "The JSON object matching the supplied schema."}},
-            "required": ["response"]}},
-    }}], "toolChoice": {"tool": {"name": _FORMAT_TOOL}}}
+        "inputSchema": {"json": input_schema},
+    }}], "toolChoice": {"tool": {"name": _FORMAT_TOOL}}}, wrapped
 
 
 def _usage(response: dict) -> TokenUsage | None:
@@ -102,10 +134,15 @@ class BedrockProvider:
         if not isinstance(response_schema, dict):
             raise TypeError("response_schema must be a dictionary")
         use_format_tool = _uses_format_tool(self.model_id)
+        tool_config, wrapped = _format_tool_config(response_schema) if use_format_tool else (None, False)
         prefix = ("Submit one JSON object matching this JSON Schema in the response field of "
                   f"the {_FORMAT_TOOL} formatting tool. Do not answer with text. "
                   "The formatting tool does not execute application actions. "
                   if use_format_tool else "Return only one JSON object matching this JSON Schema. ")
+        if use_format_tool and not wrapped:
+            prefix = ("Submit one JSON object matching this JSON Schema as the input of "
+                      f"the {_FORMAT_TOOL} formatting tool. Do not answer with text. "
+                      "The formatting tool does not execute application actions. ")
         role_instruction = ("You are a JSON decision generator. " if use_format_tool else
                             "You are a JSON decision generator; no provider-native tools are available. ")
         instruction = (
@@ -136,7 +173,7 @@ class BedrockProvider:
         parameters = {"modelId": self.model_id, "messages": messages, "system": system,
                       "inferenceConfig": {"maxTokens": request.max_output_tokens, "temperature": 0}}
         if use_format_tool:
-            parameters["toolConfig"] = _format_tool_config()
+            parameters["toolConfig"] = tool_config
         try:
             response = self._client.converse(**parameters)
         except Exception as error:
@@ -179,11 +216,15 @@ class BedrockProvider:
                 tool = block["toolUse"]
                 if (not isinstance(tool, dict) or set(tool) != {"toolUseId", "name", "input"}
                         or not isinstance(tool["toolUseId"], str) or not tool["toolUseId"]
-                        or tool["name"] != _FORMAT_TOOL or not isinstance(tool["input"], dict)
-                        or set(tool["input"]) != {"response"}
-                        or not isinstance(tool["input"]["response"], dict)):
+                        or tool["name"] != _FORMAT_TOOL or not isinstance(tool["input"], dict)):
                     return invalid
-                inputs.append(tool["input"]["response"])
+                if wrapped:
+                    if (set(tool["input"]) != {"response"}
+                            or not isinstance(tool["input"]["response"], dict)):
+                        return invalid
+                    inputs.append(tool["input"]["response"])
+                else:
+                    inputs.append(tool["input"])
             if len(inputs) != 1:
                 return invalid
             try:
