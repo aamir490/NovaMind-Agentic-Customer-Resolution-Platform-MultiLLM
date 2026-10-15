@@ -175,6 +175,11 @@ function App() {
         <div className="sidebar-head">
           <a className="brand" href="#workspace" aria-label="NovaMind AI — go to workspace">
             <img src={logoUrl} alt="NovaMind AI" className="brand-logo" width="130" height="65" />
+            <span className="brand-text">
+              <span className="brand-name">NovaMind <span className="brand-ai">AI</span></span>
+              <span className="brand-caption">Customer Resolution Platform</span>
+              <span className="brand-credit">Built by Aamir</span>
+            </span>
           </a>
           <button type="button" className="mobile-nav-toggle" aria-expanded={mobileNavOpen}
             aria-controls="workspace-navigation" onClick={() => setMobileNavOpen((open) => !open)}>
@@ -243,9 +248,7 @@ function App() {
             </div>
           </div>
 
-          {/* The logo artwork contains the single "Built by Aamir" attribution. */}
           <div className="sidebar-attribution">
-            <span className="sr-only">Built by Aamir</span>
             <div className="sidebar-social">
               <a
                 href="https://github.com/aamir490"
