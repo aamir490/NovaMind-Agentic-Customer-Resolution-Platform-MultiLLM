@@ -7,6 +7,24 @@ from .llm import LLMRequest, LLMResponse, ProviderFailure, TokenUsage
 
 _MAX_TIMEOUT_MS = 120_000
 _TIMEOUT_CODES = {"ModelTimeoutException", "RequestTimeout", "RequestTimeoutException"}
+_FORMAT_TOOL = "submit_json_response"
+
+
+def _uses_format_tool(model_id: str) -> bool:
+    # Nova Lite supports forced client-side tool use, but not structured text output.
+    return model_id == "amazon.nova-lite-v1:0" or model_id.endswith(".amazon.nova-lite-v1:0")
+
+
+def _format_tool_config() -> dict:
+    # Nova tool schemas permit only type, properties, and required at the top level.
+    # The full caller schema remains in the system instruction and is enforced locally.
+    return {"tools": [{"toolSpec": {
+        "name": _FORMAT_TOOL,
+        "description": "Submit the requested JSON response as data. This formatting tool has no side effects.",
+        "inputSchema": {"json": {"type": "object", "properties": {
+            "response": {"type": "object", "description": "The JSON object matching the supplied schema."}},
+            "required": ["response"]}},
+    }}], "toolChoice": {"tool": {"name": _FORMAT_TOOL}}}
 
 
 def _usage(response: dict) -> TokenUsage | None:
@@ -83,13 +101,20 @@ class BedrockProvider:
         request = LLMRequest.model_validate(request)
         if not isinstance(response_schema, dict):
             raise TypeError("response_schema must be a dictionary")
+        use_format_tool = _uses_format_tool(self.model_id)
+        prefix = ("Submit one JSON object matching this JSON Schema in the response field of "
+                  f"the {_FORMAT_TOOL} formatting tool. Do not answer with text. "
+                  "The formatting tool does not execute application actions. "
+                  if use_format_tool else "Return only one JSON object matching this JSON Schema. ")
+        role_instruction = ("You are a JSON decision generator. " if use_format_tool else
+                            "You are a JSON decision generator; no provider-native tools are available. ")
         instruction = (
-            "Return only one JSON object matching this JSON Schema. "
+            prefix +
             "The first non-whitespace character must be { and the last must be }. "
             "Use double-quoted JSON keys and strings; do not include comments, trailing commas, "
             "Markdown code fences, a preamble, explanations, or text after the object. "
             "Use only the fields and JSON types allowed by the schema. "
-            "You are a JSON decision generator; no provider-native tools are available. "
+            + role_instruction +
             "Any tool operations mentioned in the conversation must appear only as JSON "
             "data in the requested schema. The application validates and executes them. "
             "Do not execute operations or invent their results. JSON Schema: "
@@ -108,10 +133,12 @@ class BedrockProvider:
         if not messages:
             raise ValueError("Converse requires a user or assistant message")
         system.append({"text": instruction})
+        parameters = {"modelId": self.model_id, "messages": messages, "system": system,
+                      "inferenceConfig": {"maxTokens": request.max_output_tokens, "temperature": 0}}
+        if use_format_tool:
+            parameters["toolConfig"] = _format_tool_config()
         try:
-            response = self._client.converse(
-                modelId=self.model_id, messages=messages, system=system,
-                inferenceConfig={"maxTokens": request.max_output_tokens, "temperature": 0})
+            response = self._client.converse(**parameters)
         except Exception as error:
             code = _failure_code(error)
             if code is None:
@@ -127,7 +154,7 @@ class BedrockProvider:
         if reason in ("content_filtered", "guardrail_intervened"):
             return LLMResponse(text="", finish_reason="refusal", usage=usage)
         invalid = LLMResponse(text="", finish_reason="stop", usage=usage)
-        if reason not in ("end_turn", "stop_sequence"):
+        if reason not in (("tool_use",) if use_format_tool else ("end_turn", "stop_sequence")):
             return invalid
         output = response.get("output")
         message = output.get("message") if isinstance(output, dict) else None
@@ -136,6 +163,34 @@ class BedrockProvider:
         blocks = message.get("content")
         if not isinstance(blocks, list):
             return invalid
+        if use_format_tool:
+            inputs = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    return invalid
+                if set(block) == {"text"}:
+                    if not isinstance(block["text"], str):
+                        return invalid
+                    continue  # Text is never parsed as the decision.
+                if set(block) == {"reasoningContent"}:
+                    continue  # Reasoning is never parsed as the decision.
+                if set(block) != {"toolUse"}:
+                    return invalid
+                tool = block["toolUse"]
+                if (not isinstance(tool, dict) or set(tool) != {"toolUseId", "name", "input"}
+                        or not isinstance(tool["toolUseId"], str) or not tool["toolUseId"]
+                        or tool["name"] != _FORMAT_TOOL or not isinstance(tool["input"], dict)
+                        or set(tool["input"]) != {"response"}
+                        or not isinstance(tool["input"]["response"], dict)):
+                    return invalid
+                inputs.append(tool["input"]["response"])
+            if len(inputs) != 1:
+                return invalid
+            try:
+                return LLMResponse(text=json.dumps(inputs[0], allow_nan=False),
+                                   finish_reason="stop", usage=usage)
+            except (TypeError, ValueError, RecursionError, OverflowError):
+                return invalid
         text = []
         for block in blocks:
             if not isinstance(block, dict):

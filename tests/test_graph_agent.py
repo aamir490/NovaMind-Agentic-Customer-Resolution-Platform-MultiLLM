@@ -1,13 +1,14 @@
 """Phase 9 graph routing and parity tests; all generation is scripted and local."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from langgraph.errors import GraphRecursionError
 from pydantic import ValidationError
 
 import test_agent as baseline
 from backend.app.agent import AgentConfig, ResolutionAgent
+from backend.app.bedrock import BedrockProvider
 from backend.app.graph_agent import GraphResolutionAgent, GraphState
 from backend.app.llm import StructuredLLM
 
@@ -29,6 +30,48 @@ class GraphAgentTests(baseline.AgentTests):
         self.assertIsNone(self.state.staged_event)
         self.assertIsNone(self.agent._graph.checkpointer)
         self.assertIsNone(self.agent._graph.store)
+
+    def test_nova_lite_format_tool_keeps_graph_tool_and_final_decisions_local(self):
+        def formatted(value):
+            return {"stopReason": "tool_use", "output": {"message": {
+                "role": "assistant", "content": [{"toolUse": {
+                    "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                    "input": {"response": value}}}]}},
+                "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
+
+        client = Mock()
+        client.converse.side_effect = [
+            formatted(baseline.call("get_inventory", sku="LAP-1")),
+            formatted(baseline.FINAL),
+        ]
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=client)
+        agent = GraphResolutionAgent(StructuredLLM(provider), self.tools)
+        with patch.object(self.tools, "invoke", wraps=self.tools.invoke) as invoke:
+            state = agent.run_state(self.request)
+        self.assertEqual(state.final_result.status, "INFORMATIONAL")
+        self.assertEqual(state.node_path, (
+            "load_case", "reason", "execute_tool", "record_result", "reason", "finalize"))
+        self.assertEqual([call.args[0] for call in invoke.call_args_list], ["get_case", "get_inventory"])
+        self.assertEqual(client.converse.call_count, 2)
+        self.assertTrue(all("toolConfig" in call.kwargs for call in client.converse.call_args_list))
+        self.assertEqual(len(self.proposals.list_for_case(self.case.id)), 0)
+
+    def test_nova_lite_format_tool_preserves_pending_human_review(self):
+        client = Mock()
+        client.converse.side_effect = [{"stopReason": "tool_use", "output": {"message": {
+            "role": "assistant", "content": [{"toolUse": {
+                "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                "input": {"response": value}}}]}},
+            "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
+            for value in (self.proposal(), baseline.FINAL)]
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=client)
+        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(self.request)
+        self.assertEqual(result.status, "HUMAN_REVIEW_REQUIRED")
+        self.assertEqual(len(result.pending_proposal_ids), 1)
+        self.assertEqual(len(self.proposals.list_for_case(self.case.id)), 1)
+        self.assertEqual(self.proposals.list_for_case(self.case.id)[0].status, "PENDING_REVIEW")
+        self.assertFalse(result.actions_executed)
+        self.assertEqual(client.converse.call_count, 2)
 
     def test_failure_edges_keep_audit_once(self):
         self.run_script([baseline.call("approve")])

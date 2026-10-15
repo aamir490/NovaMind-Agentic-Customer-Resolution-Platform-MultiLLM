@@ -22,6 +22,14 @@ def completion(text=FINAL, reason="end_turn", usage=None):
     return result
 
 
+def tool_completion(value, *, name="submit_json_response", reason="tool_use", blocks=None):
+    content = blocks if blocks is not None else [{"toolUse": {
+        "toolUseId": "tooluse_offline", "name": name, "input": {"response": value}}}]
+    return {"stopReason": reason, "output": {"message": {
+        "role": "assistant", "content": content}},
+        "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
+
+
 class BedrockTests(unittest.TestCase):
     def setUp(self):
         self.client = Mock()
@@ -91,6 +99,76 @@ class BedrockTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.client.converse.return_value = payload
                 self.assertEqual(self.result().code, "INVALID_RESPONSE")
+
+    def test_nova_lite_uses_one_forced_format_tool_with_the_existing_schema(self):
+        for model_id in ("amazon.nova-lite-v1:0", "us.amazon.nova-lite-v1:0",
+                         "eu.amazon.nova-lite-v1:0"):
+            with self.subTest(model_id=model_id):
+                self.client.converse.reset_mock()
+                self.client.converse.return_value = tool_completion(json.loads(FINAL))
+                provider = BedrockProvider(model_id=model_id, client=self.client)
+                result = StructuredLLM(provider).generate(self.request, AgentDecision)
+                self.assertTrue(result.ok)
+                self.assertEqual(result.data.decision.kind, "final")
+                self.client.converse.assert_called_once()
+                body = self.client.converse.call_args.kwargs
+                self.assertEqual(body["modelId"], model_id)
+                self.assertEqual(body["inferenceConfig"], {"maxTokens": 2048, "temperature": 0})
+                config = body["toolConfig"]
+                self.assertEqual(config["toolChoice"], {"tool": {"name": "submit_json_response"}})
+                self.assertEqual(len(config["tools"]), 1)
+                spec = config["tools"][0]["toolSpec"]
+                self.assertEqual(spec["name"], "submit_json_response")
+                self.assertEqual(set(spec["inputSchema"]["json"]), {"type", "properties", "required"})
+                self.assertEqual(spec["inputSchema"]["json"]["required"], ["response"])
+                self.assertEqual(json.loads(body["system"][-1]["text"].split("JSON Schema: ", 1)[1]),
+                                 AgentDecision.model_json_schema())
+                self.assertIn("formatting tool does not execute application actions",
+                              body["system"][-1]["text"])
+                self.assertNotIn("outputConfig", body)
+
+    def test_nova_lite_rejects_text_fallback_and_ambiguous_tool_envelopes(self):
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+        correct = tool_completion(json.loads(FINAL))["output"]["message"]["content"][0]
+        cases = (completion(FINAL), tool_completion(json.loads(FINAL), name="get_inventory"),
+                 tool_completion(json.loads(FINAL), reason="end_turn"),
+                 tool_completion(json.loads(FINAL), blocks=[]),
+                 tool_completion(json.loads(FINAL), blocks=[correct, correct]),
+                 tool_completion(json.loads(FINAL), blocks=[{"text": FINAL}]),
+                 tool_completion(json.loads(FINAL), blocks=[{"toolUse": {
+                     "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                     "input": {"response": json.loads(FINAL), "extra": "PRIVATE"}}}]),
+                 tool_completion(json.loads(FINAL), blocks=[{"toolUse": {
+                     "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                     "input": {"response": FINAL}}}]),
+                 tool_completion(json.loads(FINAL), blocks=[correct, {"toolUse": {
+                     "toolUseId": "tooluse_other", "name": "approve", "input": {}}}]),
+                 tool_completion(json.loads(FINAL), blocks=[correct, {"unknown": "PRIVATE"}]))
+        for payload in cases:
+            with self.subTest(payload_type=payload["stopReason"], content=payload["output"]["message"]["content"]):
+                self.client.converse.return_value = payload
+                result = StructuredLLM(provider).generate(self.request, AgentDecision)
+                self.assertEqual(result.code, "INVALID_RESPONSE")
+                self.assertNotIn("PRIVATE", result.model_dump_json())
+
+    def test_nova_lite_tool_input_still_passes_strict_json_and_schema_validation(self):
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+        for value in ({"decision": {"kind": "final", "extra": "PRIVATE"}},
+                      {"decision": {"kind": "tool", "name": "get_inventory"}},
+                      {"decision": {"kind": "tool", "name": "approve", "arguments": []}}):
+            with self.subTest(value=value):
+                self.client.converse.return_value = tool_completion(value)
+                self.assertEqual(StructuredLLM(provider).generate(self.request, AgentDecision).code,
+                                 "INVALID_RESPONSE")
+        self.client.converse.return_value = tool_completion({"decision": {"kind": "final"},
+                                                              "non_finite": float("nan")})
+        self.assertEqual(StructuredLLM(provider).generate(self.request, AgentDecision).code,
+                         "INVALID_RESPONSE")
+        self.client.converse.return_value = tool_completion(json.loads(FINAL), blocks=[
+            {"text": "PRIVATE model preamble"},
+            {"toolUse": {"toolUseId": "tooluse_offline", "name": "submit_json_response",
+                         "input": {"response": json.loads(FINAL)}}}])
+        self.assertTrue(StructuredLLM(provider).generate(self.request, AgentDecision).ok)
 
     def test_safe_errors_without_retry(self):
         class ServiceError(Exception):
