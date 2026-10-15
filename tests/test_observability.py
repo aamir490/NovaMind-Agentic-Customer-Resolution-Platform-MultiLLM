@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from backend.app.agent import AgentConfig, AgentDecision, AgentRequest, ResolutionAgent
 from backend.app.graph_agent import GraphResolutionAgent
+from backend.app.bedrock import BedrockProvider
 from backend.app.groq import GroqProvider
 from backend.app.guardrails import MAX_PROMPT_CHARS
 from backend.app.hitl import HITLWorkflow
@@ -132,6 +133,20 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metric["total_tokens_unknown_calls"], 2)
         self.assertNotIn("secret", json.dumps(self.snapshot()))
         self.assertTrue(all(event["provider"] == "groq" for event in self.snapshot()["events"]))
+
+    def test_mocked_bedrock_usage_has_distinct_provider_label(self):
+        client = Mock()
+        client.converse.return_value = {"stopReason": "end_turn", "output": {"message": {
+            "role": "assistant", "content": [{"text": json.dumps(FINAL)}]}},
+            "usage": {"inputTokens": 7, "outputTokens": 2, "totalTokens": 9}}
+        with observing(self.observer):
+            result = StructuredLLM(BedrockProvider(model_id="test.model", client=client)).generate(
+                LLMRequest(messages=(LLMMessage(role="user", content="Review"),)), AgentDecision)
+        self.assertTrue(result.ok)
+        event = self.snapshot()["events"][-1]
+        self.assertEqual(event["provider"], "bedrock")
+        self.assertEqual((event["input_tokens"], event["output_tokens"], event["total_tokens"]), (7, 2, 9))
+        client.converse.assert_called_once()
 
     def test_usage_contract_rejects_coercion_and_negative_counts(self):
         for value in (True, -1, "12", 10**9 + 1):

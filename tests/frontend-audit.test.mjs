@@ -44,6 +44,7 @@ test('case and run lists reject mismatches, duplicate IDs and invalid offsets', 
   }
   const valid = { scope: 'case_runs_in_this_process', items: [run()], next_offset: null };
   assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'groq' }] }).auditRuns(binding)).items.length, 1);
+  assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'bedrock' }] }).auditRuns(binding)).items.length, 1);
   for (const change of [{ instance_id: id(9) }, { case_id: id(9) }, { run_id: 'bad' },
     { workflow_id: 'PRIVATE' }, { status: 'PRIVATE' }, { provider: 'gemini' },
     { actions_executed: true }, { updated_at: 'PRIVATE' }]) {

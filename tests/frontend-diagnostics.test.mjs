@@ -38,7 +38,7 @@ test('diagnostics accepts empty records and safe fallback vocabularies', async (
   assert.deepEqual((await client(raw).diagnostics()).metrics, []);
   raw.events = [{ ...diagnosticsFixture().events[0], error: 'ERROR', tool: 'unknown' }];
   assert.equal((await client(raw).diagnostics()).events[0].error, 'ERROR');
-  for (const provider of ['groq', 'fake', 'other', null]) {
+  for (const provider of ['groq', 'bedrock', 'fake', 'other', null]) {
     raw.events[0].provider = provider;
     assert.equal((await client(raw).diagnostics()).events[0].provider, provider);
   }

@@ -26,4 +26,4 @@ Keep business rules independent of FastAPI and Strands. Keep authorization outsi
 
 ## Dependencies
 
-`requirements.in` lists direct runtime dependencies. `requirements.txt` is a `pip freeze` snapshot of the installed bootstrap environment, not a hash-verified dependency lock. Phase 0C preserves both files and uses the installed environment without installation. Any later dependency update must be separately scoped, resolved in an isolated environment, verified, and reviewed. Do not generate a snapshot from global Python packages.
+`requirements.in` lists direct runtime dependencies. `requirements.txt` started as a `pip freeze` snapshot of the installed bootstrap environment and is not a hash-verified dependency lock. AI-02B adds pinned boto3 and its required transitive packages from published package metadata without installing or resolving the full environment; that dependency set still needs an isolated install and verification before deployment. Do not generate a snapshot from global Python packages.

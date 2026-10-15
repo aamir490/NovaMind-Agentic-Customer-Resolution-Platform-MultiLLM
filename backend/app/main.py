@@ -40,7 +40,7 @@ def health() -> HealthResponse:
 
 def create_app(*, auth_provider: AuthenticationProvider | None = None,
                observer: LocalObserver | None = None, local_provider_factory: Callable[[], LLMProvider] | None = None,
-               provider_label: Literal["local_scripted", "groq"] = "local_scripted",
+               provider_label: Literal["local_scripted", "groq", "bedrock"] = "local_scripted",
                conversation_store: ConversationStore | None = None,
                startup_customers: tuple[Customer, ...] = ()) -> FastAPI:
     @asynccontextmanager

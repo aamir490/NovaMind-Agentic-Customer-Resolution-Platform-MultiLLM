@@ -63,7 +63,7 @@ test('empty case list is preserved and network failure is not hidden', async () 
   await assert.rejects(createApi(async () => { throw new Error('Offline'); }).listCases(), /Offline/);
 });
 
-test('identity and run snapshots accept Groq and scripted labels but reject retired providers', async () => {
+test('identity and run snapshots accept Bedrock, Groq and scripted labels but reject retired providers', async () => {
   const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
   const instance_id = id(1), case_id = id(2), run_id = id(3);
   const identity = { identity: { user_id: id(4), role: 'ADMIN', customer_id: null },
@@ -73,7 +73,7 @@ test('identity and run snapshots accept Groq and scripted labels but reject reti
     created_at: '2026-10-15T00:00:00Z', updated_at: '2026-10-15T00:00:00Z',
     last_sequence: 0, message: null, error: null, review: null, actions_executed: false };
   const api = createApi(async (url) => ({ ok: true, json: async () => url.endsWith('/identity') ? identity : snapshot }));
-  for (const provider of ['groq', 'local_scripted']) {
+  for (const provider of ['groq', 'bedrock', 'local_scripted']) {
     identity.provider = provider;
     snapshot.provider = provider;
     assert.equal((await api.identity()).provider, provider);

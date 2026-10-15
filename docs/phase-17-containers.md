@@ -52,11 +52,39 @@ unavailable even when Groq credentials are present. Any stale `GEMINI_*` variabl
 or unknown provider selector stops startup. Use `compose.groq.yaml` for backend
 egress and runtime configuration. See [Groq configuration, JSON compatibility, tests, and
 limitations](phase-17b5a-groq.md). Live Groq and Docker execution are not verified
-by the mocked tests; Bedrock is not implemented.
+by the mocked tests.
 
 With Groq selected, identity and run snapshots report `groq`, and model diagnostics
 use the `groq` category. Scripted local providers retain `local_scripted` in
 identity and run snapshots; an absent provider reports `unavailable` in identity.
+
+## Optional Bedrock provider wiring (AI-02B)
+
+Set `NOVAMIND_LLM_PROVIDER=bedrock`, `AWS_REGION` (for example, `us-east-1`),
+and `BEDROCK_MODEL_ID` to a Converse-compatible model ID, inference-profile ID,
+or supported Bedrock ARN. Both configuration values are required and validated
+locally at startup; malformed values stop startup with a fixed error. An unset
+selector remains unavailable, and unknown selectors and stale `GEMINI_*`
+configuration still stop startup. Region/model syntax validation does not check
+whether a model is available or whether the runtime has permission to invoke it.
+
+For Compose, add `-f compose.bedrock.yaml` to the base and auth overlays. This
+backend-only overlay supplies the selector, region, model ID, and outbound
+network access. It supplies **no credentials**. Make a standard boto3 credential
+provider available to the backend process at runtime, such as a workload role,
+an injected environment credential set, or a mounted shared profile. The code
+passes no access key, secret key, profile, or custom endpoint to boto3; the
+runtime identity needs permission for `bedrock:InvokeModel` on the selected
+model or inference profile. Keep credentials outside the repository, Compose
+files, and frontend configuration. See [boto3 credential resolution](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html)
+and [Converse model selection](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
+
+Identity and run snapshots report `bedrock`; model diagnostics use `bedrock`.
+The Bedrock adapter requests JSON in a system instruction, while existing
+application validation still decides whether the response is usable. SDK
+connection/read timeouts are bounded at 30 seconds each and automatic SDK
+retries are disabled. Offline mocked tests do not verify live AWS access or
+model-specific Converse support.
 
 ## Health and local verification
 

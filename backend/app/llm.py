@@ -80,6 +80,7 @@ class StructuredLLM:
         request = LLMRequest.model_validate(request)
         provider_type = (type(self._provider).__module__, type(self._provider).__name__)
         provider = {("backend.app.groq", "GroqProvider"): "groq",
+                    ("backend.app.bedrock", "BedrockProvider"): "bedrock",
                     (__name__, "FakeLLMProvider"): "fake"}.get(provider_type, "other")
         annotate(provider_called=False, provider=provider, output_token_limit=request.max_output_tokens,
                  input_tokens=None, output_tokens=None, total_tokens=None)

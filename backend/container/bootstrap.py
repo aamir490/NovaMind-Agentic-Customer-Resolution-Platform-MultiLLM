@@ -4,7 +4,9 @@ from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
+import re
 
+from backend.app.bedrock import BedrockProvider
 from backend.app.domain import Customer
 from backend.app.groq import GroqProvider
 from backend.app.main import create_app
@@ -55,7 +57,7 @@ def _authentication_provider():
 
 
 def _llm_provider():
-    # Reject retired configuration even when Groq is selected; never ignore a stale key.
+    # Reject retired configuration under every selector; never ignore a stale key.
     if any(name.startswith("GEMINI_") for name in os.environ):
         raise RuntimeError("Container LLM provider selection is invalid")
     selected = os.environ.get("NOVAMIND_LLM_PROVIDER")
@@ -66,6 +68,24 @@ def _llm_provider():
             return GroqProvider()
         except Exception:
             raise RuntimeError("Container Groq configuration is invalid") from None
+    if selected == "bedrock":
+        try:
+            region = os.environ.get("AWS_REGION", "")
+            model_id = os.environ.get("BEDROCK_MODEL_ID", "")
+            # Validate syntax locally; model availability and permissions are
+            # determined by AWS only when a request is made.
+            if not re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+){1,3}-[0-9]{1,2}", region):
+                raise ValueError("Invalid Bedrock region")
+            identifier = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}"
+            arn = (r"arn:aws(?:-us-gov|-cn)?:bedrock:[a-z0-9-]{1,32}:"
+                   r"(?:[0-9]{12})?:(?:foundation-model|inference-profile|"
+                   r"application-inference-profile)/" + identifier)
+            if not ((not model_id.startswith("arn:") and re.fullmatch(identifier, model_id))
+                    or re.fullmatch(arn, model_id)):
+                raise ValueError("Invalid Bedrock model ID")
+            return BedrockProvider(model_id=model_id, region_name=region)
+        except Exception:
+            raise RuntimeError("Container Bedrock configuration is invalid") from None
     raise RuntimeError("Container LLM provider selection is invalid")
 
 
@@ -76,7 +96,8 @@ def create_container_app():
     try:
         app = create_app(auth_provider=auth_provider,
                          local_provider_factory=(lambda: provider) if provider is not None else None,
-                         provider_label="groq" if provider is not None else "local_scripted",
+                         provider_label=os.environ["NOVAMIND_LLM_PROVIDER"] if provider is not None
+                                        else "local_scripted",
                          startup_customers=startup_customers)
     except Exception:
         if provider is not None:

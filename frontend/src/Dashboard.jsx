@@ -150,6 +150,7 @@ function SystemStatus({ identity }) {
             : 'M18 6L6 18M6 6l12 12'} />
         </svg>
         Provider: {identity.provider === 'groq' ? 'Groq'
+          : identity.provider === 'bedrock' ? 'Amazon Bedrock'
           : providerOk ? 'Local scripted' : 'Unavailable'}
       </div>
       <div className={`db-system-pill db-system-pill--${identity.memory_available ? 'ok' : 'muted'}`}>

@@ -83,7 +83,7 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
         self.constructor.assert_not_called()
 
     def test_invalid_selector_fails_closed(self):
-        for selector in ("", " ", "GROQ", "gemini", "bedrock", "SECRET"):
+        for selector in ("", " ", "GROQ", "gemini", "Bedrock", "SECRET"):
             os.environ["NOVAMIND_LLM_PROVIDER"] = selector
             with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
                 create_container_app()

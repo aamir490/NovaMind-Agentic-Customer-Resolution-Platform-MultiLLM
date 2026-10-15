@@ -21,7 +21,7 @@ before(async () => {
   const diagnostics = await server.ssrLoadModule('/src/DiagnosticsWorkspace.jsx');
   DiagnosticsWorkspace = diagnostics.default;
   DiagnosticsSnapshot = diagnostics.DiagnosticsSnapshot;
-  for (const name of ['CaseReview', 'AIWorkspace', 'ReviewQueue', 'ReviewRunResult', 'KnowledgeEvidence']) {
+  for (const name of ['CaseReview', 'AIWorkspace', 'Dashboard', 'ReviewQueue', 'ReviewRunResult', 'KnowledgeEvidence']) {
     integratedViews[name] = (await server.ssrLoadModule(`/src/${name}.jsx`)).default;
   }
 });
@@ -162,4 +162,13 @@ test('Cases, AI Workspace, Reviews, RAG and reviewed results remain renderable w
   } }));
   assert.match(result, /APPROVED/);
   assert.match(result, /No business action executed/);
+});
+
+test('Bedrock identity is displayed with its own provider label', () => {
+  const identity = { provider: 'bedrock', role: 'ADMIN', instance_id: id(1), memory_available: false };
+  const ai = renderToStaticMarkup(createElement(integratedViews.AIWorkspace, { api: {}, identity }));
+  const dashboard = renderToStaticMarkup(createElement(integratedViews.Dashboard, { api: {}, identity }));
+  assert.match(ai, /Amazon Bedrock/);
+  assert.match(dashboard, /Provider: Amazon Bedrock/);
+  assert.doesNotMatch(ai + dashboard, /Local scripted/);
 });
