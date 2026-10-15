@@ -99,6 +99,9 @@ def _metadata(fields):
                 "provider_envelope", "json_guardrail", "output_schema"}:
             # Internal fixed labels only; never include validation errors or inputs.
             safe[key] = value
+        elif key == "invalid_response_category" and type(value) is str and value in {
+                "bedrock_empty_output", "bedrock_nonempty_json_rejected"}:
+            safe[key] = value
         elif key == "output_schema_errors":
             safe[key] = _schema_errors(value)
         elif key == "output_schema_errors_truncated" and type(value) is bool:

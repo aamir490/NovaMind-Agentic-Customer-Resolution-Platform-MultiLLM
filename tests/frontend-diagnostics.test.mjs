@@ -29,6 +29,7 @@ test('diagnostics uses authenticated bounded same-origin GET and a closed displa
   assert.equal(JSON.stringify(value).includes('PRIVATE'), false);
   assert.equal(value.events[0].input_tokens, null);
   assert.equal(value.events[0].output_tokens, 0);
+  assert.equal(value.events[0].invalid_response_category, null);
   assert.equal(value.metrics[0].input_tokens_unknown_calls, 1);
 });
 
@@ -42,6 +43,10 @@ test('diagnostics accepts empty records and safe fallback vocabularies', async (
     raw.events[0].provider = provider;
     assert.equal((await client(raw).diagnostics()).events[0].provider, provider);
   }
+  for (const category of ['bedrock_empty_output', 'bedrock_nonempty_json_rejected']) {
+    raw.events[0].invalid_response_category = category;
+    assert.equal((await client(raw).diagnostics()).events[0].invalid_response_category, category);
+  }
 });
 
 test('diagnostics rejects unsafe text and invalid values rather than rendering payloads', async () => {
@@ -49,7 +54,8 @@ test('diagnostics rejects unsafe text and invalid values rather than rendering p
     { provider: 'PRIVATE' }, { provider: 'gemini' }, { tool: 'PRIVATE' }, { status: 'PRIVATE' }, { method: 'PRIVATE' },
     { trace_id: 'PRIVATE' }, { reviewer_user_id: 'PRIVATE' }, { timestamp: 'PRIVATE' },
     { duration_ms: -1 }, { duration_ms: Infinity }, { input_tokens: -1 }, { input_tokens: 1e9 + 1 },
-    { provider_called: 'true' }, { provider_status_code: 600 }, { invalid_response_stage: 'PRIVATE' }]) {
+    { provider_called: 'true' }, { provider_status_code: 600 }, { invalid_response_stage: 'PRIVATE' },
+    { invalid_response_category: 'PRIVATE' }]) {
     const raw = diagnosticsFixture(); Object.assign(raw.events[0], change);
     await assert.rejects(client(raw).diagnostics(), { code: 'INVALID_DIAGNOSTICS_RESPONSE' });
   }

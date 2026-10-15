@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
 
 from backend.app.agent import AgentDecision
+from backend.app.bedrock import BedrockProvider
 from backend.app.frontend_contracts import DiagnosticsResponse, OutputSchemaError, TelemetryEvent
 from backend.app.guardrails import MAX_DEPTH, MAX_PAYLOAD_CHARS, MAX_PROMPT_CHARS
 from backend.app.llm import LLMMessage, LLMRequest, LLMResponse, ProviderFailure, StructuredLLM, TokenUsage
@@ -95,6 +96,38 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                      " " * MAX_PAYLOAD_CHARS + OUTPUT):
             with self.subTest(size=len(text)):
                 self.assert_failure(self.generate(self.response(text)), "json_guardrail")
+                self.assertNotIn("invalid_response_category", self.observer.snapshot()["events"][-1])
+
+    async def test_bedrock_empty_and_nonempty_json_failures_have_closed_categories(self):
+        client = Mock()
+        provider = BedrockProvider(model_id="test.model-v1", client=client)
+        for text, category in (("", "bedrock_empty_output"),
+                               (OUTPUT, "bedrock_nonempty_json_rejected")):
+            with self.subTest(category=category):
+                client.converse.return_value = {"stopReason": "end_turn", "output": {"message": {
+                    "role": "assistant", "content": [{"text": text}]}}}
+                result = StructuredLLM(provider).generate(self.request, Summary)
+                self.assertEqual(result.code, "INVALID_RESPONSE")
+                event = self.observer.snapshot()["events"][-1]
+                self.assertEqual(event["provider"], "bedrock")
+                self.assertEqual(event["invalid_response_stage"], "json_guardrail")
+                self.assertEqual(event["invalid_response_category"], category)
+                self.assertNotIn(OUTPUT, json.dumps(event))
+                self.assertNotIn(PROMPT, json.dumps(event))
+                self.assertNotIn(OUTPUT, result.model_dump_json())
+        self.assertEqual(client.converse.call_count, 2)
+        app = create_app(auth_provider=self.auth, observer=self.observer)
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://local.test") as http_client:
+            response = await http_client.get("/api/diagnostics", headers={"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(response.status_code, 200)
+        events = [event for event in response.json()["events"] if event["operation"] == "llm"]
+        self.assertEqual([event["invalid_response_category"] for event in events],
+                         ["bedrock_empty_output", "bedrock_nonempty_json_rejected"])
+        self.assertNotIn(OUTPUT, response.text)
+        self.assertNotIn(PROMPT, response.text)
+        self.assertNotIn(TOKEN, response.text)
+        self.assertNotIn(OUTPUT, self.output.getvalue())
 
     def test_output_schema_rejection_preserves_strict_types_and_extra_field_policy(self):
         for value in ({"summary": OUTPUT}, {"summary": OUTPUT, "count": "1"},
@@ -136,6 +169,14 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("invalid_response_stage", event)
             self.assertNotIn("validation_errors", event)
             self.assertFalse(event["provider_called"])
+        self.assertNotIn(OUTPUT, self.output.getvalue())
+        self.assertNotIn(TOKEN, self.output.getvalue())
+
+    def test_category_metadata_rejects_unknown_strings_and_objects(self):
+        for value in (OUTPUT, TOKEN, "", None, 1, [], {"private": OUTPUT}, RuntimeError(OUTPUT)):
+            with span("llm"):
+                annotate(invalid_response_category=value)
+            self.assertNotIn("invalid_response_category", self.observer.snapshot()["events"][-1])
         self.assertNotIn(OUTPUT, self.output.getvalue())
         self.assertNotIn(TOKEN, self.output.getvalue())
 
@@ -186,12 +227,20 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         for value in (OUTPUT, "", "schema", 1, True, [], {"private": OUTPUT}):
             with self.subTest(value_type=type(value).__name__), self.assertRaises(ValidationError):
                 TelemetryEvent.model_validate({**event, "invalid_response_stage": value})
+        for value in (OUTPUT, "", "schema", 1, True, [], {"private": OUTPUT}):
+            with self.subTest(category_type=type(value).__name__), self.assertRaises(ValidationError):
+                TelemetryEvent.model_validate({**event, "invalid_response_category": value})
+        for category in ("bedrock_empty_output", "bedrock_nonempty_json_rejected"):
+            self.assertEqual(TelemetryEvent.model_validate(
+                {**event, "invalid_response_category": category}).invalid_response_category, category)
         for field in ("prompt", "model_output", "credentials", "validation_errors"):
             with self.subTest(field=field), self.assertRaises(ValidationError):
                 TelemetryEvent.model_validate({**event, field: OUTPUT})
         self.assertIsNone(TelemetryEvent.model_validate({**event, "invalid_response_stage": None}).invalid_response_stage)
         self.assertIsNone(TelemetryEvent.model_validate(
             {key: value for key, value in event.items() if key != "invalid_response_stage"}).invalid_response_stage)
+        self.assertIsNone(TelemetryEvent.model_validate({**event, "invalid_response_category": None}).invalid_response_category)
+        self.assertIsNone(TelemetryEvent.model_validate(event).invalid_response_category)
 
     def test_schema_error_contract_matches_sanitized_vocabulary_and_optional_defaults(self):
         self.assertEqual(set(get_args(OutputSchemaError.model_fields["type"].annotation)), SCHEMA_ERROR_TYPES | {"other"})

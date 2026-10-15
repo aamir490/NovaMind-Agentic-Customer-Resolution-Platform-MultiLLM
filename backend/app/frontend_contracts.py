@@ -164,6 +164,7 @@ class TelemetryEvent(Contract):
     status: str | None = None
     provider: Literal["groq", "bedrock", "fake", "other"] | None = None
     invalid_response_stage: Literal["provider_envelope", "json_guardrail", "output_schema"] | None = None
+    invalid_response_category: Literal["bedrock_empty_output", "bedrock_nonempty_json_rejected"] | None = None
     output_schema_errors: tuple[OutputSchemaError, ...] | None = Field(default=None, max_length=MAX_SCHEMA_ERRORS)
     output_schema_errors_truncated: bool | None = Field(default=None, strict=True)
     method: str | None = None

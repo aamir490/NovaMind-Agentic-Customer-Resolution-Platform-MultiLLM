@@ -16,6 +16,7 @@ const optionalFields = {
     'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'PENDING_REVIEW', 'APPROVED', 'REJECTED']),
   provider: oneOf(['groq', 'bedrock', 'fake', 'other']),
   invalid_response_stage: oneOf(['provider_envelope', 'json_guardrail', 'output_schema']),
+  invalid_response_category: oneOf(['bedrock_empty_output', 'bedrock_nonempty_json_rejected']),
   method: oneOf(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']),
   status_code: (value) => count(value) && value >= 100 && value <= 599,
   provider_status_code: (value) => count(value) && value >= 100 && value <= 599,

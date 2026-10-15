@@ -107,6 +107,9 @@ class StructuredLLM:
             validate_response_json(response.text)
         except (ValidationError, GuardrailError):
             annotate(invalid_response_stage="json_guardrail")
+            if provider == "bedrock":
+                annotate(invalid_response_category=(
+                    "bedrock_empty_output" if response.text == "" else "bedrock_nonempty_json_rejected"))
             return LLMFailure(code="INVALID_RESPONSE", message="Output does not match the requested JSON model")
         try:
             data = output_model.model_validate_json(response.text, strict=True)

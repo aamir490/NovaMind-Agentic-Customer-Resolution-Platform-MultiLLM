@@ -121,6 +121,7 @@ export function DiagnosticsSnapshot({ snapshot }) {
                   {event.provider_called !== null && <Fact label="Provider call recorded">{event.provider_called ? 'Yes' : 'No'}</Fact>}
                   {event.provider_status_code !== null && <Fact label="Provider HTTP status">{event.provider_status_code}</Fact>}
                   {event.invalid_response_stage !== null && <Fact label="Invalid response stage">{event.invalid_response_stage}</Fact>}
+                  {event.invalid_response_category !== null && <Fact label="Invalid response category">{event.invalid_response_category}</Fact>}
                   {event.reviewer_authenticated !== null && <Fact label="Reviewer authenticated at event">{event.reviewer_authenticated ? 'Yes' : 'No'}</Fact>}
                 </dl>
                 {(event.operation === 'llm' || event.provider_called === true

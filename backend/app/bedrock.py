@@ -85,7 +85,10 @@ class BedrockProvider:
             raise TypeError("response_schema must be a dictionary")
         instruction = (
             "Return only one JSON object matching this JSON Schema. "
-            "Do not include Markdown, explanations, or extra fields. "
+            "The first non-whitespace character must be { and the last must be }. "
+            "Use double-quoted JSON keys and strings; do not include comments, trailing commas, "
+            "Markdown code fences, a preamble, explanations, or text after the object. "
+            "Use only the fields and JSON types allowed by the schema. "
             "You are a JSON decision generator; no provider-native tools are available. "
             "Any tool operations mentioned in the conversation must appear only as JSON "
             "data in the requested schema. The application validates and executes them. "
@@ -108,7 +111,7 @@ class BedrockProvider:
         try:
             response = self._client.converse(
                 modelId=self.model_id, messages=messages, system=system,
-                inferenceConfig={"maxTokens": request.max_output_tokens})
+                inferenceConfig={"maxTokens": request.max_output_tokens, "temperature": 0})
         except Exception as error:
             code = _failure_code(error)
             if code is None:

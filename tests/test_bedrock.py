@@ -44,12 +44,17 @@ class BedrockTests(unittest.TestCase):
         self.client.converse.assert_called_once()
         body = self.client.converse.call_args.kwargs
         self.assertEqual(body["modelId"], "test.model-v1")
-        self.assertEqual(body["inferenceConfig"], {"maxTokens": 2048})
+        self.assertEqual(body["inferenceConfig"], {"maxTokens": 2048, "temperature": 0})
         self.assertEqual(body["messages"], [
             {"role": "user", "content": [{"text": "Question"}]},
             {"role": "assistant", "content": [{"text": FINAL}]},
             {"role": "user", "content": [{"text": "Follow-up"}]}])
         self.assertEqual(body["system"][0], {"text": "Business instructions"})
+        instruction = body["system"][-1]["text"]
+        for phrase in ("first non-whitespace character must be {", "last must be }",
+                       "double-quoted JSON keys and strings", "trailing commas",
+                       "Markdown code fences", "text after the object"):
+            self.assertIn(phrase, instruction)
         self.assertEqual(json.loads(body["system"][-1]["text"].split("JSON Schema: ", 1)[1]), schema)
         self.assertEqual(json.dumps(schema, sort_keys=True), before)
         self.assertNotIn("toolConfig", body)
