@@ -8,6 +8,8 @@ from .llm import LLMRequest, LLMResponse, ProviderFailure, TokenUsage
 _MAX_TIMEOUT_MS = 120_000
 _TIMEOUT_CODES = {"ModelTimeoutException", "RequestTimeout", "RequestTimeoutException"}
 _FORMAT_TOOL = "submit_json_response"
+_FINAL_FORMAT_TOOL = "submit_final_decision"
+_TOOL_FORMAT_TOOL = "submit_tool_decision"
 
 
 def _uses_format_tool(model_id: str) -> bool:
@@ -15,8 +17,8 @@ def _uses_format_tool(model_id: str) -> bool:
     return model_id == "amazon.nova-lite-v1:0" or model_id.endswith(".amazon.nova-lite-v1:0")
 
 
-def _decision_tool_schema(response_schema: dict) -> dict | None:
-    """Project AgentDecision's two variants into Nova's shallow tool schema."""
+def _decision_tool_schemas(response_schema: dict) -> dict[str, dict] | None:
+    """Give each AgentDecision variant its own shallow Nova tool schema."""
     if response_schema.get("title") != "AgentDecision":
         return None
     definitions = response_schema.get("$defs", {})
@@ -36,27 +38,40 @@ def _decision_tool_schema(response_schema: dict) -> dict | None:
             or tool_fields.get("name", {}).get("type") != "string"
             or tool_fields.get("arguments", {}).get("type") != "object"):
         raise ValueError("Unsupported AgentDecision schema for Nova Lite")
-    # JsonValue is recursive and renders as {} in Pydantic's schema. Do not send
-    # its unrestricted recursive definition to Nova; local validation stays exact.
-    return {"type": "object", "properties": {"decision": {"type": "object",
-        "properties": {"kind": {"type": "string", "enum": ["tool", "final"]},
-                       "name": {"type": "string"}, "arguments": {"type": "object"}},
-        "required": ["kind"]}}, "required": ["decision"]}
+    # JsonValue is recursive and renders as {} in Pydantic's schema. Keep the
+    # provider projection shallow; the original union is validated locally.
+    return {
+        _FINAL_FORMAT_TOOL: {"type": "object", "properties": {"decision": {
+            "type": "object", "properties": {"kind": {"type": "string", "enum": ["final"]}},
+            "required": ["kind"]}}, "required": ["decision"]},
+        _TOOL_FORMAT_TOOL: {"type": "object", "properties": {"decision": {
+            "type": "object", "properties": {"kind": {"type": "string", "enum": ["tool"]},
+                                          "name": {"type": "string"},
+                                          "arguments": {"type": "object"}},
+            "required": ["kind", "name", "arguments"]}}, "required": ["decision"]},
+    }
 
 
 def _format_tool_config(response_schema: dict) -> tuple[dict, bool]:
     # Nova tool schemas permit only type, properties, and required at the top level.
     # The full caller schema remains in the system instruction and is enforced locally.
-    decision_schema = _decision_tool_schema(response_schema)
-    wrapped = decision_schema is None
-    input_schema = decision_schema or {"type": "object", "properties": {
+    decision_schemas = _decision_tool_schemas(response_schema)
+    if decision_schemas is not None:
+        descriptions = {
+            _FINAL_FORMAT_TOOL: "Submit a final decision when the case review is complete. No side effects.",
+            _TOOL_FORMAT_TOOL: "Submit a tool-call decision for application validation. No side effects.",
+        }
+        return {"tools": [{"toolSpec": {"name": name, "description": descriptions[name],
+                "inputSchema": {"json": schema}}} for name, schema in decision_schemas.items()],
+                "toolChoice": {"any": {}}}, False
+    input_schema = {"type": "object", "properties": {
         "response": {"type": "object", "description": "The JSON object matching the supplied schema."}},
         "required": ["response"]}
     return {"tools": [{"toolSpec": {
         "name": _FORMAT_TOOL,
         "description": "Submit the requested JSON response as data. This formatting tool has no side effects.",
         "inputSchema": {"json": input_schema},
-    }}], "toolChoice": {"tool": {"name": _FORMAT_TOOL}}}, wrapped
+    }}], "toolChoice": {"tool": {"name": _FORMAT_TOOL}}}, True
 
 
 def _usage(response: dict) -> TokenUsage | None:
@@ -141,8 +156,9 @@ class BedrockProvider:
                   if use_format_tool else "Return only one JSON object matching this JSON Schema. ")
         if use_format_tool and not wrapped:
             prefix = ("Submit one JSON object matching this JSON Schema as the input of "
-                      f"the {_FORMAT_TOOL} formatting tool. Do not answer with text. "
-                      "The formatting tool does not execute application actions. ")
+                      f"the {_FINAL_FORMAT_TOOL} formatting tool for a final decision or "
+                      f"the {_TOOL_FORMAT_TOOL} formatting tool for a tool-call decision. "
+                      "Do not answer with text. The formatting tools do not execute application actions. ")
         role_instruction = ("You are a JSON decision generator. " if use_format_tool else
                             "You are a JSON decision generator; no provider-native tools are available. ")
         instruction = (
@@ -202,6 +218,7 @@ class BedrockProvider:
             return invalid
         if use_format_tool:
             inputs = []
+            decision_kinds = {_FINAL_FORMAT_TOOL: "final", _TOOL_FORMAT_TOOL: "tool"}
             for block in blocks:
                 if not isinstance(block, dict):
                     return invalid
@@ -216,7 +233,9 @@ class BedrockProvider:
                 tool = block["toolUse"]
                 if (not isinstance(tool, dict) or set(tool) != {"toolUseId", "name", "input"}
                         or not isinstance(tool["toolUseId"], str) or not tool["toolUseId"]
-                        or tool["name"] != _FORMAT_TOOL or not isinstance(tool["input"], dict)):
+                        or not isinstance(tool["name"], str)
+                        or tool["name"] not in ({_FORMAT_TOOL} if wrapped else decision_kinds)
+                        or not isinstance(tool["input"], dict)):
                     return invalid
                 if wrapped:
                     if (set(tool["input"]) != {"response"}
@@ -224,6 +243,10 @@ class BedrockProvider:
                         return invalid
                     inputs.append(tool["input"]["response"])
                 else:
+                    decision = tool["input"].get("decision")
+                    if (not isinstance(decision, dict)
+                            or decision.get("kind") != decision_kinds[tool["name"]]):
+                        return invalid
                     inputs.append(tool["input"])
             if len(inputs) != 1:
                 return invalid

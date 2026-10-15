@@ -35,7 +35,9 @@ class GraphAgentTests(baseline.AgentTests):
         def formatted(value):
             return {"stopReason": "tool_use", "output": {"message": {
                 "role": "assistant", "content": [{"toolUse": {
-                    "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                    "toolUseId": "tooluse_offline",
+                    "name": ("submit_final_decision" if value["decision"]["kind"] == "final"
+                             else "submit_tool_decision"),
                     "input": value}}]}},
                 "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
 
@@ -60,7 +62,9 @@ class GraphAgentTests(baseline.AgentTests):
         client = Mock()
         client.converse.side_effect = [{"stopReason": "tool_use", "output": {"message": {
             "role": "assistant", "content": [{"toolUse": {
-                "toolUseId": "tooluse_offline", "name": "submit_json_response",
+                "toolUseId": "tooluse_offline",
+                "name": ("submit_final_decision" if value["decision"]["kind"] == "final"
+                         else "submit_tool_decision"),
                 "input": value}}]}},
             "usage": {"inputTokens": 7, "outputTokens": 8, "totalTokens": 15}}
             for value in (self.proposal(), baseline.FINAL)]

@@ -140,7 +140,7 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
             "role": "assistant", "content": [{"toolUse": {"toolUseId": "tooluse_offline",
-                "name": "submit_json_response", "input": {"decision": {"kind": "tool",
+                "name": "submit_tool_decision", "input": {"decision": {"kind": "tool",
                     "name": "get_case", "arguments": json.dumps({"case_id": OUTPUT})}}}}]}},
             "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}}
         provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=client)
