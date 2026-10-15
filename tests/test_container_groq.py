@@ -11,7 +11,6 @@ from uuid import UUID, uuid4
 import httpx
 import yaml
 
-from backend.app.gemini import GeminiProvider
 from backend.app.agent import AgentDecision, ToolCall, agent_instructions
 from backend.app.groq import GroqProvider
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
@@ -20,7 +19,6 @@ from backend.container.bootstrap import _llm_provider, create_container_app
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = {"NOVAMIND_LLM_PROVIDER": "groq", "GROQ_API_KEY": "test-only-groq-key"}
-GEMINI = {"GEMINI_API_KEY": "test-only-gemini-key", "GEMINI_MODEL": "gemini-test"}
 TOKEN = "container-groq-admin-test-token"
 
 
@@ -33,7 +31,6 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
         self.decisions = []
         self.client = self.enterContext(httpx.Client(transport=httpx.MockTransport(self.handle)))
         self.constructor = self.enterContext(patch("backend.app.groq.httpx.Client", return_value=self.client))
-        self.gemini = self.enterContext(patch("backend.app.gemini.genai.Client"))
 
     def handle(self, request):
         self.calls.append(request)
@@ -46,31 +43,35 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
             return await client.request(method, path, json=body,
                 headers={"Authorization": f"Bearer {token}"} if token else {})
 
-    def test_absent_selector_preserves_legacy_gemini_and_never_auto_enables_groq(self):
+    def test_absent_selector_keeps_provider_unavailable_even_with_groq_key(self):
         self.assertIsNone(_llm_provider())
         os.environ["GROQ_API_KEY"] = CONFIG["GROQ_API_KEY"]
         self.assertIsNone(_llm_provider())
-        os.environ.update(GEMINI)
-        with _llm_provider() as provider:
-            self.assertIsInstance(provider, GeminiProvider)
+        self.assertIsNone(create_container_app().state.frontend_runtime.provider_factory)
         self.constructor.assert_not_called()
-        self.gemini.assert_called_once()
 
-    def test_explicit_selection_with_both_credentials_uses_only_selected_provider(self):
-        os.environ.update({**CONFIG, **GEMINI})
+    def test_stale_gemini_configuration_fails_closed_with_or_without_groq_selection(self):
+        for name in ("GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_FUTURE"):
+            for selected in (None, "groq"):
+                with self.subTest(name=name, selected=selected):
+                    config = {name: ""}
+                    if selected is not None:
+                        config.update(CONFIG)
+                    with patch.dict(os.environ, config, clear=True):
+                        with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
+                            create_container_app()
+        self.constructor.assert_not_called()
+
+    def test_explicit_selection_uses_groq(self):
+        os.environ.update(CONFIG)
         with _llm_provider() as provider:
             self.assertIsInstance(provider, GroqProvider)
             self.assertEqual(provider.model, "openai/gpt-oss-20b")
-        self.gemini.assert_not_called()
-        os.environ["NOVAMIND_LLM_PROVIDER"] = "gemini"
-        with _llm_provider() as provider:
-            self.assertIsInstance(provider, GeminiProvider)
         self.constructor.assert_called_once()
-        self.gemini.assert_called_once()
         self.assertEqual(self.calls, [])
 
-    def test_selected_groq_missing_configuration_never_falls_back_to_gemini(self):
-        invalid = ({"NOVAMIND_LLM_PROVIDER": "groq", **GEMINI},
+    def test_selected_groq_missing_configuration_fails_closed(self):
+        invalid = ({"NOVAMIND_LLM_PROVIDER": "groq"},
                    {**CONFIG, "GROQ_API_KEY": ""}, {**CONFIG, "GROQ_MODEL": ""},
                    {**CONFIG, "GROQ_MODEL": "https://SECRET.invalid"})
         for config in invalid:
@@ -80,28 +81,22 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(caught.exception.__suppress_context__)
                 self.assertNotIn("SECRET", str(caught.exception))
         self.constructor.assert_not_called()
-        self.gemini.assert_not_called()
 
-    def test_invalid_selector_and_explicit_unconfigured_gemini_fail_closed(self):
-        for selector in ("", " ", "GROQ", "bedrock", "SECRET"):
+    def test_invalid_selector_fails_closed(self):
+        for selector in ("", " ", "GROQ", "gemini", "bedrock", "SECRET"):
             os.environ["NOVAMIND_LLM_PROVIDER"] = selector
             with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
                 create_container_app()
-        os.environ["NOVAMIND_LLM_PROVIDER"] = "gemini"
-        with self.assertRaisesRegex(RuntimeError, "^Container Gemini configuration is invalid$"):
-            create_container_app()
         self.constructor.assert_not_called()
-        self.gemini.assert_not_called()
 
     def test_client_construction_failure_sanitized_and_no_fallback(self):
-        os.environ.update({**CONFIG, **GEMINI})
+        os.environ.update(CONFIG)
         self.constructor.side_effect = ValueError("SECRET configuration")
         with patch("backend.container.bootstrap.create_app") as app_factory:
             with self.assertRaisesRegex(RuntimeError, "^Container Groq configuration is invalid$") as caught:
                 create_container_app()
             self.assertTrue(caught.exception.__suppress_context__)
             app_factory.assert_not_called()
-        self.gemini.assert_not_called()
 
     def test_authentication_validated_first_and_app_failure_closes_groq(self):
         os.environ.update(CONFIG)
@@ -161,7 +156,6 @@ class ContainerGroqTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(CONFIG["GROQ_API_KEY"], snapshot.text)
         self.assertTrue(runtime._closed)
         self.assertTrue(self.client.is_closed)
-        self.gemini.assert_not_called()
         self.assertEqual(len(self.calls), 2)
         self.assertEqual([call.args for call in invoke.call_args_list], [
             ("get_case", {"case_id": str(case.id)}), ("get_order", {"order_id": str(order.id)})])

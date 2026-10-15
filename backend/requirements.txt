@@ -9,7 +9,6 @@ cryptography==50.0.2
 distro==1.9.0
 fastapi==0.142.0
 google-auth==2.59.1
-google-genai==2.26.0
 h11==0.16.0
 httpcore==1.0.9
 httpcore2==2.13.1

@@ -377,7 +377,6 @@ flowchart TD
 | `backend/app/proposals.py` | Proposal lifecycle |
 | `backend/app/observability.py` | Safe trace/event metadata |
 | `backend/app/groq.py` | External Groq provider adapter |
-| `backend/app/gemini.py` | Alternative implemented adapter; not the current deployed provider |
 | `backend/container/ecs_entrypoint.py` | ECS auth material setup and API startup |
 
 > These code paths and behaviors are documented by the uploaded original README. A separate source-code audit would be needed to re-confirm their contents against the current checked-out commit.
@@ -468,7 +467,6 @@ The source calls this retrieval approach **`local_token_cosine_v1`**. It is **no
 | API/backend | Python 3.12, FastAPI, Uvicorn, Pydantic, HTTPX | Single backend Fargate application |
 | Agent runtime | LangGraph and application-managed Python tools | Bounded tool and HITL flows |
 | Model provider | Groq, OpenAI-compatible HTTP adapter | Current deployed LLM configuration |
-| Alternate model adapter | Gemini | Present in documented code, not the currently deployed provider |
 | Local data/retrieval | Local domain services, JSON knowledge, token cosine | Some deployed state is process-local |
 | Containers | Docker | Current AWS topology needs backend container on Fargate |
 | AWS edge/static | CloudFront, S3, OAC | Viewer HTTPS and private frontend |

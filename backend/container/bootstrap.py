@@ -4,10 +4,8 @@ from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
-import re
 
 from backend.app.domain import Customer
-from backend.app.gemini import GeminiProvider
 from backend.app.groq import GroqProvider
 from backend.app.main import create_app
 from backend.app.security import LocalAuthenticationProvider, LocalCredential, Role
@@ -56,34 +54,13 @@ def _authentication_provider():
     return provider, startup_customers
 
 
-def _gemini_provider():
-    # Explicit runtime injection only; no .env loading or alternative key lookup.
-    key = os.environ.get("GEMINI_API_KEY")
-    model = os.environ.get("GEMINI_MODEL")
-    if key is None and model is None:
-        return None
-    try:
-        if (not key or len(key) > 4096 or not key.isascii()
-                or any(character.isspace() or not character.isprintable() for character in key)):
-            raise ValueError("Invalid key")
-        if not model or not re.fullmatch(r"(?:models/)?gemini-[A-Za-z0-9][A-Za-z0-9._-]{0,127}", model):
-            raise ValueError("Invalid model")
-        return GeminiProvider(model=model)
-    except Exception:
-        # SDK errors can include configuration values; expose only a fixed message.
-        raise RuntimeError("Container Gemini configuration is invalid") from None
-
-
 def _llm_provider():
+    # Reject retired configuration even when Groq is selected; never ignore a stale key.
+    if any(name.startswith("GEMINI_") for name in os.environ):
+        raise RuntimeError("Container LLM provider selection is invalid")
     selected = os.environ.get("NOVAMIND_LLM_PROVIDER")
     if selected is None:
-        # Preserve existing Gemini opt-in behavior; Groq is never auto-selected.
-        return _gemini_provider()
-    if selected == "gemini":
-        provider = _gemini_provider()
-        if provider is None:
-            raise RuntimeError("Container Gemini configuration is invalid")
-        return provider
+        return None
     if selected == "groq":
         try:
             return GroqProvider()

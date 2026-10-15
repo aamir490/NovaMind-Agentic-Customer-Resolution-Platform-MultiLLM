@@ -3,7 +3,8 @@
 `backend/app/groq.py` implements the existing `LLMProvider` protocol through
 Groq's OpenAI-compatible `https://api.groq.com/openai/v1/chat/completions` endpoint.
 It reuses installed HTTPX; no new SDK, package, endpoint, or fallback routing is added.
-Gemini's adapter and existing configuration behavior are unchanged. Bedrock is not implemented.
+At the time of this phase, the previous adapter was unchanged. AI-01B later
+retired that adapter and its runtime configuration. Bedrock is not implemented.
 
 ## Schema compatibility
 
@@ -59,12 +60,9 @@ or build arguments. Bootstrap does not load `.env` files.
   no whitespace. Invalid or missing configuration stops startup with a fixed error.
 - `GROQ_MODEL`: optional model ID, default `openai/gpt-oss-20b`. A blank value is
   invalid. Direct `GroqProvider(model=...)` overrides this environment value.
-- `NOVAMIND_LLM_PROVIDER=gemini`: explicitly select existing Gemini wiring, requiring
-  both `GEMINI_API_KEY` and `GEMINI_MODEL`.
-- With no selector, the previous Gemini behavior remains: neither Gemini variable
-  means unavailable; partial/invalid Gemini configuration fails startup. Groq
-  credentials alone never auto-enable Groq. With a selector, only the selected
-  provider's configuration is used, even when both sets of credentials exist.
+- With no selector, the provider remains unavailable, even if Groq credentials
+  are present. Any stale `GEMINI_*` variable stops startup, including when Groq
+  is explicitly selected.
 
 Unknown or blank selector values stop startup. Authentication is validated first
 and is still required; provider configuration grants no access. Startup makes no
@@ -72,7 +70,7 @@ inference call. One shared client is closed after existing workflow workers drai
 
 The optional `compose.groq.yaml` overlay sets the selector, injects the key, supplies
 the default model, and attaches only the backend to the existing outbound `edge`
-network, following the Gemini overlay pattern. Use one provider overlay at a time.
+network.
 After securely injecting `GROQ_API_KEY` and configuring `NOVAMIND_AUTH_SOURCE`:
 
 ```powershell
@@ -130,11 +128,8 @@ Focused tests mock external HTTP with `httpx.MockTransport`, including a real
 Groq adapter call through the existing authenticated run route. They cover request
 construction, environment validation, explicit selection, canonical decisions,
 JSON guardrails, failures, reasoning exclusion, budgets, and client cleanup.
-Existing Gemini, structured LLM, and diagnostic tests provide regression coverage.
-
-```powershell
-./backend/.venv/Scripts/python.exe -B -m unittest tests.test_groq tests.test_container_groq tests.test_llm tests.test_gemini tests.test_container_gemini tests.test_llm_diagnostics tests.test_gemini_diagnostics -v
-```
+At the time, the focused regression included structured LLM, diagnostic, and
+now-retired provider tests. The counts below are historical; AI-01B did not rerun them.
 
 Focused result: **74 tests passed**, including 23 new Groq adapter/bootstrap tests.
 
@@ -148,20 +143,16 @@ Before the runtime-debugging follow-up, broader backend regression also passed:
 `git diff --check` passed. The test runner emitted asyncio slow-task diagnostics,
 but no test failures. No frontend build or unrelated package installation ran.
 
-The runtime-debugging follow-up adds seven focused logging/redaction tests.
-**81 tests passed** with the following command; broader regression was not repeated:
-
-```powershell
-./backend/.venv/Scripts/python.exe -B -m unittest tests.test_groq_diagnostics tests.test_groq tests.test_container_groq tests.test_llm tests.test_gemini tests.test_container_gemini tests.test_llm_diagnostics tests.test_gemini_diagnostics -q
-```
+The runtime-debugging follow-up added seven focused logging/redaction tests.
+**81 tests passed** with the then-current focused suite; broader regression was not repeated.
 
 No real Groq inference or Docker runtime test was performed by these implementation
 tests. The user's reported runtime evidence is noted above. Live JSON adherence
 after the compatibility fix still requires an explicit real runtime test. Mocked
 integration does not establish live end-to-end verification or production readiness.
 
-The native-call compatibility fix passed **83 focused tests** using the same focused
-command above. It adds regression tests for rejecting native tool responses and
+The native-call compatibility fix passed **83 focused tests** using that then-current
+suite. It added regression tests for rejecting native tool responses and
 retaining sanitized handling of the exact reported HTTP 400. The authenticated
 runtime test now supplies a JSON `get_order` decision followed by a final decision,
 verifies execution through NovaMind's dispatcher, and checks that both Groq requests

@@ -2,20 +2,24 @@
 
 Container configuration and focused local checks are implemented. **14/14 Phase 17 tests passed**, both Compose configurations validated, and the frontend built offline using installed dependencies. **Image builds and running-container verification remain unverified:** Docker CLI/Compose are installed, but the Docker Desktop Linux engine is unavailable (`dockerDesktopLinuxEngine` pipe missing). No image pull, package install, registry call, container deployment, or AWS operation ran. Phase 18 is not started.
 
+AI-01B later retired the Gemini adapter and its direct dependency. Verification
+counts and implementation-history notes below describe Phase 17 at the time;
+they are not AI-01B test results.
+
 ## Packaging and routing
 
 - `backend/Dockerfile` uses Python 3.12 slim Bookworm stages. The dependency stage installs the existing exact-version `requirements.txt` into a virtual environment using binary wheels only. The runtime copies the environment, application, knowledge fixtures, and small container bootstrap/probe modules. No compiler, wheel cache, host virtual environment, tests, or evaluation datasets are copied.
 - `frontend/Dockerfile` uses Node.js 24 and the existing npm lockfile to build static Vite assets. Its final Nginx Alpine stage contains the build output and routing configuration; Node, npm, source code, and node_modules are absent from that stage. Nginx serves the built application rather than running a Vite development/preview server.
 - Both runtime processes use UID/GID **10001:10001**, high internal ports, and exec-form commands. Compose uses read-only root filesystems, dropped capabilities, no-new-privileges, init/reaping, and bounded writable `/tmp` tmpfs mounts. No host source/data directory or Docker socket is mounted.
 - The backend runs exactly **one Uvicorn worker**, without reload or trusted proxy headers, preserving the in-memory domain/HITL boundary. Uvicorn access logs and Nginx access logs are disabled; existing Phase 16 application telemetry remains available with its original behavior. Nginx operational errors still go to stderr and are not application telemetry.
-- Only the frontend publishes a host port: `127.0.0.1:8080` by default. In the base configuration, the backend belongs only to the internal `application` network, with no published port or external egress. The frontend joins both `application` (for `/api/` proxying to the backend) and the non-internal bridge network `edge` (for published-port connectivity). The frontend therefore has an external network path, while host publication remains loopback-only. Browser requests remain same-origin; no new CORS configuration is needed. The optional Gemini overlay described below explicitly enables backend egress.
+- Only the frontend publishes a host port: `127.0.0.1:8080` by default. In the base configuration, the backend belongs only to the internal `application` network, with no published port or external egress. The frontend joins both `application` (for `/api/` proxying to the backend) and the non-internal bridge network `edge` (for published-port connectivity). The frontend therefore has an external network path, while host publication remains loopback-only. Browser requests remain same-origin; no new CORS configuration is needed. The optional Groq overlay described below explicitly enables backend egress.
 - Nginx forwards `/api/` with the original path/query and bearer header to `backend:8000`, preserves API status codes and trace headers, and disables upstream retries so writes/reviews are not replayed. Docker's local DNS resolver refreshes the backend address after recreation. Missing `/assets/` files return 404; other frontend routes use the SPA fallback. Fingerprinted assets are cacheable; HTML is revalidated. Backend `/docs` and `/openapi.json` are not exposed through this frontend proxy, consistent with the earlier Vite `/api` proxy.
 
 Each image has its own narrow build context (`backend/` or `frontend/`) and allowlist `.dockerignore`. Root files—including the three pre-existing untracked JSON files—are outside both contexts and were not read or changed. Environment files, private keys, conversation stores, caches, local dependency directories, and host builds are excluded. No build argument or frontend variable contains credentials.
 
 ## Environment and authentication
 
-The optional `.env.container.example` contains only `NOVAMIND_PORT=8080` and configuration comments. Pass it with `--env-file`, or copy it to a local ignored `.env` and change the port. Runtime images set tracing exports off; base Compose does not pass AWS/Gemini credentials or inherit arbitrary host environment variables.
+The optional `.env.container.example` contains only `NOVAMIND_PORT=8080` and configuration comments. Pass it with `--env-file`, or copy it to a local ignored `.env` and change the port. Runtime images set tracing exports off; base Compose does not pass provider credentials or inherit arbitrary host environment variables.
 
 The backend container factory delegates to the existing `create_app()`. With no `NOVAMIND_AUTH_FILE`, authentication retains the original empty registry: public `/api/health` works, while business requests return 401. The existing frontend still has no login/bearer UI; containerization does not introduce an anonymous fallback.
 
@@ -39,30 +43,14 @@ Keep the real file outside the repository, or in the ignored `.container-secrets
 
 Configured paths must be absolute. Missing/unreadable files, malformed or duplicate-key JSON, invalid identity/token shapes, duplicate/conflicting credentials, files larger than 65,536 bytes, and lists longer than 1,000 entries stop startup with a fixed error without printing token values or paths. No invalid-configuration fallback grants access. Empty lists are allowed and remain default-deny. File loading occurs only at startup; recreate the backend to load changes. No token expiry/rotation, customer seeding, or durable business-state provisioning is added.
 
-## Optional Gemini provider wiring (Phase 17A.4a)
-
-Container startup can now inject the existing `GeminiProvider` as `create_app(local_provider_factory=...)`. Set **both** `GEMINI_API_KEY` and `GEMINI_MODEL` in the backend process environment through trusted runtime configuration. Unlike direct adapter use, container startup requires an explicit model rather than selecting the adapter's default. The model must be a Gemini model ID (optionally prefixed with `models/`). No key is stored in source, a build argument, the image, or frontend configuration; the bootstrap does not load `.env` files.
-
-When both variables are absent, runs remain unavailable. Partial, blank, oversized, or malformed configuration and SDK construction failures stop startup with a fixed error, without echoing secrets. Authentication is validated first and continues to use the existing mounted credential file; configuring Gemini alone grants no API access. Startup constructs one shared provider client without calling Gemini, supplies it through the existing factory, and closes it after the existing application lifespan drains run workers. Key validity, model availability, quotas, and connectivity can only be determined by a provider request; these are not startup health guarantees. Provider failures retain the existing sanitized workflow failure handling.
-
-For Compose, use the opt-in `compose.gemini.yaml` alongside the base and auth files. Inject the key into the invoking process with your trusted secret mechanism, set `GEMINI_MODEL` to your available model ID, and set `NOVAMIND_AUTH_SOURCE` as documented above. The overlay requires both Gemini variables and passes them only to the backend at runtime. It also attaches the backend to the existing `edge` bridge so Gemini requests can leave the container; this grants general outbound connectivity, not a Gemini-specific network allowlist. The base stack remains isolated and no backend host port is added.
-
-```powershell
-docker compose --env-file .env.container.example -f compose.yaml -f compose.auth.yaml -f compose.gemini.yaml config --quiet
-docker compose --env-file .env.container.example -f compose.yaml -f compose.auth.yaml -f compose.gemini.yaml up --build -d --wait
-```
-
-These commands are operator instructions, not verification performed for this change. Keep actual credentials out of shell command history, repository files, and logs. Environment injection is visible to trusted container/host administrators; do not export rendered Compose configuration or container inspection output containing it. Recreate the backend to rotate configuration (its existing in-memory state is lost). No secret-management service or new dependency is added.
-
-The existing HTTP provider label remains `local_scripted` for any configured local factory; the actual configured adapter is Gemini. This wiring deliberately leaves API schemas and frontend labels unchanged. No agent, graph, business rule, approval boundary, or automatic action is changed. Focused tests substitute the SDK transport and exercise the real adapter and authenticated run route; no live Gemini or Docker verification is claimed.
-
 ## Optional Groq provider wiring (Phase 17B.5a)
 
 Groq is available through the same local provider factory with explicit
 `NOVAMIND_LLM_PROVIDER=groq`, runtime-injected `GROQ_API_KEY`, and optional
-`GROQ_MODEL` (default `openai/gpt-oss-20b`). Use `compose.groq.yaml` instead of the
-Gemini overlay. Without a selector, the existing Gemini configuration behavior
-above remains unchanged. See [Groq configuration, JSON compatibility, tests, and
+`GROQ_MODEL` (default `openai/gpt-oss-20b`). Without a selector, runs remain
+unavailable even when Groq credentials are present. Any stale `GEMINI_*` variable
+or unknown provider selector stops startup. Use `compose.groq.yaml` for backend
+egress and runtime configuration. See [Groq configuration, JSON compatibility, tests, and
 limitations](phase-17b5a-groq.md). Live Groq and Docker execution are not verified
 by the mocked tests; Bedrock is not implemented.
 
