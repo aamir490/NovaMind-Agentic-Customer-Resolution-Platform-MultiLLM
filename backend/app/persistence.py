@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import ContextManager, Iterator, Protocol
 from uuid import UUID
@@ -13,6 +13,10 @@ from .domain import Customer, Order, OrderItem, SupportCase
 from .operations import (
     AuthoritativeDeliveryFact, EligibilityEvidence, EligibilityResult,
     TrustedDeliverySource,
+)
+from .proposals import (
+    HumanReview, ProposalStatus, ResolutionProposal,
+    WorkflowReviewBinding,
 )
 from .service import ConflictError, NotFoundError
 
@@ -245,6 +249,133 @@ MIGRATIONS = (
                    AND json_extract(NEW.assessment_json, '$.condition') = f.item_condition
                )
              THEN RAISE(ABORT, 'invalid eligibility assessment snapshot') END;
+           END""",
+    )),
+    Migration(3, (
+        """CREATE TRIGGER validate_resolution_proposal_insert
+           BEFORE INSERT ON resolution_proposals BEGIN
+             SELECT CASE WHEN NEW.status IS NOT 'PENDING_REVIEW'
+                 OR NEW.updated_at IS NOT NEW.created_at
+                 OR NEW.reviewed_at IS NOT NULL
+                 OR NEW.reviewer_user_id IS NOT NULL
+                 OR NEW.review_note IS NOT NULL
+               THEN RAISE(ABORT, 'invalid new proposal state') END;
+             SELECT CASE WHEN NEW.action = 'refund' AND NOT EXISTS (
+               SELECT 1 FROM eligibility_evidence e
+               WHERE e.evidence_id = NEW.eligibility_evidence_id
+                 AND e.case_id = NEW.case_id
+                 AND json_extract(e.assessment_json, '$.refund_eligible') = 1
+                 AND json_array_length(json_extract(e.assessment_json, '$.denial_reasons')) = 0
+             ) THEN RAISE(ABORT, 'refund proposal requires eligible evidence') END;
+           END""",
+        """CREATE TRIGGER validate_resolution_proposal_update
+           BEFORE UPDATE ON resolution_proposals BEGIN
+             SELECT CASE WHEN
+               OLD.proposal_id IS NOT NEW.proposal_id OR
+               OLD.case_id IS NOT NEW.case_id OR
+               OLD.action IS NOT NEW.action OR
+               OLD.rationale IS NOT NEW.rationale OR
+               OLD.eligibility_evidence_id IS NOT NEW.eligibility_evidence_id OR
+               OLD.created_at IS NOT NEW.created_at OR
+               OLD.status IS NOT 'PENDING_REVIEW' OR
+               NEW.status NOT IN ('APPROVED', 'REJECTED') OR
+               NEW.updated_at <= OLD.updated_at OR
+               NEW.reviewed_at IS NOT NEW.updated_at OR
+               NEW.reviewer_user_id IS NULL OR
+               length(trim(NEW.reviewer_user_id)) NOT BETWEEN 1 AND 120 OR
+               NEW.review_note IS NULL OR
+               length(trim(NEW.review_note)) NOT BETWEEN 1 AND 4000
+             THEN RAISE(ABORT, 'invalid proposal review transition') END;
+           END""",
+        """CREATE TRIGGER immutable_resolution_proposals_delete
+           BEFORE DELETE ON resolution_proposals BEGIN
+             SELECT RAISE(ABORT, 'resolution proposals are immutable');
+           END""",
+        """CREATE TRIGGER validate_workflow_review_binding_insert
+           BEFORE INSERT ON workflow_review_bindings BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM resolution_proposals p
+               JOIN workflow_runs w ON w.workflow_id = NEW.workflow_id
+               WHERE p.proposal_id = NEW.proposal_id
+                 AND p.case_id = NEW.case_id
+                 AND p.status = 'PENDING_REVIEW'
+                 AND w.case_id = NEW.case_id
+                 AND w.status = 'REVIEW_REQUIRED'
+             ) THEN RAISE(ABORT, 'invalid workflow review binding') END;
+           END""",
+        """CREATE TRIGGER immutable_workflow_review_bindings_update
+           BEFORE UPDATE ON workflow_review_bindings BEGIN
+             SELECT RAISE(ABORT, 'workflow review bindings are immutable');
+           END""",
+        """CREATE TRIGGER immutable_workflow_review_bindings_delete
+           BEFORE DELETE ON workflow_review_bindings BEGIN
+             SELECT RAISE(ABORT, 'workflow review bindings are immutable');
+           END""",
+        """CREATE TRIGGER validate_workflow_audit_event_insert
+           BEFORE INSERT ON workflow_audit_events BEGIN
+             SELECT CASE WHEN
+               json_extract(NEW.event_json, '$.kind') IS NOT NEW.kind OR
+               json_extract(NEW.event_json, '$.workflow_id') IS NOT NEW.workflow_id OR
+               json_extract(NEW.event_json, '$.proposal_id') IS NOT NEW.proposal_id OR
+               json_extract(NEW.event_json, '$.proposal_status') IS NOT NEW.proposal_status OR
+               json_extract(NEW.event_json, '$.reviewer_user_id') IS NOT NEW.reviewer_user_id OR
+               json_extract(NEW.event_json, '$.review_note') IS NOT (
+                 SELECT review_note FROM resolution_proposals
+                 WHERE proposal_id = NEW.proposal_id
+               ) OR
+               json_extract(NEW.event_json, '$.case_id') IS NOT (
+                 SELECT case_id FROM resolution_proposals
+                 WHERE proposal_id = NEW.proposal_id
+               ) OR
+               NOT EXISTS (
+                 SELECT 1 FROM workflow_runs w
+                 JOIN resolution_proposals p ON p.proposal_id = NEW.proposal_id
+                 WHERE w.workflow_id = NEW.workflow_id
+                   AND w.case_id = p.case_id
+               )
+             THEN RAISE(ABORT, 'invalid workflow audit payload') END;
+             SELECT CASE WHEN NEW.kind = 'REVIEW_REQUIRED' AND (
+               NEW.proposal_id IS NULL OR
+               NEW.reviewer_user_id IS NOT NULL OR
+               NEW.proposal_status IS NOT 'PENDING_REVIEW' OR
+               NOT EXISTS (
+                 SELECT 1 FROM workflow_review_bindings b
+                 WHERE b.workflow_id = NEW.workflow_id
+                   AND b.proposal_id = NEW.proposal_id
+                   AND b.review_id = json_extract(NEW.event_json, '$.review_id')
+               )
+             ) THEN RAISE(ABORT, 'invalid review-required audit event') END;
+             SELECT CASE WHEN NEW.kind = 'HUMAN_REVIEW' AND (
+               NEW.proposal_id IS NULL OR
+               NEW.reviewer_user_id IS NULL OR
+               NEW.proposal_status NOT IN ('APPROVED', 'REJECTED') OR
+               NOT EXISTS (
+                 SELECT 1 FROM resolution_proposals p
+                 WHERE p.proposal_id = NEW.proposal_id
+                   AND p.status = NEW.proposal_status
+                   AND p.reviewer_user_id = NEW.reviewer_user_id
+               ) OR NOT (
+                 (EXISTS (
+                   SELECT 1 FROM workflow_review_bindings b
+                   WHERE b.workflow_id = NEW.workflow_id
+                     AND b.proposal_id = NEW.proposal_id
+                     AND b.review_id = json_extract(NEW.event_json, '$.review_id')
+                 )) OR (
+                   NOT EXISTS (
+                     SELECT 1 FROM workflow_review_bindings b
+                     WHERE b.proposal_id = NEW.proposal_id
+                   ) AND json_extract(NEW.event_json, '$.review_id') IS NULL
+                 )
+               )
+             ) THEN RAISE(ABORT, 'invalid human-review audit event') END;
+           END""",
+        """CREATE TRIGGER immutable_workflow_audit_events_update
+           BEFORE UPDATE ON workflow_audit_events BEGIN
+             SELECT RAISE(ABORT, 'workflow audit events are immutable');
+           END""",
+        """CREATE TRIGGER immutable_workflow_audit_events_delete
+           BEFORE DELETE ON workflow_audit_events BEGIN
+             SELECT RAISE(ABORT, 'workflow audit events are immutable');
            END""",
     )),
 )
@@ -729,4 +860,291 @@ class SQLiteRefundEvidenceRepository:
             except ConflictError:
                 raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
             return evidence
+
+
+class SQLiteProposalRepository:
+    """Opt-in proposal persistence with atomic, append-only review decisions."""
+
+    _ANCHOR_OWNER = "proposal-review-persistence"
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _proposal(row: sqlite3.Row) -> ResolutionProposal:
+        try:
+            return ResolutionProposal.model_validate({
+                "id": row["proposal_id"], "case_id": row["case_id"],
+                "action": row["action"], "rationale": row["rationale"],
+                "eligibility_evidence_id": row["eligibility_evidence_id"],
+                "status": row["status"], "created_at": row["created_at"],
+                "updated_at": row["updated_at"], "reviewed_at": row["reviewed_at"],
+                "reviewer_name": row["reviewer_user_id"], "review_note": row["review_note"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @staticmethod
+    def _binding(row: sqlite3.Row) -> WorkflowReviewBinding:
+        try:
+            return WorkflowReviewBinding.model_validate({
+                "workflow_id": row["workflow_id"], "case_id": row["case_id"],
+                "review_id": row["review_id"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @classmethod
+    def _ensure_review_anchor(cls, connection: sqlite3.Connection, *,
+                              workflow_id: UUID, case_id: UUID,
+                              request_id: UUID, proposal_id: UUID,
+                              created_at: datetime) -> None:
+        row = connection.execute(
+            "SELECT workflow_id, case_id, status FROM workflow_runs WHERE workflow_id = ?",
+            (str(workflow_id),),
+        ).fetchone()
+        if row is not None:
+            if row["case_id"] != str(case_id) or row["status"] != "REVIEW_REQUIRED":
+                raise ConflictError("Workflow cannot accept this proposal review binding")
+            return
+        timestamp = created_at.isoformat()
+        connection.execute(
+            """INSERT INTO workflow_runs
+               (workflow_id, run_id, case_id, owner_user_id, request_id,
+                request_fingerprint, provider, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'local_scripted', 'REVIEW_REQUIRED', ?, ?)""",
+            (str(workflow_id), str(workflow_id), str(case_id), cls._ANCHOR_OWNER,
+             str(request_id), f"proposal-review:{proposal_id}", timestamp, timestamp),
+        )
+
+    @staticmethod
+    def _next_sequence(connection: sqlite3.Connection, workflow_id: UUID) -> int:
+        row = connection.execute(
+            "SELECT coalesce(max(sequence), 0) + 1 FROM workflow_audit_events WHERE workflow_id = ?",
+            (str(workflow_id),),
+        ).fetchone()
+        return row[0]
+
+    @classmethod
+    def _append_audit(cls, connection: sqlite3.Connection, *, workflow_id: UUID,
+                      kind: str, proposal: ResolutionProposal,
+                      review_id: UUID | None, created_at: datetime) -> None:
+        payload = {
+            "kind": kind, "workflow_id": str(workflow_id),
+            "case_id": str(proposal.case_id), "proposal_id": str(proposal.id),
+            "review_id": str(review_id) if review_id is not None else None,
+            "proposal_status": proposal.status.value,
+            "reviewer_user_id": proposal.reviewer_name,
+            "review_note": proposal.review_note,
+        }
+        connection.execute(
+            """INSERT INTO workflow_audit_events
+               (workflow_id, sequence, kind, proposal_id, reviewer_user_id,
+                proposal_status, event_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(workflow_id), cls._next_sequence(connection, workflow_id), kind,
+             str(proposal.id), proposal.reviewer_name, proposal.status.value,
+             json.dumps(payload, sort_keys=True, separators=(",", ":")),
+             created_at.isoformat()),
+        )
+
+    def create(self, proposal: ResolutionProposal) -> ResolutionProposal:
+        proposal = ResolutionProposal.model_validate(proposal.model_dump())
+        with self._persistence.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM resolution_proposals WHERE proposal_id = ?", (str(proposal.id),),
+            ).fetchone() is not None:
+                raise ConflictError("Proposal already exists")
+            connection.execute(
+                """INSERT INTO resolution_proposals
+                   (proposal_id, case_id, action, rationale, eligibility_evidence_id,
+                    status, created_at, updated_at, reviewed_at, reviewer_user_id, review_note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(proposal.id), str(proposal.case_id), proposal.action.value,
+                 proposal.rationale,
+                 str(proposal.eligibility_evidence_id) if proposal.eligibility_evidence_id else None,
+                 proposal.status.value, proposal.created_at.isoformat(),
+                 proposal.updated_at.isoformat(), None, None, None),
+            )
+        return proposal
+
+    def get(self, proposal_id: UUID) -> ResolutionProposal:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM resolution_proposals WHERE proposal_id = ?", (str(proposal_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Proposal not found")
+            return self._proposal(row)
+
+    def list_for_case(self, case_id: UUID) -> list[ResolutionProposal]:
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                """SELECT * FROM resolution_proposals
+                   WHERE case_id = ? ORDER BY created_at, proposal_id""",
+                (str(case_id),),
+            ).fetchall()
+            return [self._proposal(row) for row in rows]
+
+    def bind_workflow_review(self, proposal_id: UUID,
+                             binding: WorkflowReviewBinding) -> WorkflowReviewBinding:
+        binding = WorkflowReviewBinding.model_validate(binding.model_dump())
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM resolution_proposals WHERE proposal_id = ?", (str(proposal_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Proposal not found")
+            proposal = self._proposal(row)
+            if (proposal.case_id != binding.case_id
+                    or proposal.status != ProposalStatus.PENDING_REVIEW):
+                raise ConflictError("Proposal cannot be bound to this workflow review")
+
+            existing_row = connection.execute(
+                "SELECT * FROM workflow_review_bindings WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._binding(existing_row)
+                if existing == binding:
+                    return existing
+                raise ConflictError("Proposal is already bound to a different workflow review")
+            if connection.execute(
+                """SELECT 1 FROM workflow_review_bindings
+                   WHERE workflow_id = ? OR review_id = ?""",
+                (str(binding.workflow_id), str(binding.review_id)),
+            ).fetchone() is not None:
+                raise ConflictError("Workflow review binding is already in use")
+
+            now = datetime.now(timezone.utc)
+            self._ensure_review_anchor(
+                connection, workflow_id=binding.workflow_id, case_id=binding.case_id,
+                request_id=binding.review_id, proposal_id=proposal.id, created_at=now,
+            )
+            connection.execute(
+                """INSERT INTO workflow_review_bindings
+                   (proposal_id, workflow_id, case_id, review_id, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (str(proposal.id), str(binding.workflow_id), str(binding.case_id),
+                 str(binding.review_id), now.isoformat()),
+            )
+            self._append_audit(
+                connection, workflow_id=binding.workflow_id, kind="REVIEW_REQUIRED",
+                proposal=proposal, review_id=binding.review_id, created_at=now,
+            )
+            return binding
+
+    def matches_workflow_review(self, proposal_id: UUID,
+                                binding: WorkflowReviewBinding) -> bool:
+        binding = WorkflowReviewBinding.model_validate(binding.model_dump())
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_review_bindings WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+            return row is not None and self._binding(row) == binding
+
+    def review(self, proposal_id: UUID, decision: ProposalStatus,
+               review: HumanReview, *, workflow_id: UUID | None,
+               review_id: UUID | None) -> ResolutionProposal:
+        if decision not in (ProposalStatus.APPROVED, ProposalStatus.REJECTED):
+            raise ConflictError("Review decision must be APPROVED or REJECTED")
+        review = HumanReview.model_validate(review.model_dump())
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM resolution_proposals WHERE proposal_id = ?", (str(proposal_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Proposal not found")
+            proposal = self._proposal(row)
+            if proposal.status != ProposalStatus.PENDING_REVIEW:
+                raise ConflictError("Proposal has already been reviewed")
+
+            binding_row = connection.execute(
+                "SELECT * FROM workflow_review_bindings WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+            if binding_row is not None:
+                binding = self._binding(binding_row)
+                if (workflow_id != binding.workflow_id or review_id != binding.review_id
+                        or proposal.case_id != binding.case_id):
+                    raise ConflictError(
+                        "Workflow-bound proposal must be reviewed through its active workflow"
+                    )
+                anchor = connection.execute(
+                    "SELECT case_id, status FROM workflow_runs WHERE workflow_id = ?",
+                    (str(binding.workflow_id),),
+                ).fetchone()
+                if (anchor is None or anchor["case_id"] != str(binding.case_id)
+                        or anchor["status"] != "REVIEW_REQUIRED"):
+                    raise ConflictError("Workflow review binding is stale or invalid")
+                audit_workflow_id = binding.workflow_id
+                audit_review_id = binding.review_id
+            else:
+                if workflow_id is not None or review_id is not None:
+                    raise ConflictError("Proposal is not bound to the supplied workflow review")
+                audit_workflow_id = proposal.id
+                audit_review_id = None
+                self._ensure_review_anchor(
+                    connection, workflow_id=audit_workflow_id, case_id=proposal.case_id,
+                    request_id=proposal.id, proposal_id=proposal.id,
+                    created_at=datetime.now(timezone.utc),
+                )
+
+            now = datetime.now(timezone.utc)
+            if now <= proposal.updated_at:
+                now = proposal.updated_at + timedelta(microseconds=1)
+            updated = connection.execute(
+                """UPDATE resolution_proposals
+                   SET status = ?, updated_at = ?, reviewed_at = ?,
+                       reviewer_user_id = ?, review_note = ?
+                   WHERE proposal_id = ? AND status = 'PENDING_REVIEW'""",
+                (decision.value, now.isoformat(), now.isoformat(), review.reviewer_name,
+                 review.note, str(proposal.id)),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("Proposal has already been reviewed")
+            reviewed = ResolutionProposal.model_validate({
+                **proposal.model_dump(), "status": decision, "updated_at": now,
+                "reviewed_at": now, "reviewer_name": review.reviewer_name,
+                "review_note": review.note,
+            })
+            anchor_update = connection.execute(
+                """UPDATE workflow_runs SET status = 'REVIEWED', updated_at = ?
+                   WHERE workflow_id = ? AND case_id = ? AND status = 'REVIEW_REQUIRED'""",
+                (now.isoformat(), str(audit_workflow_id), str(proposal.case_id)),
+            )
+            if anchor_update.rowcount != 1:
+                raise ConflictError("Workflow review binding is stale or invalid")
+            self._append_audit(
+                connection, workflow_id=audit_workflow_id, kind="HUMAN_REVIEW",
+                proposal=reviewed, review_id=audit_review_id, created_at=now,
+            )
+            return reviewed
+
+    def audit_events(self, workflow_id: UUID) -> tuple[dict, ...]:
+        """Read immutable repository audit payloads; not a checkpoint recovery API."""
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                """SELECT sequence, kind, proposal_id, reviewer_user_id,
+                          proposal_status, event_json
+                   FROM workflow_audit_events
+                   WHERE workflow_id = ? ORDER BY sequence""",
+                (str(workflow_id),),
+            ).fetchall()
+            try:
+                payloads = tuple(json.loads(row["event_json"]) for row in rows)
+            except Exception:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+            for expected_sequence, (row, payload) in enumerate(zip(rows, payloads), start=1):
+                if (
+                    row["sequence"] != expected_sequence
+                    or payload.get("kind") != row["kind"]
+                    or payload.get("workflow_id") != str(workflow_id)
+                    or payload.get("proposal_id") != row["proposal_id"]
+                    or payload.get("reviewer_user_id") != row["reviewer_user_id"]
+                    or payload.get("proposal_status") != row["proposal_status"]
+                ):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            return payloads
 

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from enum import StrEnum
 from threading import RLock
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from .domain import Description, Name, Record
@@ -58,10 +59,27 @@ class WorkflowReviewBinding(Record):
     review_id: UUID
 
 
+class ProposalRepository(Protocol):
+    """Optional durable proposal/review boundary."""
+
+    def create(self, proposal: ResolutionProposal) -> ResolutionProposal: ...
+    def get(self, proposal_id: UUID) -> ResolutionProposal: ...
+    def list_for_case(self, case_id: UUID) -> list[ResolutionProposal]: ...
+    def bind_workflow_review(self, proposal_id: UUID,
+                             binding: WorkflowReviewBinding) -> WorkflowReviewBinding: ...
+    def matches_workflow_review(self, proposal_id: UUID,
+                                binding: WorkflowReviewBinding) -> bool: ...
+    def review(self, proposal_id: UUID, decision: ProposalStatus,
+               review: HumanReview, *, workflow_id: UUID | None,
+               review_id: UUID | None) -> ResolutionProposal: ...
+
+
 class ProposalService:
-    def __init__(self, cases: CaseService, operations: BusinessOperations) -> None:
+    def __init__(self, cases: CaseService, operations: BusinessOperations,
+                 repository: ProposalRepository | None = None) -> None:
         self._cases = cases
         self._operations = operations
+        self._repository = repository
         self._proposals: dict[UUID, ResolutionProposal] = {}
         self._workflow_reviews: dict[UUID, WorkflowReviewBinding] = {}
         self._lock = RLock()
@@ -98,11 +116,15 @@ class ProposalService:
                 id=uuid4(), **request.model_dump(), status=ProposalStatus.PENDING_REVIEW,
                 created_at=now, updated_at=now,
             )
+            if self._repository is not None:
+                return self._repository.create(proposal)
             self._proposals[proposal.id] = proposal
             return proposal
 
     def get(self, proposal_id: UUID) -> ResolutionProposal:
         with self._lock:
+            if self._repository is not None:
+                return self._repository.get(proposal_id)
             if proposal_id not in self._proposals:
                 raise NotFoundError("Proposal not found")
             return self._proposals[proposal_id]
@@ -110,6 +132,8 @@ class ProposalService:
     def list_for_case(self, case_id: UUID) -> list[ResolutionProposal]:
         self._cases.get_case(case_id)
         with self._lock:
+            if self._repository is not None:
+                return self._repository.list_for_case(case_id)
             return [proposal for proposal in self._proposals.values() if proposal.case_id == case_id]
 
     def bind_workflow_review(self, proposal_id: UUID, *, workflow_id: UUID,
@@ -117,6 +141,8 @@ class ProposalService:
         """Bind a pending proposal to one exact HITL pause before it is exposed for review."""
         binding = WorkflowReviewBinding(workflow_id=workflow_id, case_id=case_id, review_id=review_id)
         with self._lock:
+            if self._repository is not None:
+                return self._repository.bind_workflow_review(proposal_id, binding)
             proposal = self.get(proposal_id)
             if proposal.case_id != binding.case_id or proposal.status != ProposalStatus.PENDING_REVIEW:
                 raise ConflictError("Proposal cannot be bound to this workflow review")
@@ -129,6 +155,12 @@ class ProposalService:
     def matches_workflow_review(self, proposal_id: UUID, *, workflow_id: UUID,
                                 case_id: UUID, review_id: UUID) -> bool:
         with self._lock:
+            if self._repository is not None:
+                return self._repository.matches_workflow_review(
+                    proposal_id, WorkflowReviewBinding(
+                        workflow_id=workflow_id, case_id=case_id, review_id=review_id,
+                    ),
+                )
             return self._workflow_reviews.get(proposal_id) == WorkflowReviewBinding(
                 workflow_id=workflow_id, case_id=case_id, review_id=review_id,
             )
@@ -139,7 +171,13 @@ class ProposalService:
                review_id: UUID | None = None) -> ResolutionProposal:
         if decision not in (ProposalStatus.APPROVED, ProposalStatus.REJECTED):
             raise ConflictError("Review decision must be APPROVED or REJECTED")
+        review = HumanReview.model_validate(review.model_dump())
         with self._lock:
+            if self._repository is not None:
+                return self._repository.review(
+                    proposal_id, decision, review,
+                    workflow_id=workflow_id, review_id=review_id,
+                )
             proposal = self.get(proposal_id)
             binding = self._workflow_reviews.get(proposal_id)
             if binding is not None and (workflow_id != binding.workflow_id or review_id != binding.review_id):
