@@ -95,13 +95,16 @@ class HITLWorkflow:
         self._lock = RLock()
         self._runs: dict[UUID, str] = {}
         graph = StateGraph(HITLState)
-        for name in ("load_case", "reason", "execute_tool", "record_result", "finalize", "fail_safely"):
+        for name in ("load_case", "evaluate_refund", "reason", "execute_tool", "record_result", "finalize", "fail_safely"):
             graph.add_node(name, self._instrument(name, self._delegate(name)))
         graph.add_node("prepare_review", self._instrument("prepare_review", self._prepare_review))
         graph.add_node("human_review", self._instrument("human_review", self._human_review))
         graph.add_edge(START, "load_case")
-        graph.add_conditional_edges("load_case", lambda s: "fail_safely" if s.agent.error else "reason",
-                                    {n: n for n in ("fail_safely", "reason")})
+        graph.add_conditional_edges("load_case", lambda s: self._baseline._after_load_case(s.agent),
+                                    {n: n for n in ("fail_safely", "evaluate_refund", "reason")})
+        graph.add_conditional_edges("evaluate_refund", lambda s: self._after_refund_evaluation(s.agent),
+                                    {"fail_safely": "fail_safely", "proposal_created": "prepare_review",
+                                     "finalize": "finalize"})
         graph.add_conditional_edges("reason", lambda s: self._baseline._after_reason(s.agent),
                                     {n: n for n in ("fail_safely", "finalize", "execute_tool")})
         graph.add_edge("execute_tool", "record_result")
@@ -177,6 +180,10 @@ class HITLWorkflow:
             # The human boundary uses no further reasoning steps, even at the LLM limit.
             return "prepare_review"
         return "fail_safely" if agent.error else "reason"
+
+    @staticmethod
+    def _after_refund_evaluation(agent: GraphState) -> str:
+        return GraphResolutionAgent._after_refund_evaluation(agent)
 
     def _failure(self, state: HITLState, code: str) -> dict:
         return self._update(state, error=code, audit=(*state.audit,
