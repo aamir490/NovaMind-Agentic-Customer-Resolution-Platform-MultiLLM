@@ -19,6 +19,10 @@ from .proposals import (
     WorkflowReviewBinding,
 )
 from .service import ConflictError, NotFoundError
+from .workflow_metadata import (
+    WORKFLOW_STATUS_TRANSITIONS, WorkflowMetadataStatus, WorkflowReservationResult,
+    WorkflowRunEvent, WorkflowRunMetadata, WorkflowRunReservation,
+)
 
 
 class PersistenceError(Exception):
@@ -376,6 +380,90 @@ MIGRATIONS = (
         """CREATE TRIGGER immutable_workflow_audit_events_delete
            BEFORE DELETE ON workflow_audit_events BEGIN
              SELECT RAISE(ABORT, 'workflow audit events are immutable');
+           END""",
+    )),
+    Migration(4, (
+        """CREATE TABLE workflow_run_events (
+            workflow_id TEXT NOT NULL REFERENCES workflow_runs(workflow_id),
+            sequence INTEGER NOT NULL CHECK(sequence >= 1),
+            kind TEXT NOT NULL CHECK(kind IN ('CREATED', 'STATUS_CHANGED', 'RECOVERY_REQUIRED')),
+            previous_status TEXT CHECK(previous_status IN
+                ('RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED', 'RECOVERY_REQUIRED')),
+            status TEXT NOT NULL CHECK(status IN
+                ('RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED', 'RECOVERY_REQUIRED')),
+            event_json TEXT NOT NULL CHECK(json_valid(event_json)),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(workflow_id, sequence)
+        )""",
+        """CREATE TRIGGER validate_workflow_run_insert
+           BEFORE INSERT ON workflow_runs
+           WHEN NEW.owner_user_id <> 'proposal-review-persistence'
+           BEGIN
+             SELECT CASE WHEN NEW.status IS NOT 'RUNNING'
+                 OR NEW.updated_at IS NOT NEW.created_at
+                 OR length(NEW.request_fingerprint) <> 64
+                 OR lower(NEW.request_fingerprint) GLOB '*[^0-9a-f]*'
+               THEN RAISE(ABORT, 'invalid workflow run reservation') END;
+           END""",
+        """CREATE TRIGGER validate_workflow_run_update
+           BEFORE UPDATE ON workflow_runs BEGIN
+             SELECT CASE WHEN
+               OLD.workflow_id IS NOT NEW.workflow_id OR
+               OLD.run_id IS NOT NEW.run_id OR
+               OLD.case_id IS NOT NEW.case_id OR
+               OLD.owner_user_id IS NOT NEW.owner_user_id OR
+               OLD.request_id IS NOT NEW.request_id OR
+               OLD.request_fingerprint IS NOT NEW.request_fingerprint OR
+               OLD.provider IS NOT NEW.provider OR
+               OLD.created_at IS NOT NEW.created_at OR
+               NEW.updated_at <= OLD.updated_at OR
+               NOT (
+                 (OLD.status = 'RUNNING' AND NEW.status IN
+                   ('REVIEW_REQUIRED', 'COMPLETED', 'FAILED', 'RECOVERY_REQUIRED')) OR
+                 (OLD.status = 'REVIEW_REQUIRED' AND NEW.status IN
+                   ('RESUMING', 'REVIEWED', 'RECOVERY_REQUIRED')) OR
+                 (OLD.status = 'RESUMING' AND NEW.status IN
+                   ('REVIEW_REQUIRED', 'REVIEWED', 'FAILED', 'RECOVERY_REQUIRED'))
+               )
+             THEN RAISE(ABORT, 'invalid workflow status transition') END;
+           END""",
+        """CREATE TRIGGER immutable_workflow_runs_delete
+           BEFORE DELETE ON workflow_runs BEGIN
+             SELECT RAISE(ABORT, 'workflow runs are immutable');
+           END""",
+        """CREATE TRIGGER validate_workflow_run_event_insert
+           BEFORE INSERT ON workflow_run_events BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM workflow_runs w
+               WHERE w.workflow_id = NEW.workflow_id
+                 AND w.status = NEW.status
+             ) OR
+               json_extract(NEW.event_json, '$.workflow_id') IS NOT NEW.workflow_id OR
+               json_extract(NEW.event_json, '$.sequence') IS NOT NEW.sequence OR
+               json_extract(NEW.event_json, '$.kind') IS NOT NEW.kind OR
+               json_extract(NEW.event_json, '$.previous_status') IS NOT NEW.previous_status OR
+               json_extract(NEW.event_json, '$.status') IS NOT NEW.status OR
+               json_extract(NEW.event_json, '$.case_id') IS NOT (
+                 SELECT case_id FROM workflow_runs WHERE workflow_id = NEW.workflow_id
+               ) OR
+               json_extract(NEW.event_json, '$.owner_user_id') IS NOT (
+                 SELECT owner_user_id FROM workflow_runs WHERE workflow_id = NEW.workflow_id
+               )
+             THEN RAISE(ABORT, 'invalid workflow run event') END;
+             SELECT CASE WHEN
+               (NEW.kind = 'CREATED' AND (NEW.sequence <> 1 OR NEW.previous_status IS NOT NULL
+                                          OR NEW.status <> 'RUNNING')) OR
+               (NEW.kind = 'RECOVERY_REQUIRED' AND NEW.status <> 'RECOVERY_REQUIRED') OR
+               (NEW.kind = 'STATUS_CHANGED' AND NEW.previous_status IS NULL)
+             THEN RAISE(ABORT, 'invalid workflow run event transition') END;
+           END""",
+        """CREATE TRIGGER immutable_workflow_run_events_update
+           BEFORE UPDATE ON workflow_run_events BEGIN
+             SELECT RAISE(ABORT, 'workflow run events are immutable');
+           END""",
+        """CREATE TRIGGER immutable_workflow_run_events_delete
+           BEFORE DELETE ON workflow_run_events BEGIN
+             SELECT RAISE(ABORT, 'workflow run events are immutable');
            END""",
     )),
 )
@@ -898,15 +986,22 @@ class SQLiteProposalRepository:
     def _ensure_review_anchor(cls, connection: sqlite3.Connection, *,
                               workflow_id: UUID, case_id: UUID,
                               request_id: UUID, proposal_id: UUID,
-                              created_at: datetime) -> None:
+                              created_at: datetime) -> datetime:
         row = connection.execute(
-            "SELECT workflow_id, case_id, status FROM workflow_runs WHERE workflow_id = ?",
+            """SELECT workflow_id, case_id, status, updated_at
+               FROM workflow_runs WHERE workflow_id = ?""",
             (str(workflow_id),),
         ).fetchone()
         if row is not None:
             if row["case_id"] != str(case_id) or row["status"] != "REVIEW_REQUIRED":
                 raise ConflictError("Workflow cannot accept this proposal review binding")
-            return
+            try:
+                updated_at = datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00"))
+            except Exception:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+            if updated_at.tzinfo is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            return updated_at
         timestamp = created_at.isoformat()
         connection.execute(
             """INSERT INTO workflow_runs
@@ -916,6 +1011,7 @@ class SQLiteProposalRepository:
             (str(workflow_id), str(workflow_id), str(case_id), cls._ANCHOR_OWNER,
              str(request_id), f"proposal-review:{proposal_id}", timestamp, timestamp),
         )
+        return created_at
 
     @staticmethod
     def _next_sequence(connection: sqlite3.Connection, workflow_id: UUID) -> int:
@@ -1072,7 +1168,8 @@ class SQLiteProposalRepository:
                         "Workflow-bound proposal must be reviewed through its active workflow"
                     )
                 anchor = connection.execute(
-                    "SELECT case_id, status FROM workflow_runs WHERE workflow_id = ?",
+                    """SELECT case_id, status, updated_at
+                       FROM workflow_runs WHERE workflow_id = ?""",
                     (str(binding.workflow_id),),
                 ).fetchone()
                 if (anchor is None or anchor["case_id"] != str(binding.case_id)
@@ -1080,20 +1177,29 @@ class SQLiteProposalRepository:
                     raise ConflictError("Workflow review binding is stale or invalid")
                 audit_workflow_id = binding.workflow_id
                 audit_review_id = binding.review_id
+                try:
+                    anchor_updated_at = datetime.fromisoformat(
+                        anchor["updated_at"].replace("Z", "+00:00")
+                    )
+                except Exception:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+                if anchor_updated_at.tzinfo is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
             else:
                 if workflow_id is not None or review_id is not None:
                     raise ConflictError("Proposal is not bound to the supplied workflow review")
                 audit_workflow_id = proposal.id
                 audit_review_id = None
-                self._ensure_review_anchor(
+                anchor_updated_at = self._ensure_review_anchor(
                     connection, workflow_id=audit_workflow_id, case_id=proposal.case_id,
                     request_id=proposal.id, proposal_id=proposal.id,
                     created_at=datetime.now(timezone.utc),
                 )
 
             now = datetime.now(timezone.utc)
-            if now <= proposal.updated_at:
-                now = proposal.updated_at + timedelta(microseconds=1)
+            latest_update = max(proposal.updated_at, anchor_updated_at)
+            if now <= latest_update:
+                now = latest_update + timedelta(microseconds=1)
             updated = connection.execute(
                 """UPDATE resolution_proposals
                    SET status = ?, updated_at = ?, reviewed_at = ?,
@@ -1147,4 +1253,241 @@ class SQLiteProposalRepository:
                 ):
                     raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
             return payloads
+
+
+class SQLiteWorkflowMetadataRepository:
+    """Opt-in run metadata and idempotency store; contains no replayable checkpoint."""
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _run(row: sqlite3.Row) -> WorkflowRunMetadata:
+        try:
+            run = WorkflowRunMetadata.model_validate({
+                "workflow_id": row["workflow_id"], "run_id": row["run_id"],
+                "case_id": row["case_id"], "owner_user_id": row["owner_user_id"],
+                "request_id": row["request_id"],
+                "request_fingerprint": row["request_fingerprint"],
+                "provider": row["provider"], "status": row["status"],
+                "created_at": row["created_at"], "updated_at": row["updated_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+        if (run.created_at.tzinfo is None or run.updated_at.tzinfo is None
+                or run.updated_at < run.created_at):
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        return run
+
+    @staticmethod
+    def _event(row: sqlite3.Row) -> WorkflowRunEvent:
+        try:
+            return WorkflowRunEvent.model_validate({
+                "workflow_id": row["workflow_id"], "sequence": row["sequence"],
+                "kind": row["kind"], "previous_status": row["previous_status"],
+                "status": row["status"], "created_at": row["created_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @staticmethod
+    def _next_run_sequence(connection: sqlite3.Connection, workflow_id: UUID) -> int:
+        return connection.execute(
+            "SELECT coalesce(max(sequence), 0) + 1 FROM workflow_run_events WHERE workflow_id = ?",
+            (str(workflow_id),),
+        ).fetchone()[0]
+
+    @classmethod
+    def _append_run_event(cls, connection: sqlite3.Connection, *,
+                          run: WorkflowRunMetadata, kind: str,
+                          previous_status: WorkflowMetadataStatus | None) -> WorkflowRunEvent:
+        sequence = cls._next_run_sequence(connection, run.workflow_id)
+        event = WorkflowRunEvent(
+            workflow_id=run.workflow_id, sequence=sequence, kind=kind,
+            previous_status=previous_status, status=run.status,
+            created_at=run.updated_at,
+        )
+        payload = {
+            **event.model_dump(mode="json"), "case_id": str(run.case_id),
+            "owner_user_id": str(run.owner_user_id), "run_id": str(run.run_id),
+        }
+        connection.execute(
+            """INSERT INTO workflow_run_events
+               (workflow_id, sequence, kind, previous_status, status, event_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (str(event.workflow_id), event.sequence, event.kind,
+             event.previous_status.value if event.previous_status else None,
+             event.status.value,
+             json.dumps(payload, sort_keys=True, separators=(",", ":")),
+             event.created_at.isoformat()),
+        )
+        return event
+
+    def reserve(self, reservation: WorkflowRunReservation) -> WorkflowReservationResult:
+        reservation = WorkflowRunReservation.model_validate(reservation.model_dump())
+        with self._persistence.transaction() as connection:
+            existing_row = connection.execute(
+                """SELECT * FROM workflow_runs
+                   WHERE owner_user_id = ? AND request_id = ?""",
+                (str(reservation.owner_user_id), str(reservation.request_id)),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._run(existing_row)
+                if (existing.request_fingerprint != reservation.request_fingerprint
+                        or existing.case_id != reservation.case_id
+                        or existing.provider != reservation.provider):
+                    raise ConflictError("Request ID conflicts with an existing workflow request")
+                return WorkflowReservationResult(run=existing, created=False)
+            if connection.execute(
+                "SELECT 1 FROM workflow_runs WHERE workflow_id = ? OR run_id = ?",
+                (str(reservation.workflow_id), str(reservation.run_id)),
+            ).fetchone() is not None:
+                raise ConflictError("Workflow or run ID already exists")
+
+            now = datetime.now(timezone.utc)
+            run = WorkflowRunMetadata(
+                **reservation.model_dump(), status=WorkflowMetadataStatus.RUNNING,
+                created_at=now, updated_at=now,
+            )
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (workflow_id, run_id, case_id, owner_user_id, request_id,
+                    request_fingerprint, provider, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(run.workflow_id), str(run.run_id), str(run.case_id),
+                 str(run.owner_user_id), str(run.request_id), run.request_fingerprint,
+                 run.provider, run.status.value, run.created_at.isoformat(),
+                 run.updated_at.isoformat()),
+            )
+            self._append_run_event(
+                connection, run=run, kind="CREATED", previous_status=None,
+            )
+            return WorkflowReservationResult(run=run, created=True)
+
+    def get(self, workflow_id: UUID) -> WorkflowRunMetadata:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(workflow_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Workflow run not found")
+            return self._run(row)
+
+    def get_by_run_id(self, run_id: UUID) -> WorkflowRunMetadata:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE run_id = ?", (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Workflow run not found")
+            return self._run(row)
+
+    def get_by_request(self, owner_user_id: UUID, request_id: UUID) -> WorkflowRunMetadata:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                """SELECT * FROM workflow_runs
+                   WHERE owner_user_id = ? AND request_id = ?""",
+                (str(owner_user_id), str(request_id)),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Workflow request not found")
+            return self._run(row)
+
+    def transition(self, workflow_id: UUID, *, owner_user_id: UUID, case_id: UUID,
+                   expected_status: WorkflowMetadataStatus,
+                   status: WorkflowMetadataStatus) -> WorkflowRunMetadata:
+        try:
+            expected_status = WorkflowMetadataStatus(expected_status)
+            status = WorkflowMetadataStatus(status)
+        except ValueError:
+            raise ConflictError("Invalid workflow status transition") from None
+        if status not in WORKFLOW_STATUS_TRANSITIONS[expected_status]:
+            raise ConflictError("Invalid workflow status transition")
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(workflow_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Workflow run not found")
+            current = self._run(row)
+            if current.owner_user_id != owner_user_id or current.case_id != case_id:
+                raise ConflictError("Workflow does not match the selected owner and case")
+            if current.status != expected_status:
+                raise ConflictError("Workflow status is stale")
+            updated_at = datetime.now(timezone.utc)
+            if updated_at <= current.updated_at:
+                updated_at = current.updated_at + timedelta(microseconds=1)
+            updated = connection.execute(
+                """UPDATE workflow_runs SET status = ?, updated_at = ?
+                   WHERE workflow_id = ? AND owner_user_id = ? AND case_id = ? AND status = ?""",
+                (status.value, updated_at.isoformat(), str(workflow_id),
+                 str(owner_user_id), str(case_id), expected_status.value),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("Workflow status is stale")
+            run = WorkflowRunMetadata.model_validate({
+                **current.model_dump(), "status": status, "updated_at": updated_at,
+            })
+            self._append_run_event(
+                connection, run=run,
+                kind="RECOVERY_REQUIRED" if status == WorkflowMetadataStatus.RECOVERY_REQUIRED
+                else "STATUS_CHANGED",
+                previous_status=expected_status,
+            )
+            return run
+
+    def require_recovery(self, workflow_id: UUID, *, owner_user_id: UUID,
+                         case_id: UUID,
+                         expected_status: WorkflowMetadataStatus) -> WorkflowRunMetadata:
+        try:
+            expected_status = WorkflowMetadataStatus(expected_status)
+        except ValueError:
+            raise ConflictError("Only an active workflow can require recovery") from None
+        if expected_status not in (
+            WorkflowMetadataStatus.RUNNING, WorkflowMetadataStatus.RESUMING,
+            WorkflowMetadataStatus.REVIEW_REQUIRED,
+        ):
+            raise ConflictError("Only an active workflow can require recovery")
+        return self.transition(
+            workflow_id, owner_user_id=owner_user_id, case_id=case_id,
+            expected_status=expected_status,
+            status=WorkflowMetadataStatus.RECOVERY_REQUIRED,
+        )
+
+    def events(self, workflow_id: UUID) -> tuple[WorkflowRunEvent, ...]:
+        with self._persistence.transaction() as connection:
+            run_row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(workflow_id),),
+            ).fetchone()
+            if run_row is None:
+                raise NotFoundError("Workflow run not found")
+            run = self._run(run_row)
+            rows = connection.execute(
+                """SELECT * FROM workflow_run_events
+                   WHERE workflow_id = ? ORDER BY sequence""",
+                (str(workflow_id),),
+            ).fetchall()
+            events = tuple(self._event(row) for row in rows)
+            for sequence, (row, event) in enumerate(zip(rows, events), start=1):
+                try:
+                    payload = json.loads(row["event_json"])
+                except Exception:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+                if (
+                    event.sequence != sequence
+                    or payload.get("workflow_id") != str(run.workflow_id)
+                    or payload.get("run_id") != str(run.run_id)
+                    or payload.get("case_id") != str(run.case_id)
+                    or payload.get("owner_user_id") != str(run.owner_user_id)
+                    or payload.get("sequence") != event.sequence
+                    or payload.get("kind") != event.kind
+                    or payload.get("previous_status") != (
+                        event.previous_status.value if event.previous_status else None
+                    )
+                    or payload.get("status") != event.status.value
+                ):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            if not events or events[-1].status != run.status:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            return events
 

@@ -1,10 +1,12 @@
 """Focused M5D proposal/review persistence tests; HITL checkpoints stay in memory."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from backend.app.operations import BusinessOperations
@@ -97,6 +99,24 @@ class SQLiteProposalRepositoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConflictError, "already been reviewed"):
                     self.service.review(original.id, decision, self.review)
 
+    def test_direct_review_is_monotonic_when_anchor_and_decision_share_a_clock_tick(self):
+        instant = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant if tz is not None else instant.replace(tzinfo=None)
+
+        with patch("backend.app.proposals.datetime", FixedDateTime), \
+                patch("backend.app.persistence.datetime", FixedDateTime):
+            proposal = self.proposal()
+            reviewed = self.service.review(
+                proposal.id, ProposalStatus.APPROVED, self.review,
+            )
+
+        self.assertEqual(reviewed.updated_at, instant.replace(microsecond=1))
+        self.assertEqual(self.service.get(proposal.id), reviewed)
+
     def test_audit_failure_rolls_back_proposal_workflow_and_decision(self):
         proposal = self.proposal()
         binding = self.bind(proposal)
@@ -180,7 +200,9 @@ class SQLiteProposalRepositoryTests(unittest.TestCase):
         store = SQLitePersistence(self.path)
         with store.transaction() as connection:
             connection.execute(
-                "UPDATE workflow_runs SET status = 'COMPLETED' WHERE workflow_id = ?",
+                """UPDATE workflow_runs
+                   SET status = 'RECOVERY_REQUIRED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 second')
+                   WHERE workflow_id = ?""",
                 (str(binding.workflow_id),),
             )
         with self.assertRaisesRegex(ConflictError, "stale or invalid"):
