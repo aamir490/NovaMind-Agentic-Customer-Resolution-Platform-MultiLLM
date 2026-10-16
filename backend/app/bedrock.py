@@ -3,6 +3,7 @@
 import json
 
 from .llm import LLMRequest, LLMResponse, ProviderFailure, TokenUsage
+from .observability import annotate
 
 
 _MAX_TIMEOUT_MS = 120_000
@@ -196,6 +197,11 @@ class BedrockProvider:
             code = _failure_code(error)
             if code is None:
                 raise
+            response = getattr(error, "response", None)
+            metadata = response.get("ResponseMetadata") if isinstance(response, dict) else None
+            status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+            if type(status) is int and 100 <= status <= 599:
+                annotate(provider_status_code=status)
             raise ProviderFailure(code) from None
 
         if not isinstance(response, dict):

@@ -5,12 +5,16 @@ import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
+from uuid import UUID
 
+from botocore.exceptions import ClientError
 from pydantic import ValidationError
 
 from backend.app.bedrock import BedrockProvider
 from backend.app.llm import LLMMessage, LLMRequest, ProviderFailure, StructuredLLM
 from backend.app.agent import AgentDecision
+from backend.app.observability import LocalObserver, observing
+from backend.app.security import AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential, authenticated
 
 
 FINAL = '{"decision":{"kind":"final"}}'
@@ -273,6 +277,55 @@ class BedrockTests(unittest.TestCase):
         self.client.converse.side_effect = RuntimeError("adapter bug")
         with self.assertRaisesRegex(RuntimeError, "adapter bug"):
             self.provider.generate(self.request, response_schema={})
+
+    def test_bedrock_http_status_is_safe_telemetry_and_public_failure_stays_unavailable(self):
+        auth = LocalAuthenticationProvider((LocalCredential(token="offline-status-test-token",
+            identity=AuthenticatedIdentity(user_id=UUID(int=17), role="REVIEWER")),))
+        self.enterContext(authenticated(auth, "offline-status-test-token"))
+        request = LLMRequest(messages=(LLMMessage(role="user", content="PRIVATE_PROMPT"),))
+        for service_code, status in (("ValidationException", 400), ("ModelErrorException", 424),
+                                     ("ThrottlingException", 429), ("ServiceUnavailableException", 503)):
+            with self.subTest(service_code=service_code):
+                self.client.converse.reset_mock(side_effect=True)
+                self.client.converse.side_effect = ClientError({
+                    "Error": {"Code": service_code, "Message": "PRIVATE_AWS_ERROR"},
+                    "ResponseMetadata": {"HTTPStatusCode": status, "private": "PRIVATE_CREDENTIAL"}},
+                    "Converse")
+                observer = LocalObserver()
+                with observing(observer):
+                    result = StructuredLLM(BedrockProvider(
+                        model_id="us.amazon.nova-lite-v1:0", client=self.client)).generate(
+                            request, AgentDecision)
+                self.assertEqual(result.model_dump(), {"ok": False, "code": "UNAVAILABLE",
+                    "message": "Provider could not complete the request"})
+                event = observer.snapshot()["events"][-1]
+                self.assertEqual(event["provider_status_code"], status)
+                self.assertEqual(event["provider"], "bedrock")
+                self.assertTrue(event["provider_called"])
+                self.assertIsNone(event["input_tokens"])
+                for private in ("PRIVATE_PROMPT", "PRIVATE_AWS_ERROR", "PRIVATE_CREDENTIAL",
+                                "offline-status-test-token"):
+                    self.assertNotIn(private, json.dumps(observer.snapshot()))
+                    self.assertNotIn(private, result.model_dump_json())
+                self.client.converse.assert_called_once()
+
+    def test_bedrock_ignores_non_numeric_or_out_of_range_http_status(self):
+        auth = LocalAuthenticationProvider((LocalCredential(token="offline-status-test-token",
+            identity=AuthenticatedIdentity(user_id=UUID(int=17), role="REVIEWER")),))
+        self.enterContext(authenticated(auth, "offline-status-test-token"))
+        for status in (True, "400", 99, 600, None):
+            with self.subTest(status=status):
+                self.client.converse.reset_mock(side_effect=True)
+                self.client.converse.side_effect = ClientError({
+                    "Error": {"Code": "ValidationException", "Message": "PRIVATE_AWS_ERROR"},
+                    "ResponseMetadata": {"HTTPStatusCode": status}}, "Converse")
+                observer = LocalObserver()
+                with observing(observer):
+                    result = StructuredLLM(BedrockProvider(
+                        model_id="us.amazon.nova-lite-v1:0", client=self.client)).generate(
+                            self.request, AgentDecision)
+                self.assertEqual(result.code, "UNAVAILABLE")
+                self.assertNotIn("provider_status_code", observer.snapshot()["events"][-1])
 
     def test_invalid_input_before_client_call(self):
         for kwargs in ({"model_id": " "}, {"model_id": "test", "timeout_ms": 0},
