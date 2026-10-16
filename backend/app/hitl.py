@@ -199,6 +199,13 @@ class HITLWorkflow:
             return self._failure(state, "PROPOSAL_CHANGED")
         review = ReviewRequired(workflow_id=state.workflow_id, case_id=live.case_id,
             proposal_id=live.id, review_id=uuid4(), action=live.action, rationale=live.rationale)
+        try:
+            self._proposals.bind_workflow_review(
+                live.id, workflow_id=review.workflow_id, case_id=review.case_id,
+                review_id=review.review_id,
+            )
+        except ConflictError:
+            return self._failure(state, "PROPOSAL_CHANGED")
         agent = GraphState.model_validate({**state.agent.model_dump(), "error": None})
         return self._update(state, review=review, agent=agent, audit=(*state.audit,
             self._event(state, "REVIEW_REQUIRED", proposal_id=live.id)))
@@ -226,7 +233,7 @@ class HITLWorkflow:
             status = ProposalStatus.APPROVED if decision.decision == "APPROVE" else ProposalStatus.REJECTED
             reviewed = self._proposals.review(proposal.id, status, HumanReview(
                 reviewer_name=str(identity.user_id), note=decision.note or "No note supplied.",
-            ))
+            ), workflow_id=decision.workflow_id, review_id=decision.review_id)
         except (NotFoundError, ConflictError):
             return self._failure(state, "REVIEW_CONFLICT")
         return self._update(state, reviewed_status=reviewed.status, audit=(*state.audit,
@@ -314,6 +321,10 @@ class HITLWorkflow:
             except NotFoundError:
                 return ResumeRejected(error="REVIEW_MISMATCH")
             if proposal.case_id != decision.case_id:
+                return ResumeRejected(error="REVIEW_MISMATCH")
+            if not self._proposals.matches_workflow_review(
+                    proposal.id, workflow_id=decision.workflow_id, case_id=decision.case_id,
+                    review_id=decision.review_id):
                 return ResumeRejected(error="REVIEW_MISMATCH")
             if proposal.status != ProposalStatus.PENDING_REVIEW:
                 return ResumeRejected(error="ALREADY_REVIEWED")

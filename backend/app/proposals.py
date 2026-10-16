@@ -50,11 +50,20 @@ class ResolutionProposal(Record):
     review_note: Description | None = None
 
 
+class WorkflowReviewBinding(Record):
+    """Server-side link between a paused workflow and its pending proposal."""
+
+    workflow_id: UUID
+    case_id: UUID
+    review_id: UUID
+
+
 class ProposalService:
     def __init__(self, cases: CaseService, operations: BusinessOperations) -> None:
         self._cases = cases
         self._operations = operations
         self._proposals: dict[UUID, ResolutionProposal] = {}
+        self._workflow_reviews: dict[UUID, WorkflowReviewBinding] = {}
         self._lock = RLock()
 
     @observed("proposal.create")
@@ -103,13 +112,40 @@ class ProposalService:
         with self._lock:
             return [proposal for proposal in self._proposals.values() if proposal.case_id == case_id]
 
+    def bind_workflow_review(self, proposal_id: UUID, *, workflow_id: UUID,
+                             case_id: UUID, review_id: UUID) -> WorkflowReviewBinding:
+        """Bind a pending proposal to one exact HITL pause before it is exposed for review."""
+        binding = WorkflowReviewBinding(workflow_id=workflow_id, case_id=case_id, review_id=review_id)
+        with self._lock:
+            proposal = self.get(proposal_id)
+            if proposal.case_id != binding.case_id or proposal.status != ProposalStatus.PENDING_REVIEW:
+                raise ConflictError("Proposal cannot be bound to this workflow review")
+            existing = self._workflow_reviews.get(proposal_id)
+            if existing is not None and existing != binding:
+                raise ConflictError("Proposal is already bound to a different workflow review")
+            self._workflow_reviews[proposal_id] = binding
+            return binding
+
+    def matches_workflow_review(self, proposal_id: UUID, *, workflow_id: UUID,
+                                case_id: UUID, review_id: UUID) -> bool:
+        with self._lock:
+            return self._workflow_reviews.get(proposal_id) == WorkflowReviewBinding(
+                workflow_id=workflow_id, case_id=case_id, review_id=review_id,
+            )
+
     @observed("proposal.review")
     def review(self, proposal_id: UUID, decision: ProposalStatus,
-               review: HumanReview) -> ResolutionProposal:
+               review: HumanReview, *, workflow_id: UUID | None = None,
+               review_id: UUID | None = None) -> ResolutionProposal:
         if decision not in (ProposalStatus.APPROVED, ProposalStatus.REJECTED):
             raise ConflictError("Review decision must be APPROVED or REJECTED")
         with self._lock:
             proposal = self.get(proposal_id)
+            binding = self._workflow_reviews.get(proposal_id)
+            if binding is not None and (workflow_id != binding.workflow_id or review_id != binding.review_id):
+                raise ConflictError("Workflow-bound proposal must be reviewed through its active workflow")
+            if binding is None and (workflow_id is not None or review_id is not None):
+                raise ConflictError("Proposal is not bound to the supplied workflow review")
             if proposal.status != ProposalStatus.PENDING_REVIEW:
                 raise ConflictError("Proposal has already been reviewed")
             now = datetime.now(timezone.utc)

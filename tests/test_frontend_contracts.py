@@ -178,7 +178,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
             release.set()
         await self.finished(running["run_id"])
 
-    async def test_pending_review_queue_removes_decided_and_stale_proposals(self):
+    async def test_pending_review_queue_keeps_workflow_bound_proposals_in_the_lifecycle(self):
         self.proposal_script()
         run = await self.finished((await self.start())["run_id"])
         response = await self.request("POST", f"/api/runs/{run['run_id']}/decision", self.decision(run), "reviewer")
@@ -188,11 +188,11 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         stale = await self.finished((await self.start())["run_id"])
         proposal_id = stale["review"]["proposal_id"]
         response = await self.request("POST", f"/api/proposals/{proposal_id}/reject", {"note": "Direct review"}, "reviewer")
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual((await self.finished(stale["run_id"]))["status"], "REVIEW_REQUIRED")
         response = await self.request("GET", "/api/reviews", who="admin")
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["items"], [])
+        self.assertEqual([item["run_id"] for item in response.json()["items"]], [stale["run_id"]])
 
     async def test_identity_authentication_permissions_and_no_cache(self):
         for who, expected in ((None, 401), ("a", 200), ("reviewer", 200), ("admin", 200)):
@@ -338,14 +338,15 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.cases.get_case(self.records[0].id), self.records[0])
         self.assertEqual(self.cases.get_order(self.orders[0].id), self.orders[0])
 
-    async def test_standalone_review_does_not_resume_and_stale_workflow_decision_conflicts(self):
+    async def test_workflow_decision_is_the_only_terminal_review_path(self):
         self.proposal_script()
         run = await self.finished((await self.start())["run_id"])
         proposal_id = run["review"]["proposal_id"]
         response = await self.request("POST", f"/api/proposals/{proposal_id}/reject", {"note": "Direct review"}, "reviewer")
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 409)
         response = await self.request("POST", f"/api/runs/{run['run_id']}/decision", self.decision(run), "reviewer")
-        self.assertEqual(response.json()["detail"], "ALREADY_REVIEWED")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual((await self.finished(run["run_id"]))["status"], "REVIEWED")
         self.assertEqual(self.providers[0].calls, 1)
 
     async def test_history_pagination_binding_and_server_only_assistant_writes(self):

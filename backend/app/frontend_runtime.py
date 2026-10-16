@@ -252,6 +252,10 @@ class FrontendRuntime:
             proposal = Authorization(self._cases, self._proposals).proposal(body.proposal_id)
             if proposal.status != ProposalStatus.PENDING_REVIEW:
                 raise FrontendError(409, "ALREADY_REVIEWED")
+            if not self._proposals.matches_workflow_review(
+                    proposal.id, workflow_id=body.workflow_id, case_id=body.case_id,
+                    review_id=body.review_id):
+                raise FrontendError(409, "REVIEW_MISMATCH")
             self._reserve()
             run.snapshot = run.snapshot.model_copy(update={"status": "RESUMING", "error": None, "trace_id": trace_id})
             self._publish(run, "STATE", "RESUMING")

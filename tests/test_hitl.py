@@ -14,6 +14,7 @@ from backend.app.hitl import HITLWorkflow, HumanDecision
 from backend.app.llm import StructuredLLM, ProviderFailure
 from backend.app.operations import AuthoritativeDeliveryFact
 from backend.app.proposals import HumanReview, ProposalStatus
+from backend.app.service import ConflictError
 from security_fixtures import ADMIN_ID, call_as_admin
 
 
@@ -169,12 +170,16 @@ class HITLTests(unittest.TestCase):
         self.assertEqual(sum(getattr(r, "status", None) == "REVIEWED" for r in outcomes), 1)
         self.assertEqual(sum(getattr(r, "error", None) == "NOT_PAUSED" for r in outcomes), 1)
 
-    def test_external_review_cannot_be_overwritten(self):
+    def test_workflow_bound_proposal_rejects_external_review(self):
         self.start()
-        proposal = self.proposals.review(self.paused.review.proposal_id, ProposalStatus.REJECTED,
-                                         HumanReview(reviewer_name="Other human", note="Rejected elsewhere"))
-        self.assertEqual(self.workflow.resume(self.decision()).error, "ALREADY_REVIEWED")
-        self.assertEqual(self.proposals.get(proposal.id), proposal)
+        with self.assertRaises(ConflictError):
+            self.proposals.review(self.paused.review.proposal_id, ProposalStatus.REJECTED,
+                                  HumanReview(reviewer_name="Other human", note="Rejected elsewhere"))
+        self.assertEqual(self.workflow.resume(self.decision(decision="REJECT")).status, "REVIEWED")
+        self.assertEqual(self.proposals.get(self.paused.review.proposal_id).status, ProposalStatus.REJECTED)
+        audit = self.workflow.audit(self.paused.workflow_id)
+        self.assertEqual((audit[-1].kind, audit[-1].proposal_status),
+                         ("HUMAN_REVIEW", ProposalStatus.REJECTED))
 
     def test_ordered_audit_survives_checkpoint_and_resume_without_duplicate_creation(self):
         self.start([baseline.call("get_inventory", sku="LAP-1"), self.proposal()])
