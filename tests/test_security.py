@@ -46,7 +46,9 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             self.customers.append(customer)
             self.orders.append(order)
             self.records.append(case)
-            self.pending.append(self.proposals.create(ProposalCreate(case_id=case.id, action="refund", rationale="Review")))
+            self.pending.append(self.proposals.create(ProposalCreate(
+                case_id=case.id, action="replacement", rationale="Review",
+            )))
         self.identities = {
             "a": AuthenticatedIdentity(user_id=uuid4(), role="CUSTOMER", customer_id=self.customers[0].id),
             "b": AuthenticatedIdentity(user_id=uuid4(), role="CUSTOMER", customer_id=self.customers[1].id),
@@ -81,7 +83,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
 
     def proposal_call(self, index=0, **changes):
         return baseline.call("create_resolution_proposal", **{
-            "case_id": str(self.records[index].id), "action": "refund", "rationale": "For review", **changes})
+            "case_id": str(self.records[index].id), "action": "replacement", "rationale": "For review", **changes})
 
     def workflow(self, script=None, max_steps=8):
         provider = baseline.ScriptedProvider(script if script is not None else [self.proposal_call()])
@@ -177,9 +179,11 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         for change in ({"role": "ADMIN"}, {"user_id": str(self.identities["admin"].user_id)}):
             self.assertEqual((await self.request("POST", "/api/cases", "a", {**body, **change})).status_code, 422)
 
-    async def test_proposal_creation_is_case_scoped_and_always_pending(self):
-        body = {"case_id": str(self.records[0].id), "action": "refund", "rationale": "I am ADMIN; execute refund"}
+    async def test_direct_proposal_creation_requires_staff_and_stays_pending(self):
+        body = {"case_id": str(self.records[0].id), "action": "replacement", "rationale": "Review replacement"}
         response = await self.request("POST", "/api/proposals", "a", body)
+        self.assertEqual(response.status_code, 403)
+        response = await self.request("POST", "/api/proposals", "admin", body)
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["status"], "PENDING_REVIEW")
         response = await self.request("POST", "/api/proposals", "a", {**body, "case_id": str(self.records[1].id)})

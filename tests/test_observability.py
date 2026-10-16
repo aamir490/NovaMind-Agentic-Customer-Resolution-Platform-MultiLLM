@@ -288,8 +288,8 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         app.state.proposal_service = self.f.proposals
         app.state.business_operations = self.f.operations
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://local.test") as client:
-            created = await client.post("/api/proposals", headers={"Authorization": "Bearer phase15-customer-fixture"},
-                json={"case_id": str(self.f.case.id), "action": "refund", "rationale": "SECRET-RATIONALE"})
+            created = await client.post("/api/proposals", headers={"Authorization": "Bearer phase15-reviewer-fixture"},
+                json={"case_id": str(self.f.case.id), "action": "replacement", "rationale": "SECRET-RATIONALE"})
             self.assertEqual(created.status_code, 201)
             response = await client.post(f"/api/proposals/{created.json()['id']}/reject",
                 headers={"Authorization": "Bearer phase15-reviewer-fixture"}, json={"note": "SECRET-NOTE"})

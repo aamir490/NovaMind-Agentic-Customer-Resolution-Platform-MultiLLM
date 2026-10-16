@@ -39,6 +39,7 @@ class PolicyLookup(RequestModel):
 
 class EligibilityAssessment(EligibilityInput):
     order_id: UUID
+    case_id: UUID | None = None
 
 
 class ProposalLookup(RequestModel):
@@ -110,9 +111,11 @@ class LocalTools:
             "assess_eligibility": _Binding(
                 EligibilityAssessment, EligibilityResult,
                 lambda p: operations.check_eligibility(
-                    p.order_id, EligibilityInput.model_validate(p.model_dump(exclude={"order_id"})),
+                    p.order_id,
+                    EligibilityInput.model_validate(p.model_dump(exclude={"order_id", "case_id"})),
+                    case_id=p.case_id,
                 ),
-                "Assess caller-supplied scenario facts using existing rules; not authorization.",
+                "Assess caller-supplied scenario facts using existing rules; include case_id to issue case-bound evidence. Not authorization.",
             ),
             "create_resolution_proposal": _Binding(
                 ProposalCreate, ResolutionProposal, proposals.create,

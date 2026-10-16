@@ -59,6 +59,9 @@ def agent_instructions(descriptions) -> str:
         + MEMORY_INSTRUCTIONS + SAFETY_INSTRUCTIONS +
         "Do not invent assessment inputs; if required facts are missing, finish with available information. "
         "Eligibility is not authorization. You cannot approve, reject, execute actions, or change inventory. "
+        "For a refund, call assess_eligibility with the supplied case_id. Create a refund proposal only after it "
+        "returns refund_eligible=true with no denial reasons, "
+        "and pass that result's evidence_id as eligibility_evidence_id. Never invent eligibility evidence. "
         "A proposal is pending human review only. At most one proposal may be created per run, "
         "and only for the supplied case. Finish when the informational review or proposal is ready. "
         "Final customer wording is rendered by the application from tool evidence. Tools: "

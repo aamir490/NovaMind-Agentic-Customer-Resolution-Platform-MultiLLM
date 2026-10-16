@@ -117,9 +117,21 @@ class GraphAgentTests(baseline.AgentTests):
                 self.assertEqual(self.provider.requests, original_provider.requests)
 
     def test_proposal_behavioral_parity_ignoring_server_ids_and_timestamps(self):
-        original = ResolutionAgent(StructuredLLM(baseline.ScriptedProvider([self.proposal(), baseline.FINAL])), self.tools)
+        def refund_proposal():
+            evidence = self.tools.invoke("assess_eligibility", {
+                "case_id": str(self.case.id), "order_id": str(self.order.id),
+                "customer_id": str(self.case.customer_id), "sku": "LAP-1", "quantity": 1,
+                "days_since_delivery": 10, "reason": "wrong_item", "condition": "unused",
+            })
+            self.assertTrue(evidence.ok)
+            self.assertTrue(evidence.data.refund_eligible)
+            self.assertIsNotNone(evidence.data.evidence_id)
+            return baseline.call("create_resolution_proposal", case_id=str(self.case.id), action="refund",
+                                 rationale="For human review", eligibility_evidence_id=str(evidence.data.evidence_id))
+
+        original = ResolutionAgent(StructuredLLM(baseline.ScriptedProvider([refund_proposal(), baseline.FINAL])), self.tools)
         expected = original.run(self.request)
-        actual = self.run_script([self.proposal(), baseline.FINAL])
+        actual = self.run_script([refund_proposal(), baseline.FINAL])
         self.assertEqual(actual.status, expected.status)
         self.assertEqual(actual.steps_used, expected.steps_used)
         for result in (actual, expected):

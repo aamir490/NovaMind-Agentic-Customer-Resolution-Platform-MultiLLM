@@ -62,7 +62,7 @@ class AgentTests(unittest.TestCase):
 
     def proposal(self, **overrides):
         return call("create_resolution_proposal", **{
-            "case_id": str(self.case.id), "action": "refund", "rationale": "For human review", **overrides,
+            "case_id": str(self.case.id), "action": "replacement", "rationale": "For human review", **overrides,
         })
 
     def test_lookup_loop_passes_results_back_and_keeps_ordered_audit(self):

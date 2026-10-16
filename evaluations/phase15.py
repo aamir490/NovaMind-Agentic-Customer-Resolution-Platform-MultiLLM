@@ -113,7 +113,7 @@ class Fixture:
     def __init__(self, directory):
         self.cases = CaseService()
         self.operations = BusinessOperations(self.cases)
-        self.proposals = ProposalService(self.cases)
+        self.proposals = ProposalService(self.cases, self.operations)
         self.tools = LocalTools(self.cases, self.operations, self.proposals)
         self.customer = self.cases.create_customer(CustomerCreate(name="Evaluation customer"))
         self.order = self.cases.create_order(OrderCreate(customer_id=self.customer.id,
@@ -140,7 +140,7 @@ class Fixture:
 
     def proposal(self, **extra):
         return call("create_resolution_proposal", **{
-            "case_id": str(self.case.id), "action": "refund", "rationale": "For human review", **extra})
+            "case_id": str(self.case.id), "action": "replacement", "rationale": "For human review", **extra})
 
     def snapshot(self):
         return (self.cases.get_case(self.case.id), self.cases.get_order(self.order.id),

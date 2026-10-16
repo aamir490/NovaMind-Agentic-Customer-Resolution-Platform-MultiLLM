@@ -64,7 +64,9 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     for customer in startup_customers:
         app.state.case_service.seed_customer(customer)
     app.state.business_operations = BusinessOperations(app.state.case_service)
-    app.state.proposal_service = ProposalService(app.state.case_service)
+    app.state.proposal_service = ProposalService(
+        app.state.case_service, app.state.business_operations,
+    )
     app.state.local_tools = LocalTools(
         app.state.case_service, app.state.business_operations, app.state.proposal_service,
     )

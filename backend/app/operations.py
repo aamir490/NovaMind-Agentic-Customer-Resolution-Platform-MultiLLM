@@ -1,8 +1,10 @@
 """Read-only local business operations using an explicit demonstration policy."""
 
+from datetime import datetime, timezone
 from enum import StrEnum
+from threading import RLock
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import Field
 
@@ -41,6 +43,8 @@ class InventoryItem(Record):
 
 
 class EligibilityResult(Record):
+    evidence_id: UUID | None = None
+    case_id: UUID | None = None
     order_id: UUID
     customer_id: UUID
     sku: Name
@@ -66,6 +70,18 @@ class EligibilityInput(Record):
     days_since_delivery: int = Field(strict=True, ge=0, le=36500)
     reason: ReturnReason
     condition: ItemCondition
+
+
+class EligibilityEvidence(Record):
+    """Server-issued, immutable evidence for one case/order/item assessment."""
+
+    id: UUID
+    case_id: UUID
+    order_id: UUID
+    customer_id: UUID
+    sku: Name
+    result: EligibilityResult
+    created_at: datetime
 
 
 def evaluate_rules(policy: ReturnPolicy, request: EligibilityInput,
@@ -108,6 +124,8 @@ class BusinessOperations:
             )
             for product in PRODUCT_SEEDS
         }
+        self._eligibility_evidence: dict[UUID, EligibilityEvidence] = {}
+        self._evidence_lock = RLock()
 
     def get_inventory(self, sku: str) -> InventoryItem:
         if sku not in self._inventory:
@@ -120,16 +138,23 @@ class BusinessOperations:
         return self._policies[policy_id]
 
     @observed("eligibility")
-    def check_eligibility(self, order_id: UUID, request: EligibilityInput) -> EligibilityResult:
+    def check_eligibility(self, order_id: UUID, request: EligibilityInput,
+                          *, case_id: UUID | None = None) -> EligibilityResult:
         self._cases.get_customer(request.customer_id)
         order = self._cases.get_order(order_id)
         if order.customer_id != request.customer_id:
             raise ConflictError("Order does not belong to the selected customer")
+        if case_id is not None:
+            case = self._cases.get_case(case_id)
+            if case.customer_id != request.customer_id or case.order_id != order.id:
+                raise ConflictError("Case does not belong to the selected customer and order")
         inventory = self.get_inventory(request.sku)
         policy = self.get_policy(inventory.policy_id)
         purchased = sum(item.quantity for item in order.items if item.sku == request.sku)
         reasons = evaluate_rules(policy, request, purchased)
-        return EligibilityResult(
+        evidence_id = uuid4() if case_id is not None else None
+        result = EligibilityResult(
+            evidence_id=evidence_id, case_id=case_id,
             order_id=order.id, customer_id=request.customer_id, sku=request.sku,
             requested_quantity=request.quantity, purchased_quantity=purchased,
             days_since_delivery=request.days_since_delivery,
@@ -138,3 +163,19 @@ class BusinessOperations:
             return_eligible=not reasons, refund_eligible=not reasons,
             denial_reasons=reasons, refund_requires_return=policy.refund_requires_return,
         )
+        if evidence_id is not None:
+            evidence = EligibilityEvidence(
+                id=evidence_id, case_id=case_id, order_id=order.id,
+                customer_id=request.customer_id, sku=request.sku, result=result,
+                created_at=datetime.now(timezone.utc),
+            )
+            with self._evidence_lock:
+                self._eligibility_evidence[evidence.id] = evidence
+        return result
+
+    def get_eligibility_evidence(self, evidence_id: UUID) -> EligibilityEvidence:
+        with self._evidence_lock:
+            evidence = self._eligibility_evidence.get(evidence_id)
+        if evidence is None:
+            raise NotFoundError("Eligibility evidence not found")
+        return evidence

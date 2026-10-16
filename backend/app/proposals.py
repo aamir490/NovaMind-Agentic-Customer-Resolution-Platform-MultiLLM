@@ -6,6 +6,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .domain import Description, Name, Record
+from .operations import BusinessOperations
 from .schemas import RequestModel
 from .service import CaseService, ConflictError, NotFoundError
 from .observability import observed
@@ -27,6 +28,7 @@ class ProposalCreate(RequestModel):
     case_id: UUID
     action: ProposedAction
     rationale: Description
+    eligibility_evidence_id: UUID | None = None
 
 
 class HumanReview(RequestModel):
@@ -39,6 +41,7 @@ class ResolutionProposal(Record):
     case_id: UUID
     action: ProposedAction
     rationale: Description
+    eligibility_evidence_id: UUID | None = None
     status: ProposalStatus
     created_at: datetime
     updated_at: datetime
@@ -48,14 +51,37 @@ class ResolutionProposal(Record):
 
 
 class ProposalService:
-    def __init__(self, cases: CaseService) -> None:
+    def __init__(self, cases: CaseService, operations: BusinessOperations) -> None:
         self._cases = cases
+        self._operations = operations
         self._proposals: dict[UUID, ResolutionProposal] = {}
         self._lock = RLock()
 
     @observed("proposal.create")
     def create(self, request: ProposalCreate) -> ResolutionProposal:
-        self._cases.get_case(request.case_id)
+        request = ProposalCreate.model_validate(request.model_dump())
+        case = self._cases.get_case(request.case_id)
+        if request.action == ProposedAction.REFUND:
+            if request.eligibility_evidence_id is None:
+                raise ConflictError("Trusted eligibility evidence is required for a refund proposal")
+            try:
+                evidence = self._operations.get_eligibility_evidence(request.eligibility_evidence_id)
+            except NotFoundError:
+                raise ConflictError("Trusted eligibility evidence is required for a refund proposal") from None
+            result = evidence.result
+            if (evidence.case_id != case.id
+                    or evidence.order_id != case.order_id
+                    or evidence.customer_id != case.customer_id
+                    or result.evidence_id != evidence.id
+                    or result.case_id != evidence.case_id
+                    or result.order_id != evidence.order_id
+                    or result.customer_id != evidence.customer_id
+                    or result.sku != evidence.sku):
+                raise ConflictError("Eligibility evidence does not match the selected case")
+            if not result.refund_eligible or result.denial_reasons:
+                raise ConflictError("Refund is not eligible under the supplied evidence")
+        elif request.eligibility_evidence_id is not None:
+            raise ConflictError("Eligibility evidence is only valid for refund proposals")
         with self._lock:
             now = datetime.now(timezone.utc)
             proposal = ResolutionProposal(

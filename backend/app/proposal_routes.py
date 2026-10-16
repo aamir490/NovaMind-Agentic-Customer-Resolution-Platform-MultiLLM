@@ -23,6 +23,7 @@ Proposals = Annotated[ProposalService, Depends(get_proposals)]
 
 @router.post("/proposals", response_model=ResolutionProposal, status_code=201)
 def create_proposal(body: ProposalCreate, proposals: Proposals, service: Service) -> ResolutionProposal:
+    require_roles(Role.REVIEWER, Role.ADMIN)
     Authorization(service, proposals).case(body.case_id)
     return proposals.create(body)
 

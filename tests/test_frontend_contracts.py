@@ -111,7 +111,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
 
     def proposal_script(self):
         self.script = [call("create_resolution_proposal", case_id=str(self.records[0].id),
-                            action="refund", rationale="Untrusted rationale for human review")]
+                            action="replacement", rationale="Untrusted rationale for human review")]
 
     def decision(self, snapshot, **changes):
         return {"instance_id": str(self.runtime.instance_id),

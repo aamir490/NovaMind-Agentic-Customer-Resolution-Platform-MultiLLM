@@ -46,10 +46,13 @@ def check_eligibility(
     operations: Operations,
     service: Service,
     quantity: Annotated[int, Query(ge=1, le=1000)] = 1,
+    case_id: UUID | None = None,
 ) -> EligibilityResult:
     Authorization(service).order(order_id)
     Authorization.customer(customer_id)
+    if case_id is not None:
+        Authorization(service).case(case_id)
     return operations.check_eligibility(order_id, EligibilityInput(
         customer_id=customer_id, sku=sku, quantity=quantity,
         days_since_delivery=days_since_delivery, reason=reason, condition=condition,
-    ))
+    ), case_id=case_id)

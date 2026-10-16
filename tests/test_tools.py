@@ -30,7 +30,7 @@ class LocalToolTests(unittest.TestCase):
         ))
 
     def proposal_input(self):
-        return {"case_id": str(self.case.id), "action": "refund", "rationale": "Request review only."}
+        return {"case_id": str(self.case.id), "action": "replacement", "rationale": "Request review only."}
 
     def assessment_input(self):
         return {"order_id": str(self.order.id), "customer_id": str(self.customer.id),

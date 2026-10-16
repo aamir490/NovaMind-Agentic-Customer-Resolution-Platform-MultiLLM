@@ -14,6 +14,7 @@ from pydantic import ValidationError
 import uvicorn
 
 from backend.app.main import create_app
+from backend.app.operations import EligibilityInput
 from backend.app.proposals import HumanReview, ProposalCreate, ProposalStatus
 from backend.app.schemas import CustomerCreate, OrderCreate, CaseCreate
 from backend.app.service import ConflictError, NotFoundError
@@ -37,6 +38,16 @@ class ProposalServiceTests(unittest.TestCase):
         self.service = self.app.state.proposal_service
         self.request = ProposalCreate(case_id=self.case.id, action="replacement", rationale="Review a replacement.")
         self.review = HumanReview(reviewer_name="Local reviewer", note="Reviewed the proposal.")
+
+    def refund_request(self):
+        evidence = self.app.state.business_operations.check_eligibility(
+            self.case.order_id,
+            EligibilityInput(customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
+                             days_since_delivery=10, reason="wrong_item", condition="unused"),
+            case_id=self.case.id,
+        )
+        return ProposalCreate(case_id=self.case.id, action="refund", rationale="Review only.",
+                              eligibility_evidence_id=evidence.evidence_id)
 
     def test_creation_is_pending_and_server_managed(self):
         proposal = self.service.create(self.request)
@@ -91,7 +102,10 @@ class ProposalServiceTests(unittest.TestCase):
         order_before = case_service.get_order(self.case.order_id)
         stock_before = self.app.state.business_operations.get_inventory("LAP-1")
         for action in ("refund", "replacement", "return"):
-            proposal = self.service.create(ProposalCreate(case_id=self.case.id, action=action, rationale="Review only."))
+            request = self.refund_request() if action == "refund" else ProposalCreate(
+                case_id=self.case.id, action=action, rationale="Review only.",
+            )
+            proposal = self.service.create(request)
             self.service.review(proposal.id, ProposalStatus.APPROVED, self.review)
         self.assertEqual(case_service.get_case(self.case.id), self.case)
         self.assertEqual(case_service.get_order(self.case.order_id), order_before)
@@ -162,7 +176,7 @@ class ProposalHttpTests(unittest.TestCase):
 
     def create(self):
         status, proposal = self.request("POST", "/api/proposals", {
-            "case_id": str(self.case.id), "action": "refund", "rationale": "Review a refund request.",
+            "case_id": str(self.case.id), "action": "replacement", "rationale": "Review a replacement request.",
         })
         self.assertEqual(status, 201)
         self.assertEqual(proposal["status"], "PENDING_REVIEW")

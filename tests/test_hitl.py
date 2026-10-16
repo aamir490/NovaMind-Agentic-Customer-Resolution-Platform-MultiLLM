@@ -46,11 +46,21 @@ class HITLTests(unittest.TestCase):
         self.assertEqual(self.proposals.get(result.review.proposal_id).status, "PENDING_REVIEW")
 
     def test_nova_pro_refund_decision_pauses_for_human_review_without_execution(self):
+        evidence = self.tools.invoke("assess_eligibility", {
+            "case_id": str(self.case.id), "order_id": str(self.order.id),
+            "customer_id": str(self.case.customer_id), "sku": "LAP-1", "quantity": 1,
+            "days_since_delivery": 10, "reason": "wrong_item", "condition": "unused",
+        })
+        self.assertTrue(evidence.ok)
+        self.assertTrue(evidence.data.refund_eligible)
+        self.assertIsNotNone(evidence.data.evidence_id)
+        proposal = baseline.call("create_resolution_proposal", case_id=str(self.case.id), action="refund",
+                                 rationale="For human review", eligibility_evidence_id=str(evidence.data.evidence_id))
         client = Mock()
         client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
             "role": "assistant", "content": [{"toolUse": {
                 "toolUseId": "tooluse_offline", "name": "submit_tool_decision",
-                "input": self.proposal()}}]}}}
+                "input": proposal}}]}}}
         workflow = HITLWorkflow(StructuredLLM(BedrockProvider(
             model_id="us.amazon.nova-pro-v1:0", client=client)), self.tools, self.proposals)
         order_before = self.cases.get_order(self.order.id)
