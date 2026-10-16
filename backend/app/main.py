@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from .routes import router
 from .operation_routes import router as operation_router
-from .operations import BusinessOperations
+from .operations import BusinessOperations, DeliveryFactIngestion, TrustedDeliverySource
 from .proposal_routes import router as proposal_router
 from .proposals import ProposalService
 from .service import CaseService, ConflictError, NotFoundError
@@ -42,7 +42,8 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
                observer: LocalObserver | None = None, local_provider_factory: Callable[[], LLMProvider] | None = None,
                provider_label: Literal["local_scripted", "groq", "bedrock"] = "local_scripted",
                conversation_store: ConversationStore | None = None,
-               startup_customers: tuple[Customer, ...] = ()) -> FastAPI:
+               startup_customers: tuple[Customer, ...] = (),
+               trusted_delivery_sources: tuple[TrustedDeliverySource, ...] = ()) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         try:
@@ -64,6 +65,9 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     for customer in startup_customers:
         app.state.case_service.seed_customer(customer)
     app.state.business_operations = BusinessOperations(app.state.case_service)
+    app.state.delivery_fact_ingestion = DeliveryFactIngestion(
+        app.state.business_operations, trusted_delivery_sources,
+    )
     app.state.proposal_service = ProposalService(
         app.state.case_service, app.state.business_operations,
     )

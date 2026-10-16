@@ -15,7 +15,9 @@ from pydantic import ValidationError
 import uvicorn
 
 from backend.app.main import create_app
-from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
+from backend.app.operations import (
+    AuthoritativeDeliveryFact, TrustedDeliverySource,
+)
 from backend.app.proposals import HumanReview, ProposalCreate, ProposalStatus
 from backend.app.schemas import CustomerCreate, OrderCreate, CaseCreate
 from backend.app.service import ConflictError, NotFoundError
@@ -34,7 +36,8 @@ def create_case(app):
 
 class ProposalServiceTests(unittest.TestCase):
     def setUp(self):
-        self.app = create_app()
+        self.delivery_source = TrustedDeliverySource(id="test-fulfillment")
+        self.app = create_app(trusted_delivery_sources=(self.delivery_source,))
         self.case = create_case(self.app)
         self.service = self.app.state.proposal_service
         self.request = ProposalCreate(case_id=self.case.id, action="replacement", rationale="Review a replacement.")
@@ -43,12 +46,12 @@ class ProposalServiceTests(unittest.TestCase):
     def refund_request(self):
         now = datetime.now(timezone.utc)
         operations = self.app.state.business_operations
-        operations.record_authoritative_delivery_fact(AuthoritativeDeliveryFact(
+        self.app.state.delivery_fact_ingestion.ingest(self.delivery_source.id, AuthoritativeDeliveryFact(
             id=uuid4(), case_id=self.case.id, order_id=self.case.order_id,
             customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
             delivered_at=now - timedelta(days=10), reason="wrong_item", condition="unused",
-            source_reference="test-verified-delivery", verification_status=DeliveryVerificationStatus.VERIFIED,
-            verified_at=now,
+            source_id=self.delivery_source.id,
+            source_reference="test-verified-delivery", verified_at=now,
         ))
         evidence = operations.assess_refund_eligibility(self.case.id, "LAP-1")
         return ProposalCreate(case_id=self.case.id, action="refund", rationale="Review only.",

@@ -80,13 +80,11 @@ class EligibilityEvidence(Record):
     order_id: UUID
     customer_id: UUID
     sku: Name
+    delivery_fact_id: UUID
+    delivery_source_id: Name
+    delivery_source_reference: Name
     result: EligibilityResult
     created_at: datetime
-
-
-class DeliveryVerificationStatus(StrEnum):
-    VERIFIED = "VERIFIED"
-    UNVERIFIED = "UNVERIFIED"
 
 
 class AuthoritativeDeliveryFact(Record):
@@ -101,9 +99,35 @@ class AuthoritativeDeliveryFact(Record):
     delivered_at: datetime
     reason: ReturnReason
     condition: ItemCondition
+    source_id: Name
     source_reference: Name
-    verification_status: DeliveryVerificationStatus
-    verified_at: datetime | None = None
+    verified_at: datetime
+
+
+class TrustedDeliverySource(Record):
+    """A trusted-host configured fulfillment or return-verification source."""
+
+    id: Name
+
+
+class DeliveryFactIngestion:
+    """Server-only boundary for records delivered by configured trusted sources."""
+
+    def __init__(self, operations: "BusinessOperations",
+                 sources: tuple[TrustedDeliverySource, ...] = ()) -> None:
+        self._operations = operations
+        self._sources = {source.id: source for source in sources}
+        if len(self._sources) != len(sources):
+            raise ValueError("Trusted delivery source IDs must be unique")
+
+    def ingest(self, source_id: str, fact: AuthoritativeDeliveryFact) -> AuthoritativeDeliveryFact:
+        source = self._sources.get(source_id)
+        if source is None:
+            raise ConflictError("Trusted delivery source is not configured")
+        fact = AuthoritativeDeliveryFact.model_validate(fact.model_dump())
+        if fact.source_id != source.id:
+            raise ConflictError("Delivery fact provenance does not match the configured source")
+        return self._operations._store_authoritative_delivery_fact(fact)
 
 
 def evaluate_rules(policy: ReturnPolicy, request: EligibilityInput,
@@ -148,6 +172,8 @@ class BusinessOperations:
         }
         self._eligibility_evidence: dict[UUID, EligibilityEvidence] = {}
         self._delivery_facts: dict[tuple[UUID, str], AuthoritativeDeliveryFact] = {}
+        self._delivery_fact_ids: dict[UUID, AuthoritativeDeliveryFact] = {}
+        self._delivery_source_references: dict[tuple[str, str], AuthoritativeDeliveryFact] = {}
         self._evidence_lock = RLock()
 
     def get_inventory(self, sku: str) -> InventoryItem:
@@ -187,8 +213,8 @@ class BusinessOperations:
         )
         return result
 
-    def record_authoritative_delivery_fact(self, fact: AuthoritativeDeliveryFact) -> None:
-        """Trusted-host integration boundary. Deliberately has no HTTP or tool exposure."""
+    def _store_authoritative_delivery_fact(self, fact: AuthoritativeDeliveryFact) -> AuthoritativeDeliveryFact:
+        """Internal storage called only by DeliveryFactIngestion after provenance validation."""
         fact = AuthoritativeDeliveryFact.model_validate(fact.model_dump())
         case = self._cases.get_case(fact.case_id)
         order = self._cases.get_order(fact.order_id)
@@ -198,17 +224,35 @@ class BusinessOperations:
         purchased = sum(item.quantity for item in order.items if item.sku == fact.sku)
         if purchased == 0 or fact.quantity > purchased:
             raise ConflictError("Delivery fact does not match an order item")
-        if fact.delivered_at.tzinfo is None or (fact.verified_at is not None and fact.verified_at.tzinfo is None):
+        if fact.delivered_at.tzinfo is None or fact.verified_at.tzinfo is None:
             raise ConflictError("Delivery fact timestamps must include a timezone")
-        if fact.verification_status == DeliveryVerificationStatus.VERIFIED and fact.verified_at is None:
-            raise ConflictError("Verified delivery facts require a verification timestamp")
-        if fact.verified_at is not None and fact.verified_at < fact.delivered_at:
+        if fact.verified_at < fact.delivered_at:
             raise ConflictError("Delivery fact verification cannot predate delivery")
+        now = datetime.now(timezone.utc)
+        if fact.delivered_at > now or fact.verified_at > now:
+            raise ConflictError("Delivery fact timestamps cannot be in the future")
         key = (fact.case_id, fact.sku)
+        provenance_key = (fact.source_id, fact.source_reference)
         with self._evidence_lock:
-            if key in self._delivery_facts:
-                raise ConflictError("Authoritative delivery fact already exists for this case item")
+            existing_by_id = self._delivery_fact_ids.get(fact.id)
+            if existing_by_id is not None:
+                if existing_by_id == fact:
+                    return existing_by_id
+                raise ConflictError("Delivery fact ID conflicts with an existing record")
+            existing_by_provenance = self._delivery_source_references.get(provenance_key)
+            if existing_by_provenance is not None:
+                if existing_by_provenance == fact:
+                    return existing_by_provenance
+                raise ConflictError("Delivery fact provenance conflicts with an existing record")
+            existing = self._delivery_facts.get(key)
+            if existing is not None:
+                if existing == fact:
+                    return existing
+                raise ConflictError("Conflicting delivery fact already exists for this case item")
             self._delivery_facts[key] = fact
+            self._delivery_fact_ids[fact.id] = fact
+            self._delivery_source_references[provenance_key] = fact
+        return fact
 
     @observed("refund_eligibility")
     def assess_refund_eligibility(self, case_id: UUID, sku: str) -> EligibilityResult:
@@ -218,8 +262,6 @@ class BusinessOperations:
             fact = self._delivery_facts.get(key)
         if fact is None:
             raise ConflictError("Trusted refund evidence unavailable: delivery facts are missing")
-        if fact.verification_status != DeliveryVerificationStatus.VERIFIED or fact.verified_at is None:
-            raise ConflictError("Trusted refund evidence unavailable: delivery facts are unverified")
         order = self._cases.get_order(case.order_id)
         if (fact.order_id != order.id or fact.customer_id != case.customer_id
                 or order.customer_id != case.customer_id):
@@ -250,7 +292,9 @@ class BusinessOperations:
         )
         evidence = EligibilityEvidence(
             id=evidence_id, case_id=case.id, order_id=order.id,
-            customer_id=case.customer_id, sku=fact.sku, result=result,
+            customer_id=case.customer_id, sku=fact.sku, delivery_fact_id=fact.id,
+            delivery_source_id=fact.source_id, delivery_source_reference=fact.source_reference,
+            result=result,
             created_at=now,
         )
         with self._evidence_lock:

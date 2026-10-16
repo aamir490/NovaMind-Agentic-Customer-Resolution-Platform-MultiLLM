@@ -8,7 +8,7 @@ import httpx
 
 from backend.app.main import create_app
 from backend.app.operations import (
-    AuthoritativeDeliveryFact, DeliveryVerificationStatus,
+    AuthoritativeDeliveryFact, TrustedDeliverySource,
 )
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 from backend.app.security import (
@@ -18,7 +18,8 @@ from backend.app.security import (
 
 class ProposalSecurityM1Tests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.app = create_app()
+        self.delivery_source = TrustedDeliverySource(id="test-fulfillment")
+        self.app = create_app(trusted_delivery_sources=(self.delivery_source,))
         self.cases = self.app.state.case_service
         self.customer = self.cases.create_customer(CustomerCreate(name="M1 customer"))
         self.order = self.cases.create_order(OrderCreate(
@@ -55,13 +56,14 @@ class ProposalSecurityM1Tests(unittest.IsolatedAsyncioTestCase):
 
     async def evidence(self, who="reviewer", *, days=10):
         now = datetime.now(timezone.utc)
-        self.app.state.business_operations.record_authoritative_delivery_fact(
+        self.app.state.delivery_fact_ingestion.ingest(self.delivery_source.id,
             AuthoritativeDeliveryFact(
                 id=uuid4(), case_id=self.case.id, order_id=self.order.id,
                 customer_id=self.customer.id, sku="LAP-1", quantity=1,
                 delivered_at=now - timedelta(days=days), reason="wrong_item",
-                condition="unused", source_reference="test-verified-delivery",
-                verification_status=DeliveryVerificationStatus.VERIFIED, verified_at=now,
+                condition="unused", source_id=self.delivery_source.id,
+                source_reference="test-verified-delivery",
+                verified_at=now,
             )
         )
         response = await self.request(

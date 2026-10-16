@@ -12,7 +12,7 @@ from backend.app.agent import AgentConfig, AgentRequest
 from backend.app.bedrock import BedrockProvider
 from backend.app.hitl import HITLWorkflow, HumanDecision
 from backend.app.llm import StructuredLLM, ProviderFailure
-from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
+from backend.app.operations import AuthoritativeDeliveryFact
 from backend.app.proposals import HumanReview, ProposalStatus
 from security_fixtures import ADMIN_ID, call_as_admin
 
@@ -49,12 +49,12 @@ class HITLTests(unittest.TestCase):
 
     def test_nova_pro_refund_decision_pauses_for_human_review_without_execution(self):
         now = datetime.now(timezone.utc)
-        self.app.state.business_operations.record_authoritative_delivery_fact(AuthoritativeDeliveryFact(
+        self.delivery_ingestion.ingest(self.delivery_source.id, AuthoritativeDeliveryFact(
             id=uuid4(), case_id=self.case.id, order_id=self.order.id,
             customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
             delivered_at=now - timedelta(days=10), reason="wrong_item", condition="unused",
-            source_reference="test-verified-delivery", verification_status=DeliveryVerificationStatus.VERIFIED,
-            verified_at=now,
+            source_id=self.delivery_source.id,
+            source_reference="test-verified-delivery", verified_at=now,
         ))
         evidence = self.tools.invoke("assess_refund_eligibility", {
             "case_id": str(self.case.id), "sku": "LAP-1",

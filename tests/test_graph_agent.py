@@ -13,7 +13,7 @@ from backend.app.agent import AgentConfig, ResolutionAgent
 from backend.app.bedrock import BedrockProvider
 from backend.app.graph_agent import GraphResolutionAgent, GraphState
 from backend.app.llm import StructuredLLM
-from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
+from backend.app.operations import AuthoritativeDeliveryFact
 
 
 class GraphAgentTests(baseline.AgentTests):
@@ -121,12 +121,12 @@ class GraphAgentTests(baseline.AgentTests):
 
     def test_proposal_behavioral_parity_ignoring_server_ids_and_timestamps(self):
         now = datetime.now(timezone.utc)
-        self.app.state.business_operations.record_authoritative_delivery_fact(AuthoritativeDeliveryFact(
+        self.delivery_ingestion.ingest(self.delivery_source.id, AuthoritativeDeliveryFact(
             id=uuid4(), case_id=self.case.id, order_id=self.order.id,
             customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
             delivered_at=now - timedelta(days=10), reason="wrong_item", condition="unused",
-            source_reference="test-verified-delivery", verification_status=DeliveryVerificationStatus.VERIFIED,
-            verified_at=now,
+            source_id=self.delivery_source.id,
+            source_reference="test-verified-delivery", verified_at=now,
         ))
 
         def refund_proposal():

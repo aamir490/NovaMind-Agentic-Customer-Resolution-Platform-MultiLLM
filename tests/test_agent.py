@@ -12,6 +12,7 @@ from backend.app.conversations import MEMORY_INSTRUCTIONS
 from backend.app.guardrails import SAFETY_INSTRUCTIONS
 from backend.app.llm import LLMResponse, ProviderFailure, StructuredLLM
 from backend.app.main import create_app
+from backend.app.operations import TrustedDeliverySource
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 from security_fixtures import admin_scope
 
@@ -43,9 +44,11 @@ class ScriptedProvider:
 class AgentTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(admin_scope())
-        self.app = create_app()
+        self.delivery_source = TrustedDeliverySource(id="test-fulfillment")
+        self.app = create_app(trusted_delivery_sources=(self.delivery_source,))
         self.cases = self.app.state.case_service
         self.tools = self.app.state.local_tools
+        self.delivery_ingestion = self.app.state.delivery_fact_ingestion
         self.proposals = self.app.state.proposal_service
         customer = self.cases.create_customer(CustomerCreate(name="Demo"))
         self.order = self.cases.create_order(OrderCreate(customer_id=customer.id, items=[

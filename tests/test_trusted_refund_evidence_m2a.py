@@ -5,15 +5,17 @@ import unittest
 from uuid import uuid4
 
 from backend.app.main import create_app
-from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
+from backend.app.operations import AuthoritativeDeliveryFact, TrustedDeliverySource
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
+from pydantic import ValidationError
 from security_fixtures import admin_scope
 
 
 class TrustedRefundEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(admin_scope())
-        self.app = create_app()
+        self.delivery_source = TrustedDeliverySource(id="test-fulfillment")
+        self.app = create_app(trusted_delivery_sources=(self.delivery_source,))
         self.cases = self.app.state.case_service
         self.operations = self.app.state.business_operations
         self.tools = self.app.state.local_tools
@@ -26,15 +28,17 @@ class TrustedRefundEvidenceTests(unittest.TestCase):
             subject="Wrong item", description="Request a verified refund review.",
         ))
 
-    def fact(self, *, status=DeliveryVerificationStatus.VERIFIED, days=10):
+    def fact(self, *, days=10, **changes):
         now = datetime.now(timezone.utc)
-        return AuthoritativeDeliveryFact(
-            id=uuid4(), case_id=self.case.id, order_id=self.order.id,
-            customer_id=self.customer.id, sku="LAP-1", quantity=1,
-            delivered_at=now - timedelta(days=days), reason="wrong_item", condition="unused",
-            source_reference="test-verified-delivery", verification_status=status,
-            verified_at=now if status == DeliveryVerificationStatus.VERIFIED else None,
-        )
+        values = {
+            "id": uuid4(), "case_id": self.case.id, "order_id": self.order.id,
+            "customer_id": self.customer.id, "sku": "LAP-1", "quantity": 1,
+            "delivered_at": now - timedelta(days=days), "reason": "wrong_item", "condition": "unused",
+            "source_id": self.delivery_source.id, "source_reference": "test-verified-delivery",
+            "verified_at": now,
+        }
+        values.update(changes)
+        return AuthoritativeDeliveryFact(**values)
 
     def assessment(self):
         return self.tools.invoke("assess_refund_eligibility", {
@@ -48,16 +52,15 @@ class TrustedRefundEvidenceTests(unittest.TestCase):
         self.assertIn("delivery facts are missing", result.error.message)
 
     def test_unverified_delivery_facts_fail_closed(self):
-        self.operations.record_authoritative_delivery_fact(
-            self.fact(status=DeliveryVerificationStatus.UNVERIFIED),
-        )
+        with self.assertRaises(ValidationError):
+            self.fact(verified_at=None)
         result = self.assessment()
         self.assertFalse(result.ok)
         self.assertEqual(result.error.code, "CONFLICT")
-        self.assertIn("delivery facts are unverified", result.error.message)
+        self.assertIn("delivery facts are missing", result.error.message)
 
     def test_verified_facts_issue_case_bound_refund_evidence(self):
-        self.operations.record_authoritative_delivery_fact(self.fact())
+        self.app.state.delivery_fact_ingestion.ingest(self.delivery_source.id, self.fact())
         result = self.assessment()
         self.assertTrue(result.ok)
         self.assertTrue(result.data.refund_eligible)
