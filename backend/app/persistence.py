@@ -4,7 +4,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+from datetime import datetime, timezone
 from typing import ContextManager, Iterator, Protocol
+from uuid import UUID
+
+from .domain import Customer, Order, OrderItem, SupportCase
+from .service import ConflictError, NotFoundError
 
 
 class PersistenceError(Exception):
@@ -185,10 +190,14 @@ class SQLiteUnitOfWork:
             if connection is not None:
                 connection.rollback()
             raise
-        except Exception:
+        except sqlite3.Error:
             if connection is not None:
                 connection.rollback()
             raise PersistenceError("PERSISTENCE_UNAVAILABLE") from None
+        except Exception:
+            if connection is not None:
+                connection.rollback()
+            raise
         finally:
             if connection is not None:
                 connection.close()
@@ -257,4 +266,157 @@ class SQLitePersistence(SQLiteUnitOfWork):
                     raise PersistenceError("PERSISTENCE_UNAVAILABLE")
         except PersistenceError:
             raise
+
+
+class SQLiteCaseRepository:
+    """Durable customer, order, and case repository built on the M5B UoW."""
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _customer(row: sqlite3.Row) -> Customer:
+        return Customer.model_validate({"id": row["customer_id"], "name": row["name"]})
+
+    @staticmethod
+    def _case(row: sqlite3.Row) -> SupportCase:
+        return SupportCase.model_validate({
+            "id": row["case_id"], "customer_id": row["customer_id"], "order_id": row["order_id"],
+            "subject": row["subject"], "description": row["description"], "status": row["status"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        })
+
+    @staticmethod
+    def _order(connection: sqlite3.Connection, row: sqlite3.Row) -> Order:
+        items = connection.execute(
+            "SELECT sku, name, quantity FROM order_items WHERE order_id = ? ORDER BY rowid",
+            (row["order_id"],),
+        ).fetchall()
+        return Order.model_validate({
+            "id": row["order_id"], "customer_id": row["customer_id"],
+            "items": [OrderItem.model_validate(dict(item)) for item in items],
+        })
+
+    @staticmethod
+    def _require_customer(connection: sqlite3.Connection, customer_id: UUID) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT customer_id, name FROM customers WHERE customer_id = ?", (str(customer_id),)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("Customer not found")
+        return row
+
+    @classmethod
+    def _require_order(cls, connection: sqlite3.Connection, order_id: UUID) -> Order:
+        row = connection.execute(
+            "SELECT order_id, customer_id FROM orders WHERE order_id = ?", (str(order_id),)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("Order not found")
+        return cls._order(connection, row)
+
+    def seed_customer(self, customer: Customer) -> None:
+        with self._persistence.transaction() as connection:
+            existing = connection.execute(
+                "SELECT customer_id, name FROM customers WHERE customer_id = ?", (str(customer.id),)
+            ).fetchone()
+            if existing is not None:
+                if self._customer(existing) != customer:
+                    raise ValueError(
+                        f"Startup seed conflict: customer {customer.id} already exists with different data"
+                    )
+                return
+            connection.execute("INSERT INTO customers(customer_id, name) VALUES (?, ?)",
+                               (str(customer.id), customer.name))
+
+    def create_customer(self, customer: Customer) -> Customer:
+        with self._persistence.transaction() as connection:
+            existing = connection.execute("SELECT 1 FROM customers WHERE customer_id = ?", (str(customer.id),)).fetchone()
+            if existing is not None:
+                raise ConflictError("Customer already exists")
+            connection.execute("INSERT INTO customers(customer_id, name) VALUES (?, ?)",
+                               (str(customer.id), customer.name))
+        return customer
+
+    def get_customer(self, customer_id: UUID) -> Customer:
+        with self._persistence.transaction() as connection:
+            return self._customer(self._require_customer(connection, customer_id))
+
+    def create_order(self, order: Order) -> Order:
+        skus = [item.sku for item in order.items]
+        if len(skus) != len(set(skus)):
+            raise ConflictError("An order cannot contain duplicate SKUs")
+        with self._persistence.transaction() as connection:
+            self._require_customer(connection, order.customer_id)
+            if connection.execute("SELECT 1 FROM orders WHERE order_id = ?", (str(order.id),)).fetchone() is not None:
+                raise ConflictError("Order already exists")
+            connection.execute(
+                "INSERT INTO orders(order_id, customer_id, created_at) VALUES (?, ?, ?)",
+                (str(order.id), str(order.customer_id), datetime.now(timezone.utc).isoformat()),
+            )
+            connection.executemany(
+                "INSERT INTO order_items(order_id, sku, name, quantity) VALUES (?, ?, ?, ?)",
+                [(str(order.id), item.sku, item.name, item.quantity) for item in order.items],
+            )
+        return order
+
+    def get_order(self, order_id: UUID) -> Order:
+        with self._persistence.transaction() as connection:
+            return self._require_order(connection, order_id)
+
+    def create_case(self, case: SupportCase) -> SupportCase:
+        with self._persistence.transaction() as connection:
+            self._require_customer(connection, case.customer_id)
+            order = self._require_order(connection, case.order_id)
+            if order.customer_id != case.customer_id:
+                raise ConflictError("Order does not belong to the selected customer")
+            if connection.execute("SELECT 1 FROM support_cases WHERE case_id = ?", (str(case.id),)).fetchone() is not None:
+                raise ConflictError("Case already exists")
+            connection.execute(
+                """INSERT INTO support_cases
+                   (case_id, customer_id, order_id, subject, description, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(case.id), str(case.customer_id), str(case.order_id), case.subject, case.description,
+                 case.status.value, case.created_at.isoformat(), case.updated_at.isoformat()),
+            )
+        return case
+
+    def get_case(self, case_id: UUID) -> SupportCase:
+        with self._persistence.transaction() as connection:
+            row = connection.execute("SELECT * FROM support_cases WHERE case_id = ?", (str(case_id),)).fetchone()
+            if row is None:
+                raise NotFoundError("Case not found")
+            return self._case(row)
+
+    def list_orders(self, customer_id: UUID | None = None) -> list[Order]:
+        with self._persistence.transaction() as connection:
+            if customer_id is None:
+                rows = connection.execute("SELECT order_id, customer_id FROM orders ORDER BY created_at, order_id").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT order_id, customer_id FROM orders WHERE customer_id = ? ORDER BY created_at, order_id",
+                    (str(customer_id),),
+                ).fetchall()
+            return [self._order(connection, row) for row in rows]
+
+    def list_cases(self, customer_id: UUID | None = None) -> list[SupportCase]:
+        with self._persistence.transaction() as connection:
+            if customer_id is None:
+                rows = connection.execute("SELECT * FROM support_cases ORDER BY created_at, case_id").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM support_cases WHERE customer_id = ? ORDER BY created_at, case_id",
+                    (str(customer_id),),
+                ).fetchall()
+            return [self._case(row) for row in rows]
+
+    def update_case(self, case: SupportCase) -> SupportCase:
+        with self._persistence.transaction() as connection:
+            updated = connection.execute(
+                "UPDATE support_cases SET status = ?, updated_at = ? WHERE case_id = ?",
+                (case.status.value, case.updated_at.isoformat(), str(case.id)),
+            )
+            if updated.rowcount != 1:
+                raise NotFoundError("Case not found")
+        return case
 
