@@ -466,6 +466,64 @@ MIGRATIONS = (
              SELECT RAISE(ABORT, 'workflow run events are immutable');
            END""",
     )),
+    Migration(5, (
+        """CREATE TABLE langgraph_checkpoints (
+            thread_id TEXT NOT NULL REFERENCES workflow_runs(workflow_id),
+            checkpoint_ns TEXT NOT NULL,
+            checkpoint_id TEXT NOT NULL,
+            parent_checkpoint_id TEXT,
+            checkpoint_type TEXT NOT NULL,
+            checkpoint_blob BLOB NOT NULL,
+            checkpoint_hash TEXT NOT NULL CHECK(length(checkpoint_hash) = 64),
+            metadata_type TEXT NOT NULL,
+            metadata_blob BLOB NOT NULL,
+            metadata_hash TEXT NOT NULL CHECK(length(metadata_hash) = 64),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, checkpoint_ns, checkpoint_id),
+            FOREIGN KEY(thread_id, checkpoint_ns, parent_checkpoint_id)
+                REFERENCES langgraph_checkpoints(thread_id, checkpoint_ns, checkpoint_id)
+        )""",
+        """CREATE INDEX langgraph_checkpoints_latest
+           ON langgraph_checkpoints(thread_id, checkpoint_ns, checkpoint_id DESC)""",
+        """CREATE TABLE langgraph_checkpoint_blobs (
+            thread_id TEXT NOT NULL REFERENCES workflow_runs(workflow_id),
+            checkpoint_ns TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            version_key TEXT NOT NULL,
+            value_type TEXT NOT NULL,
+            value_blob BLOB NOT NULL,
+            value_hash TEXT NOT NULL CHECK(length(value_hash) = 64),
+            PRIMARY KEY(thread_id, checkpoint_ns, channel, version_key)
+        )""",
+        """CREATE TABLE langgraph_checkpoint_writes (
+            thread_id TEXT NOT NULL,
+            checkpoint_ns TEXT NOT NULL,
+            checkpoint_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            write_index INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            value_type TEXT NOT NULL,
+            value_blob BLOB NOT NULL,
+            value_hash TEXT NOT NULL CHECK(length(value_hash) = 64),
+            task_path TEXT NOT NULL,
+            PRIMARY KEY(thread_id, checkpoint_ns, checkpoint_id, task_id, write_index),
+            FOREIGN KEY(thread_id, checkpoint_ns, checkpoint_id)
+                REFERENCES langgraph_checkpoints(thread_id, checkpoint_ns, checkpoint_id)
+                ON DELETE CASCADE
+        )""",
+        """CREATE TRIGGER immutable_langgraph_checkpoints_update
+           BEFORE UPDATE ON langgraph_checkpoints BEGIN
+             SELECT RAISE(ABORT, 'langgraph checkpoints are immutable');
+           END""",
+        """CREATE TRIGGER immutable_langgraph_checkpoint_blobs_update
+           BEFORE UPDATE ON langgraph_checkpoint_blobs BEGIN
+             SELECT RAISE(ABORT, 'langgraph checkpoint blobs are immutable');
+           END""",
+        """CREATE TRIGGER immutable_langgraph_checkpoint_writes_update
+           BEFORE UPDATE ON langgraph_checkpoint_writes BEGIN
+             SELECT RAISE(ABORT, 'langgraph checkpoint writes are immutable');
+           END""",
+    )),
 )
 
 
