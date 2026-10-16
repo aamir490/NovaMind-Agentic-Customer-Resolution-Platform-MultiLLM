@@ -18,9 +18,10 @@ LOGGER.addHandler(logging.NullHandler())
 LOGGER.propagate = False  # The trusted host may attach a local handler explicitly.
 
 OPERATIONS = frozenset({"http", "agent.loop", "agent.graph", "tool", "llm", "hitl.start",
-                        "hitl.resume", "proposal.create", "proposal.review", "eligibility"})
+                        "hitl.resume", "proposal.create", "proposal.review", "eligibility", "refund_eligibility"})
 TOOLS = frozenset({"get_customer", "get_order", "get_case", "get_inventory", "get_policy",
-                   "assess_eligibility", "create_resolution_proposal", "get_proposal_status", "search_knowledge"})
+                   "assess_eligibility", "assess_refund_eligibility", "create_resolution_proposal",
+                   "get_proposal_status", "search_knowledge"})
 ERRORS = frozenset({"UNAUTHENTICATED", "FORBIDDEN", "UNKNOWN_TOOL", "INVALID_INPUT", "NOT_FOUND", "CONFLICT",
     "KNOWLEDGE_UNAVAILABLE", "UNSAFE_CONTENT", "PAYLOAD_LIMIT", "INVALID_OUTPUT", "TIMEOUT", "UNAVAILABLE",
     "REFUSED", "INCOMPLETE", "INVALID_RESPONSE", "INPUT_LIMIT", "TOOL_ERROR", "LLM_ERROR", "STEP_LIMIT",

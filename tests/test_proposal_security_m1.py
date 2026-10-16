@@ -1,12 +1,15 @@
 """Focused M1 regression coverage for proposal authorization and refund evidence."""
 
 import unittest
-from urllib.parse import urlencode
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import httpx
 
 from backend.app.main import create_app
+from backend.app.operations import (
+    AuthoritativeDeliveryFact, DeliveryVerificationStatus,
+)
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 from backend.app.security import (
     AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential, authenticated,
@@ -51,17 +54,18 @@ class ProposalSecurityM1Tests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def evidence(self, who="reviewer", *, days=10):
-        query = urlencode({
-            "customer_id": str(self.customer.id),
-            "case_id": str(self.case.id),
-            "sku": "LAP-1",
-            "quantity": 1,
-            "days_since_delivery": days,
-            "reason": "wrong_item",
-            "condition": "unused",
-        })
+        now = datetime.now(timezone.utc)
+        self.app.state.business_operations.record_authoritative_delivery_fact(
+            AuthoritativeDeliveryFact(
+                id=uuid4(), case_id=self.case.id, order_id=self.order.id,
+                customer_id=self.customer.id, sku="LAP-1", quantity=1,
+                delivered_at=now - timedelta(days=days), reason="wrong_item",
+                condition="unused", source_reference="test-verified-delivery",
+                verification_status=DeliveryVerificationStatus.VERIFIED, verified_at=now,
+            )
+        )
         response = await self.request(
-            "GET", f"/api/orders/{self.order.id}/eligibility?{query}", who,
+            "GET", f"/api/cases/{self.case.id}/refund-eligibility?sku=LAP-1", who,
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()

@@ -42,7 +42,8 @@ class LocalToolTests(unittest.TestCase):
         self.assertEqual({d.name for d in descriptions}, {
             "search_knowledge",
             "get_customer", "get_order", "get_case", "get_inventory", "get_policy",
-            "assess_eligibility", "create_resolution_proposal", "get_proposal_status",
+            "assess_eligibility", "assess_refund_eligibility",
+            "create_resolution_proposal", "get_proposal_status",
         })
         for description in descriptions:
             self.assertFalse(description.input_schema["additionalProperties"])

@@ -42,6 +42,11 @@ class EligibilityAssessment(EligibilityInput):
     case_id: UUID | None = None
 
 
+class RefundEligibilityAssessment(RequestModel):
+    case_id: UUID
+    sku: Name
+
+
 class ProposalLookup(RequestModel):
     proposal_id: UUID
 
@@ -115,7 +120,13 @@ class LocalTools:
                     EligibilityInput.model_validate(p.model_dump(exclude={"order_id", "case_id"})),
                     case_id=p.case_id,
                 ),
-                "Assess caller-supplied scenario facts using existing rules; include case_id to issue case-bound evidence. Not authorization.",
+                "Assess caller-supplied scenario facts using existing rules. This is informational only and cannot issue refund evidence.",
+            ),
+            "assess_refund_eligibility": _Binding(
+                RefundEligibilityAssessment, EligibilityResult,
+                lambda p: operations.assess_refund_eligibility(p.case_id, p.sku),
+                "Assess refund eligibility from a server-side verified delivery record for this case item. "
+                "Fails closed when verified evidence is unavailable.",
             ),
             "create_resolution_proposal": _Binding(
                 ProposalCreate, ResolutionProposal, proposals.create,

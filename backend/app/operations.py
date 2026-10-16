@@ -59,7 +59,7 @@ class EligibilityResult(Record):
     refund_eligible: bool
     denial_reasons: tuple[str, ...]
     refund_requires_return: bool
-    assessment_basis: Literal["local_scenario_unverified_inputs"] = "local_scenario_unverified_inputs"
+    assessment_basis: Literal["local_scenario_unverified_inputs", "trusted_delivery_record"] = "local_scenario_unverified_inputs"
     authorization_granted: Literal[False] = False
 
 
@@ -82,6 +82,28 @@ class EligibilityEvidence(Record):
     sku: Name
     result: EligibilityResult
     created_at: datetime
+
+
+class DeliveryVerificationStatus(StrEnum):
+    VERIFIED = "VERIFIED"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class AuthoritativeDeliveryFact(Record):
+    """A trusted-host delivery/return verification record; never accepted from HTTP or tools."""
+
+    id: UUID
+    case_id: UUID
+    order_id: UUID
+    customer_id: UUID
+    sku: Name
+    quantity: int = Field(strict=True, ge=1, le=1000)
+    delivered_at: datetime
+    reason: ReturnReason
+    condition: ItemCondition
+    source_reference: Name
+    verification_status: DeliveryVerificationStatus
+    verified_at: datetime | None = None
 
 
 def evaluate_rules(policy: ReturnPolicy, request: EligibilityInput,
@@ -125,6 +147,7 @@ class BusinessOperations:
             for product in PRODUCT_SEEDS
         }
         self._eligibility_evidence: dict[UUID, EligibilityEvidence] = {}
+        self._delivery_facts: dict[tuple[UUID, str], AuthoritativeDeliveryFact] = {}
         self._evidence_lock = RLock()
 
     def get_inventory(self, sku: str) -> InventoryItem:
@@ -152,9 +175,8 @@ class BusinessOperations:
         policy = self.get_policy(inventory.policy_id)
         purchased = sum(item.quantity for item in order.items if item.sku == request.sku)
         reasons = evaluate_rules(policy, request, purchased)
-        evidence_id = uuid4() if case_id is not None else None
         result = EligibilityResult(
-            evidence_id=evidence_id, case_id=case_id,
+            case_id=case_id,
             order_id=order.id, customer_id=request.customer_id, sku=request.sku,
             requested_quantity=request.quantity, purchased_quantity=purchased,
             days_since_delivery=request.days_since_delivery,
@@ -163,14 +185,76 @@ class BusinessOperations:
             return_eligible=not reasons, refund_eligible=not reasons,
             denial_reasons=reasons, refund_requires_return=policy.refund_requires_return,
         )
-        if evidence_id is not None:
-            evidence = EligibilityEvidence(
-                id=evidence_id, case_id=case_id, order_id=order.id,
-                customer_id=request.customer_id, sku=request.sku, result=result,
-                created_at=datetime.now(timezone.utc),
-            )
-            with self._evidence_lock:
-                self._eligibility_evidence[evidence.id] = evidence
+        return result
+
+    def record_authoritative_delivery_fact(self, fact: AuthoritativeDeliveryFact) -> None:
+        """Trusted-host integration boundary. Deliberately has no HTTP or tool exposure."""
+        fact = AuthoritativeDeliveryFact.model_validate(fact.model_dump())
+        case = self._cases.get_case(fact.case_id)
+        order = self._cases.get_order(fact.order_id)
+        if (case.order_id != order.id or case.customer_id != fact.customer_id
+                or order.customer_id != fact.customer_id):
+            raise ConflictError("Delivery fact does not match the current case, order, and customer")
+        purchased = sum(item.quantity for item in order.items if item.sku == fact.sku)
+        if purchased == 0 or fact.quantity > purchased:
+            raise ConflictError("Delivery fact does not match an order item")
+        if fact.delivered_at.tzinfo is None or (fact.verified_at is not None and fact.verified_at.tzinfo is None):
+            raise ConflictError("Delivery fact timestamps must include a timezone")
+        if fact.verification_status == DeliveryVerificationStatus.VERIFIED and fact.verified_at is None:
+            raise ConflictError("Verified delivery facts require a verification timestamp")
+        if fact.verified_at is not None and fact.verified_at < fact.delivered_at:
+            raise ConflictError("Delivery fact verification cannot predate delivery")
+        key = (fact.case_id, fact.sku)
+        with self._evidence_lock:
+            if key in self._delivery_facts:
+                raise ConflictError("Authoritative delivery fact already exists for this case item")
+            self._delivery_facts[key] = fact
+
+    @observed("refund_eligibility")
+    def assess_refund_eligibility(self, case_id: UUID, sku: str) -> EligibilityResult:
+        case = self._cases.get_case(case_id)
+        key = (case.id, sku)
+        with self._evidence_lock:
+            fact = self._delivery_facts.get(key)
+        if fact is None:
+            raise ConflictError("Trusted refund evidence unavailable: delivery facts are missing")
+        if fact.verification_status != DeliveryVerificationStatus.VERIFIED or fact.verified_at is None:
+            raise ConflictError("Trusted refund evidence unavailable: delivery facts are unverified")
+        order = self._cases.get_order(case.order_id)
+        if (fact.order_id != order.id or fact.customer_id != case.customer_id
+                or order.customer_id != case.customer_id):
+            raise ConflictError("Trusted refund evidence does not match the current case and order")
+        inventory = self.get_inventory(fact.sku)
+        policy = self.get_policy(inventory.policy_id)
+        now = datetime.now(timezone.utc)
+        delivered_at = fact.delivered_at.astimezone(timezone.utc)
+        if delivered_at > now:
+            raise ConflictError("Trusted refund evidence unavailable: delivery timestamp is in the future")
+        days_since_delivery = (now.date() - delivered_at.date()).days
+        purchased = sum(item.quantity for item in order.items if item.sku == fact.sku)
+        assessment = EligibilityInput(
+            customer_id=case.customer_id, sku=fact.sku, quantity=fact.quantity,
+            days_since_delivery=days_since_delivery, reason=fact.reason, condition=fact.condition,
+        )
+        reasons = evaluate_rules(policy, assessment, purchased)
+        evidence_id = uuid4()
+        result = EligibilityResult(
+            evidence_id=evidence_id, case_id=case.id, order_id=order.id,
+            customer_id=case.customer_id, sku=fact.sku, requested_quantity=fact.quantity,
+            purchased_quantity=purchased, days_since_delivery=days_since_delivery,
+            reason=fact.reason, condition=fact.condition, policy_id=policy.id,
+            policy_version=policy.version, return_eligible=not reasons,
+            refund_eligible=not reasons, denial_reasons=reasons,
+            refund_requires_return=policy.refund_requires_return,
+            assessment_basis="trusted_delivery_record",
+        )
+        evidence = EligibilityEvidence(
+            id=evidence_id, case_id=case.id, order_id=order.id,
+            customer_id=case.customer_id, sku=fact.sku, result=result,
+            created_at=now,
+        )
+        with self._evidence_lock:
+            self._eligibility_evidence[evidence.id] = evidence
         return result
 
     def get_eligibility_evidence(self, evidence_id: UUID) -> EligibilityEvidence:

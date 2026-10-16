@@ -170,5 +170,7 @@ class Authorization:
             if request.case_id is not None:
                 self.case(request.case_id)
             self.customer(request.customer_id)
+        elif name == "assess_refund_eligibility":
+            self.case(request.case_id)
         elif name == "get_proposal_status":
             self.proposal(request.proposal_id)

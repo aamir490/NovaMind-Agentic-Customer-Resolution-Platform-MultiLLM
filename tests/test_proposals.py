@@ -1,6 +1,7 @@
 """Focused Phase 4 tests only; no earlier test classes are imported or run."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
 import socket
 import threading
@@ -14,7 +15,7 @@ from pydantic import ValidationError
 import uvicorn
 
 from backend.app.main import create_app
-from backend.app.operations import EligibilityInput
+from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
 from backend.app.proposals import HumanReview, ProposalCreate, ProposalStatus
 from backend.app.schemas import CustomerCreate, OrderCreate, CaseCreate
 from backend.app.service import ConflictError, NotFoundError
@@ -40,12 +41,16 @@ class ProposalServiceTests(unittest.TestCase):
         self.review = HumanReview(reviewer_name="Local reviewer", note="Reviewed the proposal.")
 
     def refund_request(self):
-        evidence = self.app.state.business_operations.check_eligibility(
-            self.case.order_id,
-            EligibilityInput(customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
-                             days_since_delivery=10, reason="wrong_item", condition="unused"),
-            case_id=self.case.id,
-        )
+        now = datetime.now(timezone.utc)
+        operations = self.app.state.business_operations
+        operations.record_authoritative_delivery_fact(AuthoritativeDeliveryFact(
+            id=uuid4(), case_id=self.case.id, order_id=self.case.order_id,
+            customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
+            delivered_at=now - timedelta(days=10), reason="wrong_item", condition="unused",
+            source_reference="test-verified-delivery", verification_status=DeliveryVerificationStatus.VERIFIED,
+            verified_at=now,
+        ))
+        evidence = operations.assess_refund_eligibility(self.case.id, "LAP-1")
         return ProposalCreate(case_id=self.case.id, action="refund", rationale="Review only.",
                               eligibility_evidence_id=evidence.evidence_id)
 

@@ -56,3 +56,10 @@ def check_eligibility(
         customer_id=customer_id, sku=sku, quantity=quantity,
         days_since_delivery=days_since_delivery, reason=reason, condition=condition,
     ), case_id=case_id)
+
+
+@router.get("/cases/{case_id}/refund-eligibility", response_model=EligibilityResult)
+def assess_refund_eligibility(case_id: UUID, sku: Name, operations: Operations,
+                              service: Service) -> EligibilityResult:
+    Authorization(service).case(case_id)
+    return operations.assess_refund_eligibility(case_id, sku)

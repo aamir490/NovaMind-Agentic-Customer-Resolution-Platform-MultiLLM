@@ -1,7 +1,9 @@
 """Phase 9 graph routing and parity tests; all generation is scripted and local."""
 
+from datetime import datetime, timedelta, timezone
 import os
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from langgraph.errors import GraphRecursionError
 from pydantic import ValidationError
@@ -11,6 +13,7 @@ from backend.app.agent import AgentConfig, ResolutionAgent
 from backend.app.bedrock import BedrockProvider
 from backend.app.graph_agent import GraphResolutionAgent, GraphState
 from backend.app.llm import StructuredLLM
+from backend.app.operations import AuthoritativeDeliveryFact, DeliveryVerificationStatus
 
 
 class GraphAgentTests(baseline.AgentTests):
@@ -117,11 +120,18 @@ class GraphAgentTests(baseline.AgentTests):
                 self.assertEqual(self.provider.requests, original_provider.requests)
 
     def test_proposal_behavioral_parity_ignoring_server_ids_and_timestamps(self):
+        now = datetime.now(timezone.utc)
+        self.app.state.business_operations.record_authoritative_delivery_fact(AuthoritativeDeliveryFact(
+            id=uuid4(), case_id=self.case.id, order_id=self.order.id,
+            customer_id=self.case.customer_id, sku="LAP-1", quantity=1,
+            delivered_at=now - timedelta(days=10), reason="wrong_item", condition="unused",
+            source_reference="test-verified-delivery", verification_status=DeliveryVerificationStatus.VERIFIED,
+            verified_at=now,
+        ))
+
         def refund_proposal():
-            evidence = self.tools.invoke("assess_eligibility", {
-                "case_id": str(self.case.id), "order_id": str(self.order.id),
-                "customer_id": str(self.case.customer_id), "sku": "LAP-1", "quantity": 1,
-                "days_since_delivery": 10, "reason": "wrong_item", "condition": "unused",
+            evidence = self.tools.invoke("assess_refund_eligibility", {
+                "case_id": str(self.case.id), "sku": "LAP-1",
             })
             self.assertTrue(evidence.ok)
             self.assertTrue(evidence.data.refund_eligible)

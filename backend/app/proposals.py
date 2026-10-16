@@ -76,7 +76,8 @@ class ProposalService:
                     or result.case_id != evidence.case_id
                     or result.order_id != evidence.order_id
                     or result.customer_id != evidence.customer_id
-                    or result.sku != evidence.sku):
+                    or result.sku != evidence.sku
+                    or result.assessment_basis != "trusted_delivery_record"):
                 raise ConflictError("Eligibility evidence does not match the selected case")
             if not result.refund_eligible or result.denial_reasons:
                 raise ConflictError("Refund is not eligible under the supplied evidence")
