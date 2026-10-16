@@ -1,20 +1,23 @@
-"""Focused M3A coverage for deterministic LangGraph refund routing."""
+"""Focused M3A/M3B coverage for deterministic LangGraph refund routing."""
 
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import test_agent as baseline
+from pydantic import ValidationError
 
 from backend.app.agent import AgentRequest
 from backend.app.graph_agent import GraphResolutionAgent
 from backend.app.hitl import HITLWorkflow
 from backend.app.llm import ProviderFailure, StructuredLLM
 from backend.app.operations import AuthoritativeDeliveryFact
+from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 
 
 class RefundOrchestrationTests(baseline.AgentTests):
     def refund_request(self):
-        return AgentRequest(case_id=self.case.id, message="Please issue a refund for this order.")
+        return AgentRequest(case_id=self.case.id, message="Please issue a refund for this order.",
+                            resolution_intent="refund", refund_sku="LAP-1")
 
     def ingest_delivery_fact(self, *, delivered_days_ago=10):
         now = datetime.now(timezone.utc)
@@ -25,6 +28,14 @@ class RefundOrchestrationTests(baseline.AgentTests):
             reason="wrong_item", condition="unused", source_id=self.delivery_source.id,
             source_reference=f"m3a-delivery-{delivered_days_ago}", verified_at=now,
         ))
+
+    def test_refund_intent_and_sku_must_be_supplied_together(self):
+        for values in (
+            {"resolution_intent": "refund"},
+            {"refund_sku": "LAP-1"},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValidationError):
+                AgentRequest(case_id=self.case.id, message="Refund request.", **values)
 
     def test_eligible_refund_creates_one_pending_proposal_and_pauses_for_review(self):
         self.ingest_delivery_fact()
@@ -80,6 +91,71 @@ class RefundOrchestrationTests(baseline.AgentTests):
 
         self.assertEqual(result.status, "INFORMATIONAL")
         self.assertIn("trusted delivery evidence is unavailable", result.customer_response)
+        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+        self.assertEqual(provider.requests, [])
+
+    def test_text_mention_is_not_refund_intent_without_validated_selection(self):
+        self.ingest_delivery_fact()
+        provider = baseline.ScriptedProvider([baseline.FINAL])
+        text_only = AgentRequest(case_id=self.case.id, message="Please refund this order.")
+
+        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(text_only)
+
+        self.assertEqual(result.status, "INFORMATIONAL")
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+
+    def test_model_cannot_create_refund_without_explicit_intent(self):
+        self.ingest_delivery_fact()
+        evidence = self.tools.invoke("assess_refund_eligibility", {
+            "case_id": str(self.case.id), "sku": "LAP-1",
+        }).data
+        provider = baseline.ScriptedProvider([baseline.call(
+            "create_resolution_proposal", case_id=str(self.case.id), action="refund",
+            rationale="Attempt to infer a refund.", eligibility_evidence_id=str(evidence.evidence_id),
+        )])
+        text_only = AgentRequest(case_id=self.case.id, message="Please refund this order.")
+
+        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(text_only)
+
+        self.assertEqual(result.error, "REFUND_INTENT_REQUIRED")
+        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+
+    def test_exact_selected_sku_is_used_for_multi_item_order(self):
+        customer = self.cases.create_customer(CustomerCreate(name="Multi-item customer"))
+        order = self.cases.create_order(OrderCreate(customer_id=customer.id, items=[
+            {"sku": "LAP-1", "name": "Laptop", "quantity": 1},
+            {"sku": "ACC-1", "name": "Dock", "quantity": 1},
+        ]))
+        case = self.cases.create_case(CaseCreate(customer_id=customer.id, order_id=order.id,
+                                                  subject="Order issue", description="Select one item."))
+        now = datetime.now(timezone.utc)
+        self.delivery_ingestion.ingest(self.delivery_source.id, AuthoritativeDeliveryFact(
+            id=uuid4(), case_id=case.id, order_id=order.id, customer_id=customer.id,
+            sku="ACC-1", quantity=1, delivered_at=now - timedelta(days=10),
+            reason="wrong_item", condition="unused", source_id=self.delivery_source.id,
+            source_reference="m3b-multi-item-acc-1", verified_at=now,
+        ))
+        request = AgentRequest(case_id=case.id, message="Review the selected item.",
+                               resolution_intent="refund", refund_sku="ACC-1")
+
+        result = GraphResolutionAgent(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                                      self.tools).run(request)
+
+        self.assertEqual(result.status, "HUMAN_REVIEW_REQUIRED")
+        proposal = self.proposals.get(result.pending_proposal_ids[0])
+        evidence = self.app.state.business_operations.get_eligibility_evidence(proposal.eligibility_evidence_id)
+        self.assertEqual(evidence.sku, "ACC-1")
+
+    def test_sku_outside_case_bound_order_creates_no_proposal(self):
+        request = AgentRequest(case_id=self.case.id, message="Refund selected item.",
+                               resolution_intent="refund", refund_sku="ACC-1")
+        provider = baseline.ScriptedProvider([baseline.FINAL])
+
+        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(request)
+
+        self.assertEqual(result.status, "INFORMATIONAL")
+        self.assertIn("selected SKU is not in the case-bound order", result.customer_response)
         self.assertEqual(self.proposals.list_for_case(self.case.id), [])
         self.assertEqual(provider.requests, [])
 

@@ -18,10 +18,10 @@ from backend.app.operations import AuthoritativeDeliveryFact
 
 class GraphAgentTests(baseline.AgentTests):
     # Reuse all 15 Phase 8 scenarios against the graph, not the old loop.
-    def run_script(self, script, max_steps=8):
+    def run_script(self, script, max_steps=8, request=None):
         self.provider = baseline.ScriptedProvider(script)
         self.agent = GraphResolutionAgent(StructuredLLM(self.provider), self.tools, AgentConfig(max_steps=max_steps))
-        self.state = self.agent.run_state(self.request)
+        self.state = self.agent.run_state(request or self.request)
         return self.state.final_result
 
     def test_explicit_routing_and_loop_nodes(self):
@@ -129,28 +129,20 @@ class GraphAgentTests(baseline.AgentTests):
             source_reference="test-verified-delivery", verified_at=now,
         ))
 
-        def refund_proposal():
-            evidence = self.tools.invoke("assess_refund_eligibility", {
-                "case_id": str(self.case.id), "sku": "LAP-1",
-            })
-            self.assertTrue(evidence.ok)
-            self.assertTrue(evidence.data.refund_eligible)
-            self.assertIsNotNone(evidence.data.evidence_id)
-            return baseline.call("create_resolution_proposal", case_id=str(self.case.id), action="refund",
-                                 rationale="For human review", eligibility_evidence_id=str(evidence.data.evidence_id))
+        refund_request = baseline.AgentRequest(
+            case_id=self.case.id, message="Request a refund for the selected item.",
+            resolution_intent="refund", refund_sku="LAP-1",
+        )
+        actual = self.run_script([baseline.FINAL], request=refund_request)
 
-        original = ResolutionAgent(StructuredLLM(baseline.ScriptedProvider([refund_proposal(), baseline.FINAL])), self.tools)
-        expected = original.run(self.request)
-        actual = self.run_script([refund_proposal(), baseline.FINAL])
-        self.assertEqual(actual.status, expected.status)
-        self.assertEqual(actual.steps_used, expected.steps_used)
-        for result in (actual, expected):
-            self.assertEqual(len(result.pending_proposal_ids), 1)
-            proposal = result.history[1].result.data
-            self.assertEqual(proposal.status, "PENDING_REVIEW")
-            self.assertEqual(proposal.case_id, self.case.id)
-            self.assertEqual(proposal.action, "refund")
-            self.assertFalse(result.actions_executed)
+        self.assertEqual(actual.status, "HUMAN_REVIEW_REQUIRED")
+        self.assertEqual(len(actual.pending_proposal_ids), 1)
+        proposal = self.proposals.get(actual.pending_proposal_ids[0])
+        self.assertEqual(proposal.status, "PENDING_REVIEW")
+        self.assertEqual(proposal.case_id, self.case.id)
+        self.assertEqual(proposal.action, "refund")
+        self.assertFalse(actual.actions_executed)
+        self.assertEqual(self.provider.requests, [])
 
     def test_invalid_state_and_public_request_cannot_inject_run_history(self):
         with self.assertRaises(ValidationError):

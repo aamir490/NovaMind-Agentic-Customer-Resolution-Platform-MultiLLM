@@ -4,8 +4,9 @@ import json
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
 
+from .domain import Name
 from .llm import LLMFailure, LLMMessage, LLMRequest, StructuredLLM
 from .tools import LocalTools, ToolFailure, ToolSuccess
 from .conversations import (ConversationService, ConversationError, MEMORY_INSTRUCTIONS,
@@ -25,6 +26,14 @@ class AgentRequest(Contract):
     case_id: UUID
     message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8000)]
     conversation_id: UUID | None = None
+    resolution_intent: Literal["refund"] | None = None
+    refund_sku: Name | None = None
+
+    @model_validator(mode="after")
+    def _validate_refund_selection(self):
+        if (self.resolution_intent == "refund") != (self.refund_sku is not None):
+            raise ValueError("Refund intent requires an exact refund_sku, and refund_sku requires refund intent")
+        return self
 
 
 class AgentConfig(Contract):
@@ -59,9 +68,9 @@ def agent_instructions(descriptions) -> str:
         + MEMORY_INSTRUCTIONS + SAFETY_INSTRUCTIONS +
         "Do not invent assessment inputs; if required facts are missing, finish with available information. "
         "Eligibility is not authorization. You cannot approve, reject, execute actions, or change inventory. "
-        "For a refund, call assess_refund_eligibility with the supplied case_id and the affected SKU. Create a refund proposal only after it "
-        "returns refund_eligible=true with no denial reasons, "
-        "and pass that result's evidence_id as eligibility_evidence_id. Never invent eligibility evidence. "
+        "A refund requires explicit resolution_intent=refund and an exact refund_sku. The graph verifies that SKU against "
+        "the case-bound order and evaluates server-side evidence before any refund proposal. Never infer refund intent, "
+        "choose an item, or invent eligibility evidence. "
         "A proposal is pending human review only. At most one proposal may be created per run, "
         "and only for the supplied case. Finish when the informational review or proposal is ready. "
         "Final customer wording is rendered by the application from tool evidence. Tools: "

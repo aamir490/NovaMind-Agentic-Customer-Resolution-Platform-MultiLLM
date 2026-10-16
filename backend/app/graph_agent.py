@@ -1,7 +1,6 @@
 """Explicit local LangGraph orchestration; Phase 8 remains the reference implementation."""
 
 import json
-import re
 from uuid import UUID
 
 from langgraph.errors import GraphRecursionError
@@ -134,14 +133,8 @@ class GraphResolutionAgent:
         })))
         return self._update(state, "load_case", history=(event,), request=request,
                             memory_started=conversation_id is not None,
-                            refund_requested=self._is_refund_request(request, result.data),
+                            refund_requested=request.resolution_intent == "refund",
                             allowed_names=tuple(item.name for item in descriptions), messages=tuple(messages))
-
-    @staticmethod
-    def _is_refund_request(request: AgentRequest, case) -> bool:
-        """Only explicit customer/case refund language enters the deterministic branch."""
-        text = " ".join((request.message, case.subject, case.description))
-        return re.search(r"\brefund\b", text, flags=re.IGNORECASE) is not None
 
     @staticmethod
     def _after_load_case(state: GraphState) -> str:
@@ -169,39 +162,29 @@ class GraphResolutionAgent:
         if not order_result.ok:
             return self._update(state, "evaluate_refund", history=tuple(history), error=order_result.error.code)
 
-        eligible = []
-        denied_reasons = []
-        unavailable = []
-        for item in order_result.data.items:
-            assessment_call = ToolCall(kind="tool", name="assess_refund_eligibility",
-                                       arguments={"case_id": str(state.request.case_id), "sku": item.sku})
-            try:
-                assessment = self._tools.invoke(assessment_call.name, assessment_call.arguments)
-            except Exception:
-                return self._update(state, "evaluate_refund", history=tuple(history), error="TOOL_ERROR",
-                                    staged_event=AuditEntry(step=state.steps, decision=assessment_call, error="TOOL_ERROR"))
-            history.append(AuditEntry(step=state.steps, decision=assessment_call, result=assessment))
-            if not assessment.ok:
-                unavailable.append(item.sku)
-                continue
-            result = assessment.data
-            if result.refund_eligible and not result.denial_reasons and result.evidence_id is not None:
-                eligible.append(result)
-            else:
-                denied_reasons.extend(result.denial_reasons)
-
-        if len(eligible) != 1:
-            if len(eligible) > 1:
-                outcome = "Refund request remains unresolved: multiple eligible order items require item selection."
-            elif denied_reasons:
-                outcome = "Refund request is denied under verified policy: " + ", ".join(sorted(set(denied_reasons))) + "."
-            elif unavailable:
-                outcome = "Refund request remains unresolved: trusted delivery evidence is unavailable for the order item."
-            else:
-                outcome = "Refund request remains unresolved: verified eligibility could not be established."
-            return self._update(state, "evaluate_refund", history=tuple(history), refund_outcome=outcome)
-
-        evidence = eligible[0]
+        selected = next((item for item in order_result.data.items if item.sku == state.request.refund_sku), None)
+        if selected is None:
+            return self._update(state, "evaluate_refund", history=tuple(history),
+                                refund_outcome="Refund request remains unresolved: selected SKU is not in the case-bound order.")
+        assessment_call = ToolCall(kind="tool", name="assess_refund_eligibility",
+                                   arguments={"case_id": str(state.request.case_id), "sku": selected.sku})
+        try:
+            assessment = self._tools.invoke(assessment_call.name, assessment_call.arguments)
+        except Exception:
+            return self._update(state, "evaluate_refund", history=tuple(history), error="TOOL_ERROR",
+                                staged_event=AuditEntry(step=state.steps, decision=assessment_call, error="TOOL_ERROR"))
+        history.append(AuditEntry(step=state.steps, decision=assessment_call, result=assessment))
+        if not assessment.ok:
+            if assessment.error.code == "CONFLICT":
+                return self._update(state, "evaluate_refund", history=tuple(history),
+                                    refund_outcome=("Refund request remains unresolved: trusted delivery evidence "
+                                                    "is unavailable for the selected item."))
+            return self._update(state, "evaluate_refund", history=tuple(history), error=assessment.error.code)
+        evidence = assessment.data
+        if not evidence.refund_eligible or evidence.denial_reasons or evidence.evidence_id is None:
+            reasons = ", ".join(sorted(set(evidence.denial_reasons))) or "refund_eligibility_not_established"
+            return self._update(state, "evaluate_refund", history=tuple(history),
+                                refund_outcome="Refund request is denied under verified policy: " + reasons + ".")
         proposal_call = ToolCall(kind="tool", name="create_resolution_proposal", arguments={
             "case_id": str(state.request.case_id), "action": "refund",
             "rationale": "Server-side refund eligibility evidence requires human review.",
@@ -253,6 +236,8 @@ class GraphResolutionAgent:
         elif call.name == "create_resolution_proposal":
             if state.created:
                 error = "PROPOSAL_LIMIT"
+            elif call.arguments.get("action") == "refund" and not state.refund_requested:
+                error = "REFUND_INTENT_REQUIRED"
             else:
                 try:
                     same_case = UUID(str(call.arguments.get("case_id"))) == state.request.case_id

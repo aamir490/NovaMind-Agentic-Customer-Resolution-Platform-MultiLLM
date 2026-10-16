@@ -185,9 +185,12 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
         && snapshot.review.proposal_id === item.proposalId, 'decision binding');
       return snapshot;
     },
-    async startRun({ instance_id, request_id, case_id, message }) {
+    async startRun({ instance_id, request_id, case_id, message, resolution_intent, refund_sku }) {
       // Exactly one POST per explicit submission; never retry a potentially committed run.
-      const result = await request('/runs', { method: 'POST', body: { instance_id, request_id, case_id, message } });
+      const body = { instance_id, request_id, case_id, message };
+      if (resolution_intent !== undefined) body.resolution_intent = resolution_intent;
+      if (refund_sku !== undefined) body.refund_sku = refund_sku;
+      const result = await request('/runs', { method: 'POST', body });
       return runSnapshot(result, { instance_id, case_id });
     },
     async runSnapshot(binding, options) {

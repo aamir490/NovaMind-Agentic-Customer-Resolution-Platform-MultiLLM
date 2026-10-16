@@ -56,26 +56,17 @@ class HITLTests(unittest.TestCase):
             source_id=self.delivery_source.id,
             source_reference="test-verified-delivery", verified_at=now,
         ))
-        evidence = self.tools.invoke("assess_refund_eligibility", {
-            "case_id": str(self.case.id), "sku": "LAP-1",
-        })
-        self.assertTrue(evidence.ok)
-        self.assertTrue(evidence.data.refund_eligible)
-        self.assertIsNotNone(evidence.data.evidence_id)
-        proposal = baseline.call("create_resolution_proposal", case_id=str(self.case.id), action="refund",
-                                 rationale="For human review", eligibility_evidence_id=str(evidence.data.evidence_id))
         client = Mock()
-        client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
-            "role": "assistant", "content": [{"toolUse": {
-                "toolUseId": "tooluse_offline", "name": "submit_tool_decision",
-                "input": proposal}}]}}}
         workflow = HITLWorkflow(StructuredLLM(BedrockProvider(
             model_id="us.amazon.nova-pro-v1:0", client=client)), self.tools, self.proposals)
         order_before = self.cases.get_order(self.order.id)
         case_before = self.cases.get_case(self.case.id)
         inventory_before = self.app.state.business_operations.get_inventory("LAP-1")
         with patch.object(self.proposals, "review", wraps=self.proposals.review) as review:
-            result = workflow.start(self.request)
+            result = workflow.start(AgentRequest(
+                case_id=self.case.id, message="Request a refund for the selected item.",
+                resolution_intent="refund", refund_sku="LAP-1",
+            ))
             review.assert_not_called()
         self.assertEqual(result.status, "REVIEW_REQUIRED")
         self.assertEqual(result.review.action, "refund")
@@ -88,6 +79,23 @@ class HITLTests(unittest.TestCase):
         snapshot = workflow._graph.get_state(workflow._runtime_config(result.workflow_id))
         self.assertEqual(snapshot.next, ("human_review",))
         self.assertTrue(snapshot.tasks[0].interrupts)
+        client.converse.assert_not_called()
+
+    def test_nova_pro_non_refund_tool_decision_reaches_human_review(self):
+        proposal = self.proposal()
+        client = Mock()
+        client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
+            "role": "assistant", "content": [{"toolUse": {
+                "toolUseId": "tooluse_offline", "name": "submit_tool_decision",
+                "input": proposal}}]}}}
+        workflow = HITLWorkflow(StructuredLLM(BedrockProvider(
+            model_id="us.amazon.nova-pro-v1:0", client=client)), self.tools, self.proposals)
+
+        result = workflow.start(self.request)
+
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "replacement")
+        self.assertFalse(result.actions_executed)
         client.converse.assert_called_once()
         config = client.converse.call_args.kwargs["toolConfig"]
         self.assertEqual(config["toolChoice"], {"any": {}})

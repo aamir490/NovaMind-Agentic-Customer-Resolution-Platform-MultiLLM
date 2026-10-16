@@ -57,7 +57,7 @@ class RunEvent(Contract):
     timestamp: datetime
     kind: Literal["STATE", "NODE", "TOOL"]
     state: Literal["RUNNING", "RESUMING", "REVIEW_REQUIRED", "REVIEWED", "COMPLETED", "FAILED", "STARTED", "PAUSED"]
-    node: Literal["load_case", "reason", "execute_tool", "record_result", "finalize",
+    node: Literal["load_case", "evaluate_refund", "reason", "execute_tool", "record_result", "finalize",
                   "fail_safely", "prepare_review", "human_review"] | None = None
     tool: str | None = None
     ok: bool | None = None

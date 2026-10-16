@@ -92,6 +92,8 @@ export default function AIWorkspace({ api, identity }) {
   const [cases, setCases]           = useState(null);
   const [caseId, setCaseId]         = useState('');
   const [message, setMessage]       = useState('');
+  const [refundIntent, setRefundIntent] = useState(false);
+  const [refundSku, setRefundSku]   = useState('');
   const [loadingCases, setLoadingCases] = useState(false);
   const [caseError, setCaseError]   = useState('');
   const [attempt, setAttempt]       = useState(null);
@@ -195,9 +197,14 @@ export default function AIWorkspace({ api, identity }) {
   async function startRun(event) {
     event.preventDefault();
     if (!api || !identity || identity.provider === 'unavailable' || submitted.current || caseRequest.current
-        || !cases?.some((record) => record.id === caseId) || !message.trim() || message.length > 8000) return;
+        || !cases?.some((record) => record.id === caseId) || !message.trim() || message.length > 8000
+        || (refundIntent && !refundSku.trim())) return;
     const body = { instance_id: identity.instance_id, request_id: createRequestId(),
       case_id: caseId, message: message.trim() };
+    if (refundIntent) {
+      body.resolution_intent = 'refund';
+      body.refund_sku = refundSku.trim();
+    }
     submitted.current = true;
     setAttempt({ state: 'sending', body });
     try {
@@ -255,6 +262,7 @@ export default function AIWorkspace({ api, identity }) {
           : loadingCases ? 'Wait for cases to finish loading.'
             : !caseId ? 'Select an available case to enable submission.'
               : !message.trim() ? 'Enter a request message to enable submission.'
+                : refundIntent && !refundSku.trim() ? 'Enter the exact SKU for the requested refund.'
                 : 'Ready to submit.';
 
   const statusTone = attempt?.error || tracking?.error
@@ -362,10 +370,33 @@ export default function AIWorkspace({ api, identity }) {
             Describe the support request. Maximum 8,000 characters.
           </p>
 
+          <label>
+            <input
+              type="checkbox"
+              checked={refundIntent}
+              onChange={(event) => setRefundIntent(event.target.checked)}
+            />
+            Request a refund for one item
+          </label>
+          {refundIntent && <label>
+            Exact item SKU
+            <input
+              required
+              maxLength={120}
+              value={refundSku}
+              aria-describedby="run-refund-help"
+              onChange={(event) => setRefundSku(event.target.value)}
+            />
+          </label>}
+          {refundIntent && <p id="run-refund-help" className="case-caption">
+            Enter the exact SKU from the selected case's order. The server verifies the selection and trusted evidence.
+          </p>}
+
           <div className="ai-submit-row">
             <button
               type="submit"
-              disabled={loadingCases || locked || identity.provider === 'unavailable' || !caseId || !message.trim()}
+              disabled={loadingCases || locked || identity.provider === 'unavailable' || !caseId || !message.trim()
+                || (refundIntent && !refundSku.trim())}
               aria-busy={submitting}
               aria-describedby="run-submit-help"
             >
