@@ -235,6 +235,69 @@ class BedrockTests(unittest.TestCase):
         tool_schema = self.client.converse.call_args.kwargs["toolConfig"]["tools"][1]["toolSpec"]["inputSchema"]["json"]
         self.assertEqual(tool_schema["properties"]["decision"]["properties"]["arguments"], {"type": "object"})
 
+    def test_nova_pro_uses_two_forced_tools_for_valid_final_and_tool_decisions(self):
+        values = ((json.loads(FINAL), "submit_final_decision"),
+                  ({"decision": {"kind": "tool", "name": "get_case",
+                                  "arguments": {"case_id": "case-1"}}}, "submit_tool_decision"))
+        for model_id in ("amazon.nova-pro-v1:0", "us.amazon.nova-pro-v1:0"):
+            provider = BedrockProvider(model_id=model_id, client=self.client)
+            for value, name in values:
+                with self.subTest(model_id=model_id, name=name):
+                    self.client.converse.reset_mock()
+                    self.client.converse.return_value = tool_completion(value, name=name)
+                    result = StructuredLLM(provider).generate(self.request, AgentDecision)
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.data.model_dump(mode="json"), value)
+                    self.client.converse.assert_called_once()
+                    body = self.client.converse.call_args.kwargs
+                    self.assertEqual(body["modelId"], model_id)
+                    self.assertEqual(body["toolConfig"]["toolChoice"], {"any": {}})
+                    specs = {item["toolSpec"]["name"]: item["toolSpec"]["inputSchema"]["json"]
+                             for item in body["toolConfig"]["tools"]}
+                    self.assertEqual(set(specs), {"submit_final_decision", "submit_tool_decision"})
+                    self.assertEqual(set(specs[name]), {"type", "properties", "required"})
+                    self.assertEqual(specs[name]["required"], ["decision"])
+                    self.assertNotIn("outputConfig", body)
+
+    def test_nova_pro_rejects_text_malformed_multiple_and_crossed_tool_responses(self):
+        final = json.loads(FINAL)
+        correct = tool_completion(final)["output"]["message"]["content"][0]
+        cases = (completion(FINAL), tool_completion(final, reason="end_turn"),
+                 tool_completion(final, blocks=[]),
+                 tool_completion(final, blocks=[correct, correct]),
+                 tool_completion(final, name="approve"),
+                 tool_completion(final, blocks=[{"toolUse": {
+                     "toolUseId": "offline", "name": "submit_final_decision", "input": FINAL}}]),
+                 tool_completion(final, name="submit_tool_decision"),
+                 tool_completion({"decision": {"kind": "tool", "name": "get_case",
+                     "arguments": {}}}, name="submit_final_decision"))
+        for model_id in ("amazon.nova-pro-v1:0", "us.amazon.nova-pro-v1:0"):
+            provider = BedrockProvider(model_id=model_id, client=self.client)
+            for index, payload in enumerate(cases):
+                with self.subTest(model_id=model_id, case=index):
+                    self.client.converse.return_value = payload
+                    result = StructuredLLM(provider).generate(self.request, AgentDecision)
+                    self.assertEqual(result.code, "INVALID_RESPONSE")
+
+    def test_nova_pro_preserves_extra_fields_and_rejects_stringified_arguments(self):
+        cases = (({"decision": {"kind": "final", "name": "get_case", "arguments": {}}},
+                  "submit_final_decision"),
+                 ({"decision": {"kind": "tool", "name": "get_case", "arguments": {},
+                                "extra": "PRIVATE"}}, "submit_tool_decision"),
+                 ({"decision": {"kind": "tool", "name": "get_case",
+                                "arguments": '{"case_id":"PRIVATE"}'}}, "submit_tool_decision"))
+        for model_id in ("amazon.nova-pro-v1:0", "us.amazon.nova-pro-v1:0"):
+            provider = BedrockProvider(model_id=model_id, client=self.client)
+            for value, name in cases:
+                with self.subTest(model_id=model_id, name=name, value=value):
+                    self.client.converse.return_value = tool_completion(value, name=name)
+                    raw = provider.generate(self.request,
+                                            response_schema=AgentDecision.model_json_schema())
+                    self.assertEqual(json.loads(raw.text), value)
+                    result = StructuredLLM(provider).generate(self.request, AgentDecision)
+                    self.assertEqual(result.code, "INVALID_RESPONSE")
+                    self.assertNotIn("PRIVATE", result.model_dump_json())
+
     def test_nova_lite_other_response_models_keep_wrapped_tool_contract(self):
         from pydantic import BaseModel
 

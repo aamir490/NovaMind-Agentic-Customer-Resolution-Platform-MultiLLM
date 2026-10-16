@@ -14,8 +14,10 @@ _TOOL_FORMAT_TOOL = "submit_tool_decision"
 
 
 def _uses_format_tool(model_id: str) -> bool:
-    # Nova Lite supports forced client-side tool use, but not structured text output.
-    return model_id == "amazon.nova-lite-v1:0" or model_id.endswith(".amazon.nova-lite-v1:0")
+    # Keep structured decisions on the forced-tool path for supported Nova models.
+    return (model_id == "amazon.nova-lite-v1:0"
+            or model_id.endswith(".amazon.nova-lite-v1:0")
+            or model_id in ("amazon.nova-pro-v1:0", "us.amazon.nova-pro-v1:0"))
 
 
 def _decision_tool_schemas(response_schema: dict) -> dict[str, dict] | None:
@@ -27,7 +29,7 @@ def _decision_tool_schemas(response_schema: dict) -> dict[str, dict] | None:
     if (response_schema.get("required") != ["decision"]
             or {part.get("$ref") for part in decision.get("oneOf", [])}
             != {"#/$defs/ToolCall", "#/$defs/Finish"}):
-        raise ValueError("Unsupported AgentDecision schema for Nova Lite")
+        raise ValueError("Unsupported AgentDecision schema for Nova")
     tool = definitions.get("ToolCall", {})
     finish = definitions.get("Finish", {})
     tool_fields = tool.get("properties", {})
@@ -38,7 +40,7 @@ def _decision_tool_schemas(response_schema: dict) -> dict[str, dict] | None:
             or finish_fields.get("kind", {}).get("const") != "final"
             or tool_fields.get("name", {}).get("type") != "string"
             or tool_fields.get("arguments", {}).get("type") != "object"):
-        raise ValueError("Unsupported AgentDecision schema for Nova Lite")
+        raise ValueError("Unsupported AgentDecision schema for Nova")
     # JsonValue is recursive and renders as {} in Pydantic's schema. Keep the
     # provider projection shallow; the original union is validated locally.
     return {

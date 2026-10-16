@@ -4,10 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import unittest
 from uuid import uuid4
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import test_agent as baseline
 from backend.app.agent import AgentConfig, AgentRequest
+from backend.app.bedrock import BedrockProvider
 from backend.app.hitl import HITLWorkflow, HumanDecision
 from backend.app.llm import StructuredLLM, ProviderFailure
 from backend.app.proposals import HumanReview, ProposalStatus
@@ -43,6 +44,37 @@ class HITLTests(unittest.TestCase):
         self.assertEqual(snapshot.next, ("human_review",))
         self.assertTrue(snapshot.tasks[0].interrupts)
         self.assertEqual(self.proposals.get(result.review.proposal_id).status, "PENDING_REVIEW")
+
+    def test_nova_pro_refund_decision_pauses_for_human_review_without_execution(self):
+        client = Mock()
+        client.converse.return_value = {"stopReason": "tool_use", "output": {"message": {
+            "role": "assistant", "content": [{"toolUse": {
+                "toolUseId": "tooluse_offline", "name": "submit_tool_decision",
+                "input": self.proposal()}}]}}}
+        workflow = HITLWorkflow(StructuredLLM(BedrockProvider(
+            model_id="us.amazon.nova-pro-v1:0", client=client)), self.tools, self.proposals)
+        order_before = self.cases.get_order(self.order.id)
+        case_before = self.cases.get_case(self.case.id)
+        inventory_before = self.app.state.business_operations.get_inventory("LAP-1")
+        with patch.object(self.proposals, "review", wraps=self.proposals.review) as review:
+            result = workflow.start(self.request)
+            review.assert_not_called()
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "refund")
+        self.assertEqual(self.proposals.get(result.review.proposal_id).status, "PENDING_REVIEW")
+        self.assertEqual(len(self.proposals.list_for_case(self.case.id)), 1)
+        self.assertFalse(result.actions_executed)
+        self.assertEqual(self.cases.get_order(self.order.id), order_before)
+        self.assertEqual(self.cases.get_case(self.case.id), case_before)
+        self.assertEqual(self.app.state.business_operations.get_inventory("LAP-1"), inventory_before)
+        snapshot = workflow._graph.get_state(workflow._runtime_config(result.workflow_id))
+        self.assertEqual(snapshot.next, ("human_review",))
+        self.assertTrue(snapshot.tasks[0].interrupts)
+        client.converse.assert_called_once()
+        config = client.converse.call_args.kwargs["toolConfig"]
+        self.assertEqual(config["toolChoice"], {"any": {}})
+        self.assertEqual({item["toolSpec"]["name"] for item in config["tools"]},
+                         {"submit_final_decision", "submit_tool_decision"})
 
     def test_approve_resume_reuses_review_service_and_never_calls_llm_again(self):
         self.start()
