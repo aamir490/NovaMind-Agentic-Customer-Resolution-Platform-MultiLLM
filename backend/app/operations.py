@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from enum import StrEnum
 from threading import RLock
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import Field
@@ -110,6 +110,16 @@ class TrustedDeliverySource(Record):
     id: Name
 
 
+class RefundEvidenceRepository(Protocol):
+    """Optional durable boundary for trusted refund inputs and issued evidence."""
+
+    def add_trusted_source(self, source: TrustedDeliverySource) -> None: ...
+    def store_delivery_fact(self, fact: AuthoritativeDeliveryFact) -> AuthoritativeDeliveryFact: ...
+    def get_delivery_fact(self, case_id: UUID, sku: str) -> AuthoritativeDeliveryFact | None: ...
+    def store_eligibility_evidence(self, evidence: EligibilityEvidence) -> EligibilityEvidence: ...
+    def get_eligibility_evidence(self, evidence_id: UUID) -> EligibilityEvidence: ...
+
+
 class DeliveryFactIngestion:
     """Server-only boundary for records delivered by configured trusted sources."""
 
@@ -119,6 +129,7 @@ class DeliveryFactIngestion:
         self._sources = {source.id: source for source in sources}
         if len(self._sources) != len(sources):
             raise ValueError("Trusted delivery source IDs must be unique")
+        operations._add_trusted_delivery_sources(tuple(self._sources.values()))
 
     def ingest(self, source_id: str, fact: AuthoritativeDeliveryFact) -> AuthoritativeDeliveryFact:
         source = self._sources.get(source_id)
@@ -150,8 +161,10 @@ def evaluate_rules(policy: ReturnPolicy, request: EligibilityInput,
 
 
 class BusinessOperations:
-    def __init__(self, cases: CaseService) -> None:
+    def __init__(self, cases: CaseService,
+                 evidence_repository: RefundEvidenceRepository | None = None) -> None:
         self._cases = cases
+        self._evidence_repository = evidence_repository
         self._policies = {
             "standard-return": ReturnPolicy(
                 id="standard-return", version="demo-v1", return_window_days=30,
@@ -175,6 +188,14 @@ class BusinessOperations:
         self._delivery_fact_ids: dict[UUID, AuthoritativeDeliveryFact] = {}
         self._delivery_source_references: dict[tuple[str, str], AuthoritativeDeliveryFact] = {}
         self._evidence_lock = RLock()
+
+    def _add_trusted_delivery_sources(self,
+                                      sources: tuple[TrustedDeliverySource, ...]) -> None:
+        """Persist only sources explicitly trusted by host configuration this process."""
+        if self._evidence_repository is None:
+            return
+        for source in sources:
+            self._evidence_repository.add_trusted_source(source)
 
     def get_inventory(self, sku: str) -> InventoryItem:
         if sku not in self._inventory:
@@ -231,6 +252,8 @@ class BusinessOperations:
         now = datetime.now(timezone.utc)
         if fact.delivered_at > now or fact.verified_at > now:
             raise ConflictError("Delivery fact timestamps cannot be in the future")
+        if self._evidence_repository is not None:
+            return self._evidence_repository.store_delivery_fact(fact)
         key = (fact.case_id, fact.sku)
         provenance_key = (fact.source_id, fact.source_reference)
         with self._evidence_lock:
@@ -258,8 +281,11 @@ class BusinessOperations:
     def assess_refund_eligibility(self, case_id: UUID, sku: str) -> EligibilityResult:
         case = self._cases.get_case(case_id)
         key = (case.id, sku)
-        with self._evidence_lock:
-            fact = self._delivery_facts.get(key)
+        if self._evidence_repository is not None:
+            fact = self._evidence_repository.get_delivery_fact(*key)
+        else:
+            with self._evidence_lock:
+                fact = self._delivery_facts.get(key)
         if fact is None:
             raise ConflictError("Trusted refund evidence unavailable: delivery facts are missing")
         order = self._cases.get_order(case.order_id)
@@ -297,11 +323,16 @@ class BusinessOperations:
             result=result,
             created_at=now,
         )
-        with self._evidence_lock:
-            self._eligibility_evidence[evidence.id] = evidence
+        if self._evidence_repository is not None:
+            self._evidence_repository.store_eligibility_evidence(evidence)
+        else:
+            with self._evidence_lock:
+                self._eligibility_evidence[evidence.id] = evidence
         return result
 
     def get_eligibility_evidence(self, evidence_id: UUID) -> EligibilityEvidence:
+        if self._evidence_repository is not None:
+            return self._evidence_repository.get_eligibility_evidence(evidence_id)
         with self._evidence_lock:
             evidence = self._eligibility_evidence.get(evidence_id)
         if evidence is None:

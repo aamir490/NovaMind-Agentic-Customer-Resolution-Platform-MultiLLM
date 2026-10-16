@@ -5,10 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
+import json
 from typing import ContextManager, Iterator, Protocol
 from uuid import UUID
 
 from .domain import Customer, Order, OrderItem, SupportCase
+from .operations import (
+    AuthoritativeDeliveryFact, EligibilityEvidence, EligibilityResult,
+    TrustedDeliverySource,
+)
 from .service import ConflictError, NotFoundError
 
 
@@ -166,6 +171,81 @@ MIGRATIONS = (
             created_at TEXT NOT NULL,
             PRIMARY KEY(workflow_id, sequence)
         )""",
+    )),
+    Migration(2, (
+        """CREATE TRIGGER immutable_trusted_delivery_sources_update
+           BEFORE UPDATE ON trusted_delivery_sources BEGIN
+             SELECT RAISE(ABORT, 'trusted delivery sources are immutable');
+           END""",
+        """CREATE TRIGGER immutable_trusted_delivery_sources_delete
+           BEFORE DELETE ON trusted_delivery_sources BEGIN
+             SELECT RAISE(ABORT, 'trusted delivery sources are immutable');
+           END""",
+        """CREATE TRIGGER immutable_delivery_facts_update
+           BEFORE UPDATE ON delivery_facts BEGIN
+             SELECT RAISE(ABORT, 'delivery facts are immutable');
+           END""",
+        """CREATE TRIGGER immutable_delivery_facts_delete
+           BEFORE DELETE ON delivery_facts BEGIN
+             SELECT RAISE(ABORT, 'delivery facts are immutable');
+           END""",
+        """CREATE TRIGGER immutable_eligibility_evidence_update
+           BEFORE UPDATE ON eligibility_evidence BEGIN
+             SELECT RAISE(ABORT, 'eligibility evidence is immutable');
+           END""",
+        """CREATE TRIGGER immutable_eligibility_evidence_delete
+           BEFORE DELETE ON eligibility_evidence BEGIN
+             SELECT RAISE(ABORT, 'eligibility evidence is immutable');
+           END""",
+        """CREATE TRIGGER validate_delivery_fact_bindings
+           BEFORE INSERT ON delivery_facts BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM support_cases c
+               JOIN orders o ON o.order_id = c.order_id
+               JOIN order_items i ON i.order_id = o.order_id
+               WHERE c.case_id = NEW.case_id
+                 AND c.order_id = NEW.order_id
+                 AND c.customer_id = NEW.customer_id
+                 AND o.customer_id = NEW.customer_id
+                 AND i.sku = NEW.sku
+                 AND NEW.quantity <= i.quantity
+             ) THEN RAISE(ABORT, 'invalid delivery fact bindings') END;
+           END""",
+        """CREATE TRIGGER validate_eligibility_evidence_bindings
+           BEFORE INSERT ON eligibility_evidence BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM delivery_facts f
+               WHERE f.delivery_fact_id = NEW.delivery_fact_id
+                 AND f.case_id = NEW.case_id
+                 AND f.order_id = NEW.order_id
+                 AND f.customer_id = NEW.customer_id
+                 AND f.sku = NEW.sku
+             ) THEN RAISE(ABORT, 'invalid eligibility evidence bindings') END;
+             SELECT CASE WHEN
+               json_extract(NEW.assessment_json, '$.evidence_id') IS NOT NEW.evidence_id OR
+               json_extract(NEW.assessment_json, '$.case_id') IS NOT NEW.case_id OR
+               json_extract(NEW.assessment_json, '$.order_id') IS NOT NEW.order_id OR
+               json_extract(NEW.assessment_json, '$.customer_id') IS NOT NEW.customer_id OR
+               json_extract(NEW.assessment_json, '$.sku') IS NOT NEW.sku OR
+               json_extract(NEW.assessment_json, '$.policy_id') IS NOT NEW.policy_id OR
+               json_extract(NEW.assessment_json, '$.policy_version') IS NOT NEW.policy_version OR
+               json_extract(NEW.assessment_json, '$.assessment_basis') IS NOT 'trusted_delivery_record' OR
+               json_extract(NEW.assessment_json, '$.authorization_granted') IS NOT 0 OR
+               json_extract(NEW.assessment_json, '$.return_eligible') IS NOT
+                 json_extract(NEW.assessment_json, '$.refund_eligible') OR
+               json_extract(NEW.assessment_json, '$.refund_eligible') IS NOT
+                 (json_array_length(json_extract(NEW.assessment_json, '$.denial_reasons')) = 0) OR
+               NOT EXISTS (
+                 SELECT 1 FROM delivery_facts f
+                 JOIN order_items i ON i.order_id = f.order_id AND i.sku = f.sku
+                 WHERE f.delivery_fact_id = NEW.delivery_fact_id
+                   AND json_extract(NEW.assessment_json, '$.requested_quantity') = f.quantity
+                   AND json_extract(NEW.assessment_json, '$.purchased_quantity') = i.quantity
+                   AND json_extract(NEW.assessment_json, '$.reason') = f.reason
+                   AND json_extract(NEW.assessment_json, '$.condition') = f.item_condition
+               )
+             THEN RAISE(ABORT, 'invalid eligibility assessment snapshot') END;
+           END""",
     )),
 )
 
@@ -419,4 +499,234 @@ class SQLiteCaseRepository:
             if updated.rowcount != 1:
                 raise NotFoundError("Case not found")
         return case
+
+
+class SQLiteRefundEvidenceRepository:
+    """Opt-in durable trusted-delivery and refund-evidence repository."""
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _delivery_fact(row: sqlite3.Row) -> AuthoritativeDeliveryFact:
+        try:
+            return AuthoritativeDeliveryFact.model_validate({
+                "id": row["delivery_fact_id"], "case_id": row["case_id"],
+                "order_id": row["order_id"], "customer_id": row["customer_id"],
+                "sku": row["sku"], "quantity": row["quantity"],
+                "delivered_at": row["delivered_at"], "reason": row["reason"],
+                "condition": row["item_condition"], "source_id": row["source_id"],
+                "source_reference": row["source_reference"], "verified_at": row["verified_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @classmethod
+    def _evidence(cls, row: sqlite3.Row) -> EligibilityEvidence:
+        try:
+            result = EligibilityResult.model_validate(json.loads(row["assessment_json"]))
+            evidence = EligibilityEvidence.model_validate({
+                "id": row["evidence_id"], "case_id": row["case_id"],
+                "order_id": row["order_id"], "customer_id": row["customer_id"],
+                "sku": row["sku"], "delivery_fact_id": row["delivery_fact_id"],
+                "delivery_source_id": row["source_id"],
+                "delivery_source_reference": row["source_reference"],
+                "result": result, "created_at": row["created_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+        try:
+            cls._validate_evidence_shape(evidence)
+        except ConflictError:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+        if evidence.result.policy_id != row["policy_id"] or evidence.result.policy_version != row["policy_version"]:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        return evidence
+
+    @staticmethod
+    def _validate_evidence_shape(evidence: EligibilityEvidence) -> None:
+        result = evidence.result
+        if (
+            result.evidence_id != evidence.id
+            or result.case_id != evidence.case_id
+            or result.order_id != evidence.order_id
+            or result.customer_id != evidence.customer_id
+            or result.sku != evidence.sku
+            or result.assessment_basis != "trusted_delivery_record"
+            or result.return_eligible != result.refund_eligible
+            or result.refund_eligible != (not result.denial_reasons)
+            or evidence.created_at.tzinfo is None
+        ):
+            raise ConflictError("Eligibility evidence is invalid or forged")
+
+    @staticmethod
+    def _require_fact_bindings(connection: sqlite3.Connection,
+                               fact: AuthoritativeDeliveryFact) -> None:
+        row = connection.execute(
+            """SELECT c.customer_id AS case_customer_id, c.order_id AS case_order_id,
+                      o.customer_id AS order_customer_id, i.quantity AS purchased_quantity
+               FROM support_cases c
+               JOIN orders o ON o.order_id = c.order_id
+               JOIN order_items i ON i.order_id = o.order_id AND i.sku = ?
+               WHERE c.case_id = ?""",
+            (fact.sku, str(fact.case_id)),
+        ).fetchone()
+        if (row is None or row["case_order_id"] != str(fact.order_id)
+                or row["case_customer_id"] != str(fact.customer_id)
+                or row["order_customer_id"] != str(fact.customer_id)
+                or fact.quantity > row["purchased_quantity"]):
+            raise ConflictError("Delivery fact does not match the current case, order, customer, and item")
+
+    @classmethod
+    def _require_evidence_bindings(cls, connection: sqlite3.Connection,
+                                   evidence: EligibilityEvidence) -> None:
+        fact_row = connection.execute(
+            "SELECT * FROM delivery_facts WHERE delivery_fact_id = ?",
+            (str(evidence.delivery_fact_id),),
+        ).fetchone()
+        if fact_row is None:
+            raise ConflictError("Eligibility evidence delivery fact is missing")
+        fact = cls._delivery_fact(fact_row)
+        cls._require_fact_bindings(connection, fact)
+        result = evidence.result
+        if (
+            fact.case_id != evidence.case_id or fact.order_id != evidence.order_id
+            or fact.customer_id != evidence.customer_id or fact.sku != evidence.sku
+            or fact.source_id != evidence.delivery_source_id
+            or fact.source_reference != evidence.delivery_source_reference
+            or result.requested_quantity != fact.quantity
+            or result.reason != fact.reason or result.condition != fact.condition
+            or evidence.created_at < fact.verified_at
+        ):
+            raise ConflictError("Eligibility evidence does not match its trusted delivery fact")
+        order_item = connection.execute(
+            "SELECT quantity FROM order_items WHERE order_id = ? AND sku = ?",
+            (str(evidence.order_id), evidence.sku),
+        ).fetchone()
+        if order_item is None or result.purchased_quantity != order_item["quantity"]:
+            raise ConflictError("Eligibility evidence does not match its purchased item")
+        expected_days = (
+            evidence.created_at.astimezone(timezone.utc).date()
+            - fact.delivered_at.astimezone(timezone.utc).date()
+        ).days
+        if result.days_since_delivery != expected_days:
+            raise ConflictError("Eligibility evidence delivery age is invalid")
+
+    def add_trusted_source(self, source: TrustedDeliverySource) -> None:
+        source = TrustedDeliverySource.model_validate(source.model_dump())
+        with self._persistence.transaction() as connection:
+            existing = connection.execute(
+                "SELECT source_id FROM trusted_delivery_sources WHERE source_id = ?", (source.id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO trusted_delivery_sources(source_id) VALUES (?)", (source.id,),
+                )
+
+    def store_delivery_fact(self, fact: AuthoritativeDeliveryFact) -> AuthoritativeDeliveryFact:
+        fact = AuthoritativeDeliveryFact.model_validate(fact.model_dump())
+        with self._persistence.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM trusted_delivery_sources WHERE source_id = ?", (fact.source_id,),
+            ).fetchone() is None:
+                raise ConflictError("Trusted delivery source is not persisted")
+            self._require_fact_bindings(connection, fact)
+
+            candidates = (
+                ("SELECT * FROM delivery_facts WHERE delivery_fact_id = ?", (str(fact.id),),
+                 "Delivery fact ID conflicts with an existing record"),
+                ("SELECT * FROM delivery_facts WHERE source_id = ? AND source_reference = ?",
+                 (fact.source_id, fact.source_reference),
+                 "Delivery fact provenance conflicts with an existing record"),
+                ("SELECT * FROM delivery_facts WHERE case_id = ? AND sku = ?",
+                 (str(fact.case_id), fact.sku),
+                 "Conflicting delivery fact already exists for this case item"),
+            )
+            for query, parameters, conflict_message in candidates:
+                row = connection.execute(query, parameters).fetchone()
+                if row is not None:
+                    existing = self._delivery_fact(row)
+                    if existing == fact:
+                        return existing
+                    raise ConflictError(conflict_message)
+
+            connection.execute(
+                """INSERT INTO delivery_facts
+                   (delivery_fact_id, case_id, order_id, customer_id, sku, quantity,
+                    delivered_at, reason, item_condition, source_id, source_reference, verified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(fact.id), str(fact.case_id), str(fact.order_id), str(fact.customer_id),
+                 fact.sku, fact.quantity, fact.delivered_at.isoformat(), fact.reason.value,
+                 fact.condition.value, fact.source_id, fact.source_reference,
+                 fact.verified_at.isoformat()),
+            )
+        return fact
+
+    def get_delivery_fact(self, case_id: UUID, sku: str) -> AuthoritativeDeliveryFact | None:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_facts WHERE case_id = ? AND sku = ?",
+                (str(case_id), sku),
+            ).fetchone()
+            if row is None:
+                return None
+            fact = self._delivery_fact(row)
+            try:
+                self._require_fact_bindings(connection, fact)
+            except ConflictError:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+            return fact
+
+    def store_eligibility_evidence(self, evidence: EligibilityEvidence) -> EligibilityEvidence:
+        evidence = EligibilityEvidence.model_validate(evidence.model_dump())
+        self._validate_evidence_shape(evidence)
+        with self._persistence.transaction() as connection:
+            result = evidence.result
+            self._require_evidence_bindings(connection, evidence)
+
+            existing_row = connection.execute(
+                """SELECT e.*, f.source_id, f.source_reference
+                   FROM eligibility_evidence e
+                   JOIN delivery_facts f ON f.delivery_fact_id = e.delivery_fact_id
+                   WHERE e.evidence_id = ?""",
+                (str(evidence.id),),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._evidence(existing_row)
+                if existing == evidence:
+                    return existing
+                raise ConflictError("Eligibility evidence ID conflicts with an existing record")
+
+            assessment_json = json.dumps(
+                result.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+            )
+            connection.execute(
+                """INSERT INTO eligibility_evidence
+                   (evidence_id, case_id, order_id, customer_id, sku, delivery_fact_id,
+                    policy_id, policy_version, assessment_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(evidence.id), str(evidence.case_id), str(evidence.order_id),
+                 str(evidence.customer_id), evidence.sku, str(evidence.delivery_fact_id),
+                 result.policy_id, result.policy_version, assessment_json,
+                 evidence.created_at.isoformat()),
+            )
+        return evidence
+
+    def get_eligibility_evidence(self, evidence_id: UUID) -> EligibilityEvidence:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                """SELECT e.*, f.source_id, f.source_reference
+                   FROM eligibility_evidence e
+                   JOIN delivery_facts f ON f.delivery_fact_id = e.delivery_fact_id
+                   WHERE e.evidence_id = ?""",
+                (str(evidence_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Eligibility evidence not found")
+            evidence = self._evidence(row)
+            try:
+                self._require_evidence_bindings(connection, evidence)
+            except ConflictError:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+            return evidence
 
