@@ -151,7 +151,7 @@ MIGRATIONS = (
             owner_user_id TEXT NOT NULL,
             request_id TEXT NOT NULL,
             request_fingerprint TEXT NOT NULL,
-            provider TEXT NOT NULL CHECK(provider IN ('local_scripted', 'groq', 'bedrock')),
+            provider TEXT NOT NULL CHECK(provider IN ('local_scripted', 'bedrock')),
             status TEXT NOT NULL CHECK(status IN ('RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED', 'RECOVERY_REQUIRED')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -522,6 +522,149 @@ MIGRATIONS = (
         """CREATE TRIGGER immutable_langgraph_checkpoint_writes_update
            BEFORE UPDATE ON langgraph_checkpoint_writes BEGIN
              SELECT RAISE(ABORT, 'langgraph checkpoint writes are immutable');
+           END""",
+    )),
+    Migration(6, (
+        "PRAGMA defer_foreign_keys=ON",
+        """CREATE TABLE resolution_proposals_v6 (
+            proposal_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT NOT NULL REFERENCES support_cases(case_id),
+            action TEXT NOT NULL CHECK(action IN
+                ('refund', 'refund_investigation', 'replacement', 'return')),
+            rationale TEXT NOT NULL CHECK(length(trim(rationale)) BETWEEN 1 AND 4000),
+            eligibility_evidence_id TEXT REFERENCES eligibility_evidence(evidence_id),
+            status TEXT NOT NULL CHECK(status IN ('PENDING_REVIEW', 'APPROVED', 'REJECTED')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            reviewed_at TEXT,
+            reviewer_user_id TEXT,
+            review_note TEXT,
+            CHECK((action = 'refund' AND eligibility_evidence_id IS NOT NULL)
+                  OR (action <> 'refund' AND eligibility_evidence_id IS NULL)),
+            CHECK((status = 'PENDING_REVIEW' AND reviewed_at IS NULL
+                   AND reviewer_user_id IS NULL AND review_note IS NULL)
+                  OR (status IN ('APPROVED', 'REJECTED') AND reviewed_at IS NOT NULL
+                      AND reviewer_user_id IS NOT NULL AND review_note IS NOT NULL)),
+            FOREIGN KEY(case_id, eligibility_evidence_id)
+                REFERENCES eligibility_evidence(case_id, evidence_id),
+            UNIQUE(case_id, proposal_id)
+        )""",
+        """INSERT INTO resolution_proposals_v6
+           SELECT * FROM resolution_proposals""",
+        "DROP TRIGGER validate_workflow_review_binding_insert",
+        "DROP TRIGGER validate_workflow_audit_event_insert",
+        "DROP TABLE resolution_proposals",
+        "ALTER TABLE resolution_proposals_v6 RENAME TO resolution_proposals",
+        """CREATE INDEX resolution_proposals_case
+           ON resolution_proposals(case_id, status, created_at, proposal_id)""",
+        """CREATE TRIGGER validate_resolution_proposal_insert
+           BEFORE INSERT ON resolution_proposals BEGIN
+             SELECT CASE WHEN NEW.status IS NOT 'PENDING_REVIEW'
+                 OR NEW.updated_at IS NOT NEW.created_at
+                 OR NEW.reviewed_at IS NOT NULL
+                 OR NEW.reviewer_user_id IS NOT NULL
+                 OR NEW.review_note IS NOT NULL
+               THEN RAISE(ABORT, 'invalid new proposal state') END;
+             SELECT CASE WHEN NEW.action = 'refund' AND NOT EXISTS (
+               SELECT 1 FROM eligibility_evidence e
+               WHERE e.evidence_id = NEW.eligibility_evidence_id
+                 AND e.case_id = NEW.case_id
+                 AND json_extract(e.assessment_json, '$.refund_eligible') = 1
+                 AND json_array_length(json_extract(e.assessment_json, '$.denial_reasons')) = 0
+             ) THEN RAISE(ABORT, 'refund proposal requires eligible evidence') END;
+           END""",
+        """CREATE TRIGGER validate_resolution_proposal_update
+           BEFORE UPDATE ON resolution_proposals BEGIN
+             SELECT CASE WHEN
+               OLD.proposal_id IS NOT NEW.proposal_id OR
+               OLD.case_id IS NOT NEW.case_id OR
+               OLD.action IS NOT NEW.action OR
+               OLD.rationale IS NOT NEW.rationale OR
+               OLD.eligibility_evidence_id IS NOT NEW.eligibility_evidence_id OR
+               OLD.created_at IS NOT NEW.created_at OR
+               OLD.status IS NOT 'PENDING_REVIEW' OR
+               NEW.status NOT IN ('APPROVED', 'REJECTED') OR
+               NEW.updated_at <= OLD.updated_at OR
+               NEW.reviewed_at IS NOT NEW.updated_at OR
+               NEW.reviewer_user_id IS NULL OR
+               length(trim(NEW.reviewer_user_id)) NOT BETWEEN 1 AND 120 OR
+               NEW.review_note IS NULL OR
+               length(trim(NEW.review_note)) NOT BETWEEN 1 AND 4000
+             THEN RAISE(ABORT, 'invalid proposal review transition') END;
+           END""",
+        """CREATE TRIGGER immutable_resolution_proposals_delete
+           BEFORE DELETE ON resolution_proposals BEGIN
+             SELECT RAISE(ABORT, 'resolution proposals are immutable');
+           END""",
+        """CREATE TRIGGER validate_workflow_review_binding_insert
+           BEFORE INSERT ON workflow_review_bindings BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM resolution_proposals p
+               JOIN workflow_runs w ON w.workflow_id = NEW.workflow_id
+               WHERE p.proposal_id = NEW.proposal_id
+                 AND p.case_id = NEW.case_id
+                 AND p.status = 'PENDING_REVIEW'
+                 AND w.case_id = NEW.case_id
+                 AND w.status = 'REVIEW_REQUIRED'
+             ) THEN RAISE(ABORT, 'invalid workflow review binding') END;
+           END""",
+        """CREATE TRIGGER validate_workflow_audit_event_insert
+           BEFORE INSERT ON workflow_audit_events BEGIN
+             SELECT CASE WHEN
+               json_extract(NEW.event_json, '$.kind') IS NOT NEW.kind OR
+               json_extract(NEW.event_json, '$.workflow_id') IS NOT NEW.workflow_id OR
+               json_extract(NEW.event_json, '$.proposal_id') IS NOT NEW.proposal_id OR
+               json_extract(NEW.event_json, '$.proposal_status') IS NOT NEW.proposal_status OR
+               json_extract(NEW.event_json, '$.reviewer_user_id') IS NOT NEW.reviewer_user_id OR
+               json_extract(NEW.event_json, '$.review_note') IS NOT (
+                 SELECT review_note FROM resolution_proposals
+                 WHERE proposal_id = NEW.proposal_id
+               ) OR
+               json_extract(NEW.event_json, '$.case_id') IS NOT (
+                 SELECT case_id FROM resolution_proposals
+                 WHERE proposal_id = NEW.proposal_id
+               ) OR
+               NOT EXISTS (
+                 SELECT 1 FROM workflow_runs w
+                 JOIN resolution_proposals p ON p.proposal_id = NEW.proposal_id
+                 WHERE w.workflow_id = NEW.workflow_id
+                   AND w.case_id = p.case_id
+               )
+             THEN RAISE(ABORT, 'invalid workflow audit payload') END;
+             SELECT CASE WHEN NEW.kind = 'REVIEW_REQUIRED' AND (
+               NEW.proposal_id IS NULL OR
+               NEW.reviewer_user_id IS NOT NULL OR
+               NEW.proposal_status IS NOT 'PENDING_REVIEW' OR
+               NOT EXISTS (
+                 SELECT 1 FROM workflow_review_bindings b
+                 WHERE b.workflow_id = NEW.workflow_id
+                   AND b.proposal_id = NEW.proposal_id
+                   AND b.review_id = json_extract(NEW.event_json, '$.review_id')
+               )
+             ) THEN RAISE(ABORT, 'invalid review-required audit event') END;
+             SELECT CASE WHEN NEW.kind = 'HUMAN_REVIEW' AND (
+               NEW.proposal_id IS NULL OR
+               NEW.reviewer_user_id IS NULL OR
+               NEW.proposal_status NOT IN ('APPROVED', 'REJECTED') OR
+               NOT EXISTS (
+                 SELECT 1 FROM resolution_proposals p
+                 WHERE p.proposal_id = NEW.proposal_id
+                   AND p.status = NEW.proposal_status
+                   AND p.reviewer_user_id = NEW.reviewer_user_id
+               ) OR NOT (
+                 (EXISTS (
+                   SELECT 1 FROM workflow_review_bindings b
+                   WHERE b.workflow_id = NEW.workflow_id
+                     AND b.proposal_id = NEW.proposal_id
+                     AND b.review_id = json_extract(NEW.event_json, '$.review_id')
+                 )) OR (
+                   NOT EXISTS (
+                     SELECT 1 FROM workflow_review_bindings b
+                     WHERE b.proposal_id = NEW.proposal_id
+                   ) AND json_extract(NEW.event_json, '$.review_id') IS NULL
+                 )
+               )
+             ) THEN RAISE(ABORT, 'invalid human-review audit event') END;
            END""",
     )),
 )

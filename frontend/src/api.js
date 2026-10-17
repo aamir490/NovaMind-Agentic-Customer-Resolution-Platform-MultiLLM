@@ -11,7 +11,7 @@ const isOptionalText = (value) => value === null || typeof value === 'string';
 const isTimestamp = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const runStatuses = ['RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED'];
 const eventStates = [...runStatuses, 'STARTED', 'PAUSED'];
-const eventNodes = ['load_case', 'reason', 'execute_tool', 'record_result', 'finalize',
+const eventNodes = ['load_case', 'evaluate_refund', 'reason', 'execute_tool', 'record_result', 'finalize',
   'fail_safely', 'prepare_review', 'human_review'];
 const productCategories = ['laptops', 'displays', 'docks_hubs', 'input_devices',
   'audio', 'storage', 'bags_protection', 'warranties_services'];
@@ -80,7 +80,7 @@ function knowledgeEvidence(event) {
 function runSnapshot(result, { instance_id, case_id, run_id }) {
   requireResponse(result?.instance_id === instance_id && result.case_id === case_id && isUuid(result.run_id)
     && (run_id === undefined || result.run_id === run_id) && runStatuses.includes(result.status)
-    && ['local_scripted', 'groq', 'bedrock'].includes(result.provider) && result.actions_executed === false
+    && ['local_scripted', 'bedrock'].includes(result.provider) && result.actions_executed === false
     && isOptionalUuid(result.workflow_id) && isOptionalUuid(result.conversation_id) && isOptionalUuid(result.trace_id)
     && isTimestamp(result.created_at) && isTimestamp(result.updated_at)
     && isCount(result.last_sequence) && isOptionalText(result.message) && isOptionalText(result.error), 'run snapshot');
@@ -88,7 +88,7 @@ function runSnapshot(result, { instance_id, case_id, run_id }) {
   const review = result.review;
   requireResponse(review === null || (review && isUuid(review.workflow_id) && review.workflow_id === result.workflow_id
     && review.case_id === case_id && isUuid(review.proposal_id) && isUuid(review.review_id)
-    && ['return', 'refund', 'replacement'].includes(review.action) && review.status === 'PENDING_REVIEW'
+    && ['return', 'refund', 'refund_investigation', 'replacement'].includes(review.action) && review.status === 'PENDING_REVIEW'
     && isText(review.rationale) && review.rationale.length <= 4000), 'run review');
   // Explicit display projection; no raw workflow state or unrestricted response dump.
   return { instance_id: result.instance_id, run_id: result.run_id, case_id: result.case_id,
@@ -141,7 +141,7 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
           || (identity.role === 'CUSTOMER'
             ? !isUuid(identity.customer_id)
             : identity.customer_id !== null)
-          || !isUuid(payload.instance_id) || !['unavailable', 'local_scripted', 'groq', 'bedrock'].includes(payload.provider)
+          || !isUuid(payload.instance_id) || !['unavailable', 'local_scripted', 'bedrock'].includes(payload.provider)
           || typeof payload.memory_available !== 'boolean') {
         throw new Error('Unexpected identity response.');
       }
@@ -162,7 +162,7 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
           && item.status === 'REVIEW_REQUIRED' && item.actions_executed === false && isTimestamp(item.updated_at)
           && review && review.case_id === item.case_id && review.workflow_id === item.workflow_id
           && isUuid(review.proposal_id) && isUuid(review.review_id) && review.status === 'PENDING_REVIEW'
-          && ['return', 'refund', 'replacement'].includes(review.action)
+          && ['return', 'refund', 'refund_investigation', 'replacement'].includes(review.action)
           && isText(review.rationale) && Array.from(review.rationale).length <= 4000, 'pending review');
         runIds.add(item.run_id);
         return { runId: item.run_id, caseId: item.case_id, caseSubject: item.case_subject,

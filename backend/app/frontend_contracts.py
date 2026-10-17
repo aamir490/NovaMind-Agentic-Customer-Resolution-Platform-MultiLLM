@@ -19,7 +19,7 @@ class IdentityResponse(Contract):
     can_review: bool
     can_view_diagnostics: bool
     instance_id: UUID
-    provider: Literal["unavailable", "local_scripted", "groq", "bedrock"]
+    provider: Literal["unavailable", "local_scripted", "bedrock"]
     memory_available: bool
 
 
@@ -38,7 +38,7 @@ class RunSnapshot(Contract):
     case_id: UUID
     workflow_id: UUID | None = None
     conversation_id: UUID | None = None
-    provider: Literal["local_scripted", "groq", "bedrock"] = "local_scripted"
+    provider: Literal["local_scripted", "bedrock"] = "local_scripted"
     status: Literal["RUNNING", "RESUMING", "REVIEW_REQUIRED", "REVIEWED", "COMPLETED", "FAILED"]
     created_at: datetime
     updated_at: datetime

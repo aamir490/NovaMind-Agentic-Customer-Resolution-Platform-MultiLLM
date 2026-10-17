@@ -3,7 +3,8 @@ import { auditTools, auditErrors } from './auditContracts.js';
 export const operationLabels = Object.freeze({ http: 'HTTP requests', 'agent.loop': 'Agent loop',
   'agent.graph': 'Agent graph', tool: 'Tools', llm: 'Model requests', 'hitl.start': 'Workflow starts',
   'hitl.resume': 'Workflow resumes', 'proposal.create': 'Proposal creation',
-  'proposal.review': 'Human reviews', eligibility: 'Eligibility assessments' });
+  'proposal.review': 'Human reviews', eligibility: 'Eligibility assessments',
+  refund_eligibility: 'Refund eligibility assessments' });
 const operation = (value) => typeof value === 'string' && Object.hasOwn(operationLabels, value);
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const duration = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;

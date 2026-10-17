@@ -53,7 +53,7 @@ class FrontendRuntime:
                  max_runs=128, max_active=2, event_capacity=128):
         if not (1 <= max_runs <= 1024 and 1 <= max_active <= 8 and 1 <= event_capacity <= 1024):
             raise ValueError("Invalid local runtime bounds")
-        if provider_label not in ("local_scripted", "groq", "bedrock"):
+        if provider_label not in ("local_scripted", "bedrock"):
             raise ValueError("Invalid provider label")
         self.instance_id = uuid4()
         self.provider_factory = local_provider_factory
@@ -202,6 +202,8 @@ class FrontendRuntime:
             run = self._authorized(run_id)
             if after > run.snapshot.last_sequence:
                 raise FrontendError(409, "EVENT_CURSOR_AHEAD")
+            if not run.events:
+                raise FrontendError(409, "NO_EVENTS_YET")
             first = run.events[0].sequence
             events = tuple(event for event in run.events if event.sequence > after)[:limit]
             cursor = events[-1].sequence if events else after

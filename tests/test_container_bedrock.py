@@ -1,5 +1,6 @@
 """Bedrock container selection and contracts with a fully mocked SDK client."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -14,13 +15,18 @@ import httpx
 import yaml
 
 from backend.app.bedrock import BedrockProvider
+from backend.app.proposals import ProposalStatus
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
+from backend.app.service import ConflictError
 from backend.container.bootstrap import _llm_provider, create_container_app
 
 
 CONFIG = {"NOVAMIND_LLM_PROVIDER": "bedrock", "AWS_REGION": "us-east-1",
           "BEDROCK_MODEL_ID": "us.anthropic.claude-3-5-sonnet-20240620-v1:0"}
 TOKEN = "container-bedrock-admin-test-token"
+CUSTOMER_TOKEN = "container-bedrock-demo-customer-token"
+REVIEWER_TOKEN = "container-bedrock-demo-reviewer-token"
+CUSTOMER_ID = UUID(int=31)
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -132,6 +138,91 @@ class ContainerBedrockTests(unittest.IsolatedAsyncioTestCase):
             "AWS_REGION": "${AWS_REGION:?Set AWS_REGION in the invoking process}",
             "BEDROCK_MODEL_ID": "${BEDROCK_MODEL_ID:?Set BEDROCK_MODEL_ID in the invoking process}"})
         self.assertNotIn("AWS_ACCESS_KEY_ID", (ROOT / "compose.bedrock.yaml").read_text())
+        demo_path = ROOT / "compose.bedrock.demo.yaml"
+        demo = yaml.safe_load(demo_path.read_text())
+        self.assertEqual(demo, {"services": {"backend": {"environment": {
+            "NOVAMIND_BEDROCK_DEMO_DATA": "true",
+        }}}})
+        demo_text = demo_path.read_text()
+        for forbidden in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "secrets:", "volumes:"):
+            self.assertNotIn(forbidden, demo_text)
+
+    async def test_opt_in_bedrock_demo_lap10_reaches_review_without_model_call(self):
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        auth = directory / "auth.json"
+        auth.write_text(json.dumps([
+            {"token": CUSTOMER_TOKEN, "identity": {
+                "user_id": str(UUID(int=32)), "role": "CUSTOMER",
+                "customer_id": str(CUSTOMER_ID)}},
+            {"token": REVIEWER_TOKEN, "identity": {
+                "user_id": str(UUID(int=33)), "role": "REVIEWER"}},
+        ]), encoding="utf-8")
+        os.environ.update({**CONFIG, "NOVAMIND_AUTH_FILE": str(auth),
+                           "NOVAMIND_BEDROCK_DEMO_DATA": "true"})
+        app = create_container_app()
+        service = app.state.case_service
+        cases = service.list_cases(CUSTOMER_ID)
+        self.assertEqual(len(cases), 1)
+        case = cases[0]
+        self.assertEqual(case.subject,
+                         "[SYNTHETIC BEDROCK DEMO] Eligible LAP-10 refund review")
+        order = service.get_order(case.order_id)
+        self.assertEqual([(item.sku, item.quantity) for item in order.items], [("LAP-10", 1)])
+        inventory = app.state.business_operations.get_inventory("LAP-10")
+        with self.assertRaises(ConflictError):
+            app.state.business_operations.assess_refund_eligibility(case.id, "LAP-1")
+        other_order = service.create_order(OrderCreate(
+            customer_id=CUSTOMER_ID,
+            items=[{"sku": "LAP-10", "name": "NovaBook Laptop 10", "quantity": 1}],
+        ))
+        other_case = service.create_case(CaseCreate(
+            customer_id=CUSTOMER_ID, order_id=other_order.id,
+            subject="Synthetic mismatch", description="No trusted delivery fact.",
+        ))
+        with self.assertRaises(ConflictError):
+            app.state.business_operations.assess_refund_eligibility(other_case.id, "LAP-10")
+
+        identity = await self.request(app, "GET", "/api/identity", token=REVIEWER_TOKEN)
+        started = await self.request(app, "POST", "/api/runs", {
+            "instance_id": identity.json()["instance_id"], "request_id": str(uuid4()),
+            "case_id": str(case.id), "message": "Synthetic LAP-10 refund review.",
+            "resolution_intent": "refund", "refund_sku": "LAP-10",
+        }, token=REVIEWER_TOKEN)
+        self.assertEqual(started.status_code, 202, started.text)
+        run_id = started.json()["run_id"]
+        for _ in range(200):
+            snapshot = await self.request(app, "GET", f"/api/runs/{run_id}",
+                                          token=REVIEWER_TOKEN)
+            if snapshot.json()["status"] != "RUNNING":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(snapshot.json()["status"], "REVIEW_REQUIRED", snapshot.text)
+        self.assertFalse(snapshot.json()["actions_executed"])
+        proposal = app.state.proposal_service.get(UUID(snapshot.json()["review"]["proposal_id"]))
+        self.assertEqual(proposal.status, ProposalStatus.PENDING_REVIEW)
+        evidence = app.state.business_operations.get_eligibility_evidence(
+            proposal.eligibility_evidence_id)
+        self.assertEqual((evidence.case_id, evidence.order_id, evidence.customer_id, evidence.sku),
+                         (case.id, order.id, CUSTOMER_ID, "LAP-10"))
+        self.assertEqual(evidence.delivery_source_id, "bedrock-demo-fulfillment")
+        self.assertEqual(service.get_order(order.id), order)
+        self.assertEqual(service.get_case(case.id), case)
+        self.assertEqual(app.state.business_operations.get_inventory("LAP-10"), inventory)
+        self.client.converse.assert_not_called()
+        app.state.frontend_runtime.close()
+        app.state.frontend_runtime.provider_factory().close()
+
+    def test_bedrock_demo_flag_is_exact_and_provider_bound(self):
+        for environment in (
+            {**CONFIG, "NOVAMIND_BEDROCK_DEMO_DATA": "TRUE"},
+            {"NOVAMIND_LLM_PROVIDER": "local_scripted", "NOVAMIND_OFFLINE_TESTING": "true",
+             "NOVAMIND_BEDROCK_DEMO_DATA": "true"},
+        ):
+            with self.subTest(environment=tuple(environment)):
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                            RuntimeError, "^Container Bedrock demo configuration is invalid$"):
+                        create_container_app()
 
     async def test_identity_runs_and_diagnostics_report_bedrock(self):
         os.environ.update(CONFIG)

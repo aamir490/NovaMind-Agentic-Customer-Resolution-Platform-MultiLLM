@@ -175,21 +175,28 @@ class GraphResolutionAgent:
                                 staged_event=AuditEntry(step=state.steps, decision=assessment_call, error="TOOL_ERROR"))
         history.append(AuditEntry(step=state.steps, decision=assessment_call, result=assessment))
         if not assessment.ok:
-            if assessment.error.code == "CONFLICT":
-                return self._update(state, "evaluate_refund", history=tuple(history),
-                                    refund_outcome=("Refund request remains unresolved: trusted delivery evidence "
-                                                    "is unavailable for the selected item."))
+            if assessment.error.code in ("CONFLICT", "NOT_FOUND"):
+                return self._create_refund_review(state, history, action="refund_investigation",
+                    rationale=("Human investigation required: trusted delivery evidence or policy confirmation "
+                               "is unavailable for the selected case-bound purchased item. "
+                               "This is not refund approval."))
             return self._update(state, "evaluate_refund", history=tuple(history), error=assessment.error.code)
         evidence = assessment.data
         if not evidence.refund_eligible or evidence.denial_reasons or evidence.evidence_id is None:
             reasons = ", ".join(sorted(set(evidence.denial_reasons))) or "refund_eligibility_not_established"
-            return self._update(state, "evaluate_refund", history=tuple(history),
-                                refund_outcome="Refund request is denied under verified policy: " + reasons + ".")
-        proposal_call = ToolCall(kind="tool", name="create_resolution_proposal", arguments={
-            "case_id": str(state.request.case_id), "action": "refund",
-            "rationale": "Server-side refund eligibility evidence requires human review.",
-            "eligibility_evidence_id": str(evidence.evidence_id),
-        })
+            return self._create_refund_review(state, history, action="refund_investigation",
+                rationale=("Human investigation required: trusted evidence does not confirm refund eligibility "
+                           f"({reasons}). This is not refund approval."))
+        return self._create_refund_review(state, history, action="refund",
+            rationale="Server-side refund eligibility evidence requires human review.",
+            evidence_id=evidence.evidence_id)
+
+    def _create_refund_review(self, state: GraphState, history: list[AuditEntry], *,
+                              action: str, rationale: str, evidence_id: UUID | None = None) -> dict:
+        arguments = {"case_id": str(state.request.case_id), "action": action, "rationale": rationale}
+        if evidence_id is not None:
+            arguments["eligibility_evidence_id"] = str(evidence_id)
+        proposal_call = ToolCall(kind="tool", name="create_resolution_proposal", arguments=arguments)
         try:
             proposal_result = self._tools.invoke(proposal_call.name, proposal_call.arguments)
         except Exception:
@@ -236,7 +243,7 @@ class GraphResolutionAgent:
         elif call.name == "create_resolution_proposal":
             if state.created:
                 error = "PROPOSAL_LIMIT"
-            elif call.arguments.get("action") == "refund" and not state.refund_requested:
+            elif call.arguments.get("action") in ("refund", "refund_investigation") and not state.refund_requested:
                 error = "REFUND_INTENT_REQUIRED"
             else:
                 try:

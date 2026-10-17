@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import KnowledgeEvidence from './KnowledgeEvidence.jsx';
+import { reviewRequestStatusForDisplay } from './reviewPresentation.js';
 
 function createRequestId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -240,6 +241,7 @@ export default function AIWorkspace({ api, identity }) {
   const toolEvents      = tracking?.events.filter((event) => event.kind === 'TOOL') ?? [];
   const allEvents       = tracking?.events ?? [];
   const review          = snapshot?.review;
+  const reviewRequestStatus = reviewRequestStatusForDisplay(review, snapshot?.reviewed_status ?? null);
   const proposalRefs    = [...new Set(toolEvents.map((e) => e.proposal_id).filter(Boolean))]
     .filter((id) => id !== review?.proposal_id);
   const stages          = pipelineStages(attempt, tracking);
@@ -612,7 +614,9 @@ export default function AIWorkspace({ api, identity }) {
                   <dl className="case-facts">
                     {review && (
                       <>
-                        <div><dt>Review request status</dt><dd>{review.status}</dd></div>
+                        {reviewRequestStatus && (
+                          <div><dt>Review request status</dt><dd>{reviewRequestStatus}</dd></div>
+                        )}
                         <div><dt>Review ID</dt><dd className="case-mono">{review.review_id}</dd></div>
                       </>
                     )}

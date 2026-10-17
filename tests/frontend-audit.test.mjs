@@ -43,10 +43,10 @@ test('case and run lists reject mismatches, duplicate IDs and invalid offsets', 
     await assert.rejects(client(payload).auditCases(), { code: 'INVALID_AUDIT_RESPONSE' });
   }
   const valid = { scope: 'case_runs_in_this_process', items: [run()], next_offset: null };
-  assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'groq' }] }).auditRuns(binding)).items.length, 1);
+  assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'local_scripted' }] }).auditRuns(binding)).items.length, 1);
   assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'bedrock' }] }).auditRuns(binding)).items.length, 1);
   for (const change of [{ instance_id: id(9) }, { case_id: id(9) }, { run_id: 'bad' },
-    { workflow_id: 'PRIVATE' }, { status: 'PRIVATE' }, { provider: 'gemini' },
+    { workflow_id: 'PRIVATE' }, { status: 'PRIVATE' }, { provider: 'groq' }, { provider: 'gemini' },
     { actions_executed: true }, { updated_at: 'PRIVATE' }]) {
     await assert.rejects(client({ ...valid, items: [{ ...run(), ...change }] }).auditRuns(binding), { code: 'INVALID_AUDIT_RESPONSE' });
   }

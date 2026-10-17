@@ -10,7 +10,7 @@ from .domain import Record
 
 
 Fingerprint = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-Provider = Literal["local_scripted", "groq", "bedrock"]
+Provider = Literal["local_scripted", "bedrock"]
 
 
 class WorkflowMetadataStatus(StrEnum):

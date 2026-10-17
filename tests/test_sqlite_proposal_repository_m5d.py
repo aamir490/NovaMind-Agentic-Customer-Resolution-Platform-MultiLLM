@@ -85,6 +85,22 @@ class SQLiteProposalRepositoryTests(unittest.TestCase):
         self.assertEqual(events[-1]["reviewer_user_id"], self.review.reviewer_name)
         self.assertEqual(events[-1]["proposal_status"], "APPROVED")
 
+    def test_refund_investigation_without_evidence_is_durable_and_distinct(self):
+        proposal = self.service.create(ProposalCreate(
+            case_id=self.case.id, action="refund_investigation",
+            rationale="Trusted evidence is missing; investigate without approving a refund.",
+        ))
+
+        _, recreated, _ = self.stack()
+        self.assertEqual(recreated.get(proposal.id), proposal)
+        self.assertEqual(proposal.action, "refund_investigation")
+        self.assertIsNone(proposal.eligibility_evidence_id)
+        with self.assertRaises(ConflictError):
+            recreated.create(ProposalCreate(
+                case_id=self.case.id, action="refund",
+                rationale="Evidence-free refund approval must remain impossible.",
+            ))
+
     def test_approval_and_rejection_are_terminal_and_preserve_proposal_fields(self):
         for decision in (ProposalStatus.APPROVED, ProposalStatus.REJECTED):
             with self.subTest(decision=decision):

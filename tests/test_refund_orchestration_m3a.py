@@ -1,7 +1,7 @@
 """Focused M3A/M3B coverage for deterministic LangGraph refund routing."""
 
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import test_agent as baseline
 from pydantic import ValidationError
@@ -11,7 +11,10 @@ from backend.app.graph_agent import GraphResolutionAgent
 from backend.app.hitl import HITLWorkflow
 from backend.app.llm import ProviderFailure, StructuredLLM
 from backend.app.operations import AuthoritativeDeliveryFact
+from backend.app.proposals import ProposalStatus
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
+from backend.app.security import (AuthenticatedIdentity, LocalAuthenticationProvider,
+                                  LocalCredential, SecurityError, authenticated)
 
 
 class RefundOrchestrationTests(baseline.AgentTests):
@@ -51,26 +54,29 @@ class RefundOrchestrationTests(baseline.AgentTests):
         self.assertEqual(provider.requests, [])
         self.assertFalse(result.actions_executed)
 
-    def test_ineligible_refund_creates_no_proposal_and_returns_verified_denial(self):
+    def test_ineligible_refund_creates_investigation_review_not_refund_approval(self):
         self.ingest_delivery_fact(delivered_days_ago=31)
         provider = baseline.ScriptedProvider([baseline.FINAL])
+        result = HITLWorkflow(StructuredLLM(provider), self.tools, self.proposals).start(
+            self.refund_request())
 
-        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(self.refund_request())
-
-        self.assertEqual(result.status, "INFORMATIONAL")
-        self.assertIn("denied under verified policy", result.customer_response)
-        self.assertIn("outside_return_window", result.customer_response)
-        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "refund_investigation")
+        proposal = self.proposals.get(result.review.proposal_id)
+        self.assertIsNone(proposal.eligibility_evidence_id)
+        self.assertIn("outside_return_window", proposal.rationale)
         self.assertEqual(provider.requests, [])
 
-    def test_missing_evidence_creates_no_proposal_and_returns_unresolved_outcome(self):
+    def test_missing_evidence_creates_investigation_review_not_refund_approval(self):
         provider = baseline.ScriptedProvider([baseline.FINAL])
+        result = HITLWorkflow(StructuredLLM(provider), self.tools, self.proposals).start(
+            self.refund_request())
 
-        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(self.refund_request())
-
-        self.assertEqual(result.status, "INFORMATIONAL")
-        self.assertIn("trusted delivery evidence is unavailable", result.customer_response)
-        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "refund_investigation")
+        proposal = self.proposals.get(result.review.proposal_id)
+        self.assertIsNone(proposal.eligibility_evidence_id)
+        self.assertIn("not refund approval", proposal.rationale)
         self.assertEqual(provider.requests, [])
 
     def test_premature_model_final_cannot_resolve_an_eligible_refund(self):
@@ -86,12 +92,12 @@ class RefundOrchestrationTests(baseline.AgentTests):
 
     def test_provider_failure_cannot_bypass_refund_evidence_evaluation(self):
         provider = baseline.ScriptedProvider([ProviderFailure("UNAVAILABLE")])
+        result = HITLWorkflow(StructuredLLM(provider), self.tools, self.proposals).start(
+            self.refund_request())
 
-        result = GraphResolutionAgent(StructuredLLM(provider), self.tools).run(self.refund_request())
-
-        self.assertEqual(result.status, "INFORMATIONAL")
-        self.assertIn("trusted delivery evidence is unavailable", result.customer_response)
-        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "refund_investigation")
+        self.assertEqual(len(self.proposals.list_for_case(self.case.id)), 1)
         self.assertEqual(provider.requests, [])
 
     def test_text_mention_is_not_refund_intent_without_validated_selection(self):
@@ -146,6 +152,93 @@ class RefundOrchestrationTests(baseline.AgentTests):
         proposal = self.proposals.get(result.pending_proposal_ids[0])
         evidence = self.app.state.business_operations.get_eligibility_evidence(proposal.eligibility_evidence_id)
         self.assertEqual(evidence.sku, "ACC-1")
+
+    def test_lap10_and_any_other_purchased_sku_use_the_same_review_routing(self):
+        customer = self.cases.create_customer(CustomerCreate(name="Universal refund customer"))
+        order = self.cases.create_order(OrderCreate(customer_id=customer.id, items=[
+            {"sku": "LAP-10", "name": "Laptop 10", "quantity": 1},
+            {"sku": "ACC-9", "name": "Adapter", "quantity": 1},
+        ]))
+        for sku in ("LAP-10", "ACC-9"):
+            with self.subTest(sku=sku):
+                case = self.cases.create_case(CaseCreate(
+                    customer_id=customer.id, order_id=order.id,
+                    subject=f"Refund {sku}", description="Human review requested.",
+                ))
+                provider = baseline.ScriptedProvider([baseline.FINAL])
+                result = HITLWorkflow(StructuredLLM(provider), self.tools, self.proposals).start(
+                    AgentRequest(case_id=case.id, message="Review refund.",
+                                 resolution_intent="refund", refund_sku=sku))
+                self.assertEqual(result.status, "REVIEW_REQUIRED")
+                self.assertEqual(result.review.action, "refund_investigation")
+                self.assertEqual(provider.requests, [])
+
+    def test_trusted_fact_for_purchased_sku_without_policy_enters_investigation(self):
+        customer = self.cases.create_customer(CustomerCreate(name="Non-catalog item customer"))
+        order = self.cases.create_order(OrderCreate(customer_id=customer.id, items=[
+            {"sku": "CUSTOM-42", "name": "Custom purchased item", "quantity": 1},
+        ]))
+        case = self.cases.create_case(CaseCreate(
+            customer_id=customer.id, order_id=order.id,
+            subject="Custom item refund", description="Review purchased item.",
+        ))
+        now = datetime.now(timezone.utc)
+        self.delivery_ingestion.ingest(self.delivery_source.id, AuthoritativeDeliveryFact(
+            id=uuid4(), case_id=case.id, order_id=order.id, customer_id=customer.id,
+            sku="CUSTOM-42", quantity=1, delivered_at=now - timedelta(days=5),
+            reason="wrong_item", condition="unused", source_id=self.delivery_source.id,
+            source_reference="custom-42-delivery", verified_at=now,
+        ))
+        provider = baseline.ScriptedProvider([baseline.FINAL])
+        result = HITLWorkflow(StructuredLLM(provider), self.tools, self.proposals).start(
+            AgentRequest(case_id=case.id, message="Review refund.",
+                         resolution_intent="refund", refund_sku="CUSTOM-42"))
+
+        self.assertEqual(result.status, "REVIEW_REQUIRED")
+        self.assertEqual(result.review.action, "refund_investigation")
+        self.assertIsNone(self.proposals.get(result.review.proposal_id).eligibility_evidence_id)
+        self.assertEqual(provider.requests, [])
+
+    def test_investigation_review_decisions_are_atomic_and_not_refund_approval(self):
+        def pause():
+            workflow = HITLWorkflow(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                                    self.tools, self.proposals)
+            paused = workflow.start(self.refund_request())
+            payload = {"workflow_id": paused.review.workflow_id,
+                       "case_id": paused.review.case_id,
+                       "proposal_id": paused.review.proposal_id,
+                       "review_id": paused.review.review_id}
+            return workflow, paused, payload
+
+        approved_workflow, approved_pause, approved = pause()
+        approved_result = approved_workflow.resume({**approved, "decision": "APPROVE"})
+        self.assertEqual(approved_result.reviewed_status, "APPROVED")
+        approved_proposal = self.proposals.get(approved_pause.review.proposal_id)
+        self.assertEqual(approved_proposal.action, "refund_investigation")
+        self.assertIsNone(approved_proposal.eligibility_evidence_id)
+
+        rejected_workflow, rejected_pause, rejected = pause()
+        rejected_result = rejected_workflow.resume({**rejected, "decision": "REJECT"})
+        self.assertEqual(rejected_result.reviewed_status, "REJECTED")
+        self.assertEqual(self.proposals.get(rejected_pause.review.proposal_id).status,
+                         ProposalStatus.REJECTED)
+
+    def test_customer_cannot_decide_investigation_review(self):
+        workflow = HITLWorkflow(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                                self.tools, self.proposals)
+        paused = workflow.start(self.refund_request())
+        payload = {"workflow_id": paused.review.workflow_id, "case_id": paused.review.case_id,
+                   "proposal_id": paused.review.proposal_id, "review_id": paused.review.review_id,
+                   "decision": "APPROVE"}
+        customer_provider = LocalAuthenticationProvider((LocalCredential(
+            token="refund-customer-test-token",
+            identity=AuthenticatedIdentity(user_id=UUID(int=901), role="CUSTOMER",
+                                           customer_id=self.case.customer_id)),))
+        with authenticated(customer_provider, "refund-customer-test-token"):
+            with self.assertRaises(SecurityError):
+                workflow.resume(payload)
+        self.assertEqual(self.proposals.get(paused.review.proposal_id).status,
+                         ProposalStatus.PENDING_REVIEW)
 
     def test_sku_outside_case_bound_order_creates_no_proposal(self):
         request = AgentRequest(case_id=self.case.id, message="Refund selected item.",

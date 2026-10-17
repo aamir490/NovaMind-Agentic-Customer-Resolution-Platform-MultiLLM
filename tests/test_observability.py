@@ -6,7 +6,6 @@ from contextvars import Context
 import io
 import json
 import logging
-import os
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
@@ -18,7 +17,6 @@ from pydantic import ValidationError
 from backend.app.agent import AgentConfig, AgentDecision, AgentRequest, ResolutionAgent
 from backend.app.graph_agent import GraphResolutionAgent
 from backend.app.bedrock import BedrockProvider
-from backend.app.groq import GroqProvider
 from backend.app.guardrails import MAX_PROMPT_CHARS
 from backend.app.hitl import HITLWorkflow
 from backend.app.llm import FakeLLMProvider, LLMMessage, LLMRequest, LLMResponse, ProviderFailure, StructuredLLM, TokenUsage
@@ -117,22 +115,23 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metric["output_tokens_unknown_calls"], 0)
         self.assertEqual(metric["total_tokens_unknown_calls"], 2)
 
-    def test_mocked_groq_usage_metadata_and_malformed_counts(self):
-        for metadata in ({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 15},
-                         {"prompt_tokens": True, "completion_tokens": -1, "total_tokens": "secret"}, None):
-            payload = {"choices": [{"finish_reason": "content_filter"}], "usage": metadata}
-            transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
-            with patch.dict(os.environ, {"GROQ_API_KEY": "test-only-key"}), httpx.Client(transport=transport) as client:
-                with observing(self.observer):
-                    result = StructuredLLM(GroqProvider(client=client, model="local-mock-only")).generate(
-                        LLMRequest(messages=(LLMMessage(role="user", content="Review"),)), AgentDecision)
+    def test_mocked_bedrock_usage_metadata_and_malformed_counts(self):
+        """Bedrock usage metadata is recorded and malformed counts are safely ignored."""
+        for usage in ({"inputTokens": 10, "outputTokens": 2, "totalTokens": 15},
+                      {"inputTokens": True, "outputTokens": -1, "totalTokens": "secret"}, None):
+            response = {"stopReason": "content_filtered", "usage": usage}
+            client = Mock()
+            client.converse.return_value = response
+            with observing(self.observer):
+                result = StructuredLLM(BedrockProvider(model_id="test.model", client=client)).generate(
+                    LLMRequest(messages=(LLMMessage(role="user", content="Review"),)), AgentDecision)
             self.assertEqual(result.code, "REFUSED")
         metric = self.snapshot()["metrics"]["llm"]
         self.assertEqual(metric["input_tokens_known"], 10)
         self.assertEqual(metric["total_tokens_known"], 15)
         self.assertEqual(metric["total_tokens_unknown_calls"], 2)
         self.assertNotIn("secret", json.dumps(self.snapshot()))
-        self.assertTrue(all(event["provider"] == "groq" for event in self.snapshot()["events"]))
+        self.assertTrue(all(event["provider"] == "bedrock" for event in self.snapshot()["events"]))
 
     def test_mocked_bedrock_usage_has_distinct_provider_label(self):
         client = Mock()

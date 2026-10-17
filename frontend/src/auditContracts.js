@@ -6,7 +6,8 @@ const timestamp = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.
 const statuses = ['RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED'];
 const kinds = ['AGENT', 'REVIEW_REQUIRED', 'HUMAN_REVIEW', 'FAILURE'];
 const tools = ['get_customer', 'get_order', 'get_case', 'get_inventory', 'get_policy',
-  'assess_eligibility', 'create_resolution_proposal', 'get_proposal_status', 'search_knowledge'];
+  'assess_eligibility', 'assess_refund_eligibility', 'create_resolution_proposal',
+  'get_proposal_status', 'search_knowledge'];
 // Matches the backend's safe_error vocabulary, with no fallback to raw error text.
 const errors = ['UNAUTHENTICATED', 'FORBIDDEN', 'UNKNOWN_TOOL', 'INVALID_INPUT', 'NOT_FOUND', 'CONFLICT',
   'KNOWLEDGE_UNAVAILABLE', 'UNSAFE_CONTENT', 'PAYLOAD_LIMIT', 'INVALID_OUTPUT', 'TIMEOUT', 'UNAVAILABLE',
@@ -48,7 +49,7 @@ export function auditRuns(page, binding, offset) {
     check(item?.instance_id === binding.instance_id && item.case_id === binding.case_id
       && uuid(item.run_id) && !seen.has(item.run_id) && optionalUuid(item.workflow_id)
       && statuses.includes(item.status) && timestamp(item.created_at) && timestamp(item.updated_at)
-      && ['local_scripted', 'groq', 'bedrock'].includes(item.provider) && item.actions_executed === false);
+      && ['local_scripted', 'bedrock'].includes(item.provider) && item.actions_executed === false);
     seen.add(item.run_id);
     return { run_id: item.run_id, workflow_id: item.workflow_id, status: item.status,
       created_at: item.created_at, updated_at: item.updated_at };

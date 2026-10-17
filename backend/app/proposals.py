@@ -16,6 +16,7 @@ from .observability import observed
 class ProposedAction(StrEnum):
     RETURN = "return"
     REFUND = "refund"
+    REFUND_INVESTIGATION = "refund_investigation"
     REPLACEMENT = "replacement"
 
 
