@@ -5,7 +5,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: novamind-backend:local
+    image: novamind-ai-customer-resolution-backend:local
     init: true
     read_only: true
     cap_drop: [ALL]
@@ -21,7 +21,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    image: novamind-frontend:local
+    image: novamind-ai-customer-resolution-frontend:local
     init: true
     read_only: true
     cap_drop: [ALL]

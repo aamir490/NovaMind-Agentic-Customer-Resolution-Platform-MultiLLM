@@ -140,6 +140,39 @@ class SQLiteWorkflowMetadataRepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.get(run.workflow_id).status, winner)
         self.assertEqual(len(self.repository.events(run.workflow_id)), 2)
 
+    def test_visible_case_runs_paginate_filter_owner_and_exclude_recovery_required(self):
+        first = self.repository.reserve(self.reservation()).run
+        self.repository.transition(
+            first.workflow_id, owner_user_id=self.owner_id, case_id=self.case.id,
+            expected_status=WorkflowMetadataStatus.RUNNING,
+            status=WorkflowMetadataStatus.COMPLETED,
+        )
+        second = self.repository.reserve(self.reservation(
+            workflow_id=uuid4(), run_id=uuid4(), request_id=uuid4(),
+            request_fingerprint=sha256(b"second visible workflow").hexdigest(),
+        )).run
+        self.repository.transition(
+            second.workflow_id, owner_user_id=self.owner_id, case_id=self.case.id,
+            expected_status=WorkflowMetadataStatus.RUNNING,
+            status=WorkflowMetadataStatus.FAILED,
+        )
+        hidden = self.repository.reserve(self.reservation(
+            workflow_id=uuid4(), run_id=uuid4(), request_id=uuid4(),
+            request_fingerprint=sha256(b"recovery workflow").hexdigest(),
+        )).run
+        self.repository.require_recovery(
+            hidden.workflow_id, owner_user_id=self.owner_id, case_id=self.case.id,
+            expected_status=WorkflowMetadataStatus.RUNNING,
+        )
+
+        first_page = self.reopened().visible_runs_for_case(self.case.id, self.owner_id, 0, 1)
+        second_page = self.reopened().visible_runs_for_case(self.case.id, self.owner_id, 1, 1)
+        self.assertEqual([run.run_id for run in (*first_page, *second_page)], [first.run_id, second.run_id])
+        self.assertEqual(self.reopened().visible_runs_for_case(self.case.id, uuid4(), 0, 10), ())
+        self.assertNotIn(hidden.run_id, {run.run_id for run in self.reopened().visible_runs_for_case(
+            self.case.id, None, 0, 10,
+        )})
+
     def test_event_failure_rolls_back_status_transition(self):
         run = self.repository.reserve(self.reservation()).run
         store = SQLitePersistence(self.path)

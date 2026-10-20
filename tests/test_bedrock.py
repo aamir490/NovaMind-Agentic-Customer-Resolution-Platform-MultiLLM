@@ -216,7 +216,10 @@ class BedrockTests(unittest.TestCase):
                 self.client.converse.return_value = tool_completion(value, name=name)
                 result = StructuredLLM(provider).generate(self.request, AgentDecision)
                 self.assertTrue(result.ok)
-                self.assertEqual(result.data.model_dump(mode="json"), value)
+                self.assertEqual(result.data.model_dump(mode="json"), {
+                    **value, "investigation_plan": None, "resolution_draft": None,
+                    "grounded_response": None,
+                })
                 other = "submit_tool_decision" if name == "submit_final_decision" else "submit_final_decision"
                 self.client.converse.return_value = tool_completion(value, name=other)
                 self.assertEqual(StructuredLLM(provider).generate(self.request, AgentDecision).code,
@@ -247,7 +250,10 @@ class BedrockTests(unittest.TestCase):
                     self.client.converse.return_value = tool_completion(value, name=name)
                     result = StructuredLLM(provider).generate(self.request, AgentDecision)
                     self.assertTrue(result.ok)
-                    self.assertEqual(result.data.model_dump(mode="json"), value)
+                    self.assertEqual(result.data.model_dump(mode="json"), {
+                        **value, "investigation_plan": None, "resolution_draft": None,
+                        "grounded_response": None,
+                    })
                     self.client.converse.assert_called_once()
                     body = self.client.converse.call_args.kwargs
                     self.assertEqual(body["modelId"], model_id)

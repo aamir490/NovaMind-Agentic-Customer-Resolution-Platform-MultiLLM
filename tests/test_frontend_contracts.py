@@ -93,7 +93,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
                 "case_id": str(self.records[0].id), "message": "Please review this case", **changes}
 
     async def start(self, body=None):
-        response = await self.request("POST", "/api/runs", body or self.body())
+        response = await self.request("POST", "/api/runs", body or self.body(), who="reviewer")
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["trace_id"], response.headers["X-Trace-ID"])
         self.assertEqual(response.json()["provider"], "local_scripted")
@@ -101,7 +101,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def finished(self, run_id):
         for _ in range(300):
-            response = await self.request("GET", f"/api/runs/{run_id}")
+            response = await self.request("GET", f"/api/runs/{run_id}", who="reviewer")
             self.assertEqual(response.status_code, 200, response.text)
             snapshot = response.json()
             if snapshot["status"] not in ("RUNNING", "RESUMING"):
@@ -211,9 +211,9 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.provider_factory = None
         identity = await self.request("GET", "/api/identity")
         self.assertEqual(identity.json()["provider"], "unavailable")
-        response = await self.request("POST", "/api/runs", self.body())
+        response = await self.request("POST", "/api/runs", self.body(), who="reviewer")
         self.assertEqual((response.status_code, response.json()["detail"]), (503, "PROVIDER_UNAVAILABLE"))
-        response = await self.request("POST", "/api/runs", self.body(instance_id=str(uuid4())))
+        response = await self.request("POST", "/api/runs", self.body(instance_id=str(uuid4())), who="reviewer")
         self.assertEqual(response.json()["detail"], "INSTANCE_CHANGED_DO_NOT_REPLAY")
         self.runtime.memory = None
         response = await self.request("GET", f"/api/cases/{self.records[0].id}/conversations")
@@ -223,11 +223,11 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_inputs_do_not_echo_secrets_or_accept_identity_state(self):
         for key in ("identity", "provider", "graph_state", "checkpoint", "reviewer_name", "role"):
-            response = await self.request("POST", "/api/runs", self.body(**{key: "sensitive-marker"}))
+            response = await self.request("POST", "/api/runs", self.body(**{key: "sensitive-marker"}), who="reviewer")
             self.assertEqual(response.status_code, 422)
             self.assertNotIn("sensitive-marker", response.text)
         for message in ("", "x" * 8001):
-            response = await self.request("POST", "/api/runs", self.body(message=message))
+            response = await self.request("POST", "/api/runs", self.body(message=message), who="reviewer")
             self.assertEqual(response.status_code, 422)
         self.assertEqual(len(self.providers), 0)
 
@@ -254,12 +254,14 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         try:
             run = await asyncio.wait_for(self.start(), 2)
             self.assertTrue(await asyncio.to_thread(entered.wait, 2))
-            response = await asyncio.wait_for(self.request("GET", f"/api/runs/{run['run_id']}/events"), 2)
+            response = await asyncio.wait_for(
+                self.request("GET", f"/api/runs/{run['run_id']}/events", who="reviewer"), 2)
             page = response.json()
             self.assertEqual(page["snapshot"]["status"], "RUNNING")
             self.assertTrue(any(event["node"] == "reason" and event["state"] == "STARTED" for event in page["events"]))
             self.assertFalse(any(event["node"] == "finalize" for event in page["events"]))
-            again = (await self.request("GET", f"/api/runs/{run['run_id']}/events?after={page['next_after']}")).json()
+            again = (await self.request(
+                "GET", f"/api/runs/{run['run_id']}/events?after={page['next_after']}", who="reviewer")).json()
             self.assertEqual(again["events"], [])
         finally:
             release.set()
@@ -270,13 +272,13 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_start_is_atomic_and_conflicting_payload_does_not_replay(self):
         self.proposal_script()
         body = self.body()
-        responses = await asyncio.gather(*(self.request("POST", "/api/runs", body) for _ in range(4)))
+        responses = await asyncio.gather(*(self.request("POST", "/api/runs", body, who="reviewer") for _ in range(4)))
         self.assertTrue(all(value.status_code == 202 for value in responses))
         self.assertEqual(len({value.json()["run_id"] for value in responses}), 1)
         run = await self.finished(responses[0].json()["run_id"])
-        repeat = await self.request("POST", "/api/runs", body)
+        repeat = await self.request("POST", "/api/runs", body, who="reviewer")
         self.assertEqual(repeat.json()["run_id"], run["run_id"])
-        conflict = await self.request("POST", "/api/runs", {**body, "message": "Changed request"})
+        conflict = await self.request("POST", "/api/runs", {**body, "message": "Changed request"}, who="reviewer")
         self.assertEqual(conflict.status_code, 409)
         self.assertEqual(len(self.app.state.proposal_service.list_for_case(self.records[0].id)), 1)
         self.assertEqual(len(self.providers), 1)
@@ -288,7 +290,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.provider_factory = lambda: ScriptedProvider([{"kind": "final"}], entered=entered, release=release)
         try:
             run = await self.start()
-            rejected = await self.request("POST", "/api/runs", self.body())
+            rejected = await self.request("POST", "/api/runs", self.body(), who="reviewer")
             self.assertEqual(rejected.status_code, 503)
             self.assertEqual(rejected.json()["detail"], "RUN_CAPACITY_UNAVAILABLE")
             self.assertEqual(len(self.runtime._runs), 1)
@@ -296,25 +298,26 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
             release.set()
         await self.finished(run["run_id"])
         self.runtime._max_runs = 1
-        rejected = await self.request("POST", "/api/runs", self.body())
+        rejected = await self.request("POST", "/api/runs", self.body(), who="reviewer")
         self.assertEqual(rejected.json()["detail"], "RUN_RETENTION_FULL")
 
     async def test_event_order_pagination_reconnect_gap_and_cursor_validation(self):
         self.runtime._event_capacity = 4
         run = await self.finished((await self.start())["run_id"])
         base = f"/api/runs/{run['run_id']}/events"
-        first = (await self.request("GET", base + "?limit=2")).json()
+        first = (await self.request("GET", base + "?limit=2", who="reviewer")).json()
         self.assertTrue(first["gap"])
         self.assertGreater(first["dropped_events"], 0)
-        repeated = (await self.request("GET", base + "?limit=2")).json()
+        repeated = (await self.request("GET", base + "?limit=2", who="reviewer")).json()
         self.assertEqual(first, repeated)
-        second = (await self.request("GET", base + f"?after={first['next_after']}&limit=2")).json()
+        second = (await self.request(
+            "GET", base + f"?after={first['next_after']}&limit=2", who="reviewer")).json()
         sequences = [event["sequence"] for event in first["events"] + second["events"]]
         self.assertEqual(sequences, list(range(first["first_available_sequence"], run["last_sequence"] + 1)))
         self.assertFalse(second["gap"])
         self.assertFalse(second["has_more"])
         for query, code in (("limit=101", 422), ("after=-1", 422), ("after=99999", 409)):
-            self.assertEqual((await self.request("GET", base + "?" + query)).status_code, code)
+            self.assertEqual((await self.request("GET", base + "?" + query, who="reviewer")).status_code, code)
 
     async def test_bound_review_rejects_mismatch_spoofing_and_concurrent_decisions(self):
         self.proposal_script()
@@ -389,7 +392,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_rag_evidence_and_events_exclude_raw_prompts_payloads(self):
         self.script = [call("search_knowledge", query="refund return", top_k=2), {"kind": "final"}]
         run = await self.finished((await self.start())["run_id"])
-        response = await self.request("GET", f"/api/runs/{run['run_id']}/events")
+        response = await self.request("GET", f"/api/runs/{run['run_id']}/events", who="reviewer")
         events = response.json()["events"]
         retrieval = next(event for event in events if event["retrieval_method"])
         self.assertTrue(retrieval["evidence"])
@@ -400,7 +403,7 @@ class FrontendContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failures_and_guardrails_preserve_real_workflow_outcomes(self):
         for script, error in (([ProviderFailure("UNAVAILABLE")], "UNAVAILABLE"),
-                              ([call("get_order", order_id=str(uuid4()))], "FORBIDDEN"),
+                              ([call("get_order", order_id=str(uuid4()))], "NOT_FOUND"),
                               ([call("approve_proposal", proposal_id=str(uuid4()))], "UNKNOWN_TOOL")):
             self.script = script
             run = await self.finished((await self.start())["run_id"])

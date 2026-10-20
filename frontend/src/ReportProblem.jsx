@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 /**
  * Report a Problem — customer support intake form.
@@ -20,6 +20,11 @@ import { useState } from 'react';
 const SUBJECT_MAX = 200;
 const DESC_MAX = 4000;
 
+function createIdempotencyKey() {
+  if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
+  throw new Error('Your browser cannot safely submit this support request.');
+}
+
 export default function ReportProblem({ api, order, onSuccess, onCancel }) {
   const [subject, setSubject]         = useState('');
   const [description, setDescription] = useState('');
@@ -28,6 +33,7 @@ export default function ReportProblem({ api, order, onSuccess, onCancel }) {
   const [result, setResult]           = useState(null);
   const [error, setError]             = useState(null);
   const [fieldErrors, setFieldErrors] = useState({});
+  const idempotencyKey = useRef(null);
 
   function validate() {
     const errs = {};
@@ -51,12 +57,14 @@ export default function ReportProblem({ api, order, onSuccess, onCancel }) {
     setSubmitting(true);
     setSubmitted(true);
     setError(null);
+    if (idempotencyKey.current === null) idempotencyKey.current = createIdempotencyKey();
 
     try {
       const supportCase = await api.createMyCase({
         orderId: order.id,
         subject: subject.trim(),
         description: description.trim(),
+        idempotencyKey: idempotencyKey.current,
       });
       setResult(supportCase);
       onSuccess?.(supportCase);
@@ -150,7 +158,7 @@ export default function ReportProblem({ api, order, onSuccess, onCancel }) {
               required
               maxLength={SUBJECT_MAX}
               value={subject}
-              onChange={(e) => { setSubject(e.target.value); setFieldErrors((p) => ({ ...p, subject: undefined })); }}
+              onChange={(e) => { idempotencyKey.current = null; setSubject(e.target.value); setFieldErrors((p) => ({ ...p, subject: undefined })); }}
               aria-describedby={fieldErrors.subject ? 'rp-subject-error' : 'rp-subject-help'}
               aria-invalid={!!fieldErrors.subject}
               placeholder="e.g. Received wrong item"
@@ -168,7 +176,7 @@ export default function ReportProblem({ api, order, onSuccess, onCancel }) {
               maxLength={DESC_MAX}
               rows={5}
               value={description}
-              onChange={(e) => { setDescription(e.target.value); setFieldErrors((p) => ({ ...p, description: undefined })); }}
+              onChange={(e) => { idempotencyKey.current = null; setDescription(e.target.value); setFieldErrors((p) => ({ ...p, description: undefined })); }}
               aria-describedby={fieldErrors.description ? 'rp-desc-error' : 'rp-desc-help'}
               aria-invalid={!!fieldErrors.description}
               placeholder="Please describe what happened and how we can help."

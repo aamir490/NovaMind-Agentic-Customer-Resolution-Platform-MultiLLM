@@ -16,6 +16,9 @@ COPY --from=dependencies /opt/venv /opt/venv
 COPY app/ backend/app/
 COPY knowledge/ backend/knowledge/
 COPY container/ backend/container/
+# The volume mounts at /srv/state. Docker populates its empty volume with this
+# UID/GID-owned child directory, which is the only durable write location.
+RUN install -d -o 10001 -g 10001 -m 0750 /srv/state/novamind
 USER 10001:10001
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \

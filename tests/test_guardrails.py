@@ -110,8 +110,12 @@ class GuardrailTests(unittest.TestCase):
             tools = LocalTools(self.cases, self.app.state.business_operations, self.proposals, LocalKnowledgeRetriever(path))
             for mode in ("loop", "graph", "hitl"):
                 result, provider, _ = self.execute(mode, [baseline.call("search_knowledge", query="refund")], tools=tools)
-                self.assertEqual(result.error, "UNSAFE_CONTENT")
-                self.assertEqual(len(provider.requests), 1)
+                # Automatic graph grounding rejects unsafe corpus text before
+                # model invocation and intentionally hides the rejection reason
+                # behind the same fail-closed retrieval error as other corrupt
+                # reference data.
+                self.assertEqual(result.error, "UNSAFE_CONTENT" if mode == "loop" else "KNOWLEDGE_UNAVAILABLE")
+                self.assertEqual(len(provider.requests), 1 if mode == "loop" else 0)
                 self.assertNotIn(ATTACK, result.model_dump_json())
 
     def test_model_injection_rationale_rejected_before_proposal_all_paths(self):
@@ -224,9 +228,40 @@ class GuardrailTests(unittest.TestCase):
         self.assertEqual(self.app.state.business_operations.get_inventory("LAP-1").available_quantity, 5)
 
     def test_case_binding_step_limit_and_single_proposal_are_preserved(self):
+        spoofed_case_id = uuid4()
+        result, _, _ = self.execute("loop", [self.proposal(case_id=str(spoofed_case_id))])
+        self.assertEqual(result.error, "CASE_MISMATCH")
+
+        result, provider, _ = self.execute(
+            "graph", [self.proposal(case_id=str(spoofed_case_id)), baseline.FINAL],
+        )
+        self.assertEqual((result.status, result.error), ("HUMAN_REVIEW_REQUIRED", None))
+        self.assertEqual(len(provider.requests), 2)
+        self.assertFalse(result.actions_executed)
+        proposal = self.proposals.get(result.pending_proposal_ids[0])
+        self.assertEqual(proposal.case_id, self.case.id)
+
+        paused, provider, workflow = self.execute(
+            "hitl", [self.proposal(case_id=str(spoofed_case_id)), baseline.FINAL],
+        )
+        self.assertEqual(paused.status, "REVIEW_REQUIRED")
+        self.assertFalse(paused.actions_executed)
+        self.assertEqual(paused.review.case_id, self.case.id)
+        self.assertEqual(self.proposals.get(paused.review.proposal_id).case_id, self.case.id)
+        self.assertEqual(workflow.resume({
+            "workflow_id": paused.review.workflow_id, "case_id": spoofed_case_id,
+            "proposal_id": paused.review.proposal_id, "review_id": paused.review.review_id,
+            "decision": "REJECT",
+        }).error, "REVIEW_MISMATCH")
+        reviewed = workflow.resume({
+            "workflow_id": paused.review.workflow_id, "case_id": paused.review.case_id,
+            "proposal_id": paused.review.proposal_id, "review_id": paused.review.review_id,
+            "decision": "REJECT",
+        })
+        self.assertEqual(reviewed.status, "REVIEWED")
+        self.assertFalse(reviewed.actions_executed)
+
         for mode in ("loop", "graph", "hitl"):
-            result, _, _ = self.execute(mode, [self.proposal(case_id=str(uuid4()))])
-            self.assertEqual(result.error, "CASE_MISMATCH")
             result, provider, _ = self.execute(mode, [baseline.call("get_inventory", sku="LAP-1")], max_steps=1)
             self.assertEqual(result.error, "STEP_LIMIT")
             self.assertEqual(len(provider.requests), 1)

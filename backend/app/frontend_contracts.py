@@ -12,6 +12,7 @@ from .hitl import HumanDecision, ReviewRequired
 from .knowledge import RetrievalHit
 from .observability import MAX_SCHEMA_ERRORS, MAX_SCHEMA_LOCATION
 from .security import AuthenticatedIdentity
+from .resolution_drafts import ResolutionDraft
 
 
 class IdentityResponse(Contract):
@@ -47,6 +48,7 @@ class RunSnapshot(Contract):
     review: ReviewRequired | None = None
     reviewed_status: Literal["APPROVED", "REJECTED"] | None = None
     message: str | None = None
+    resolution_draft: ResolutionDraft | None = None
     error: str | None = None
     actions_executed: Literal[False] = False
 
@@ -81,7 +83,7 @@ class EventPage(Contract):
 class RunPage(Contract):
     items: tuple[RunSnapshot, ...]
     next_offset: int | None
-    scope: Literal["case_runs_in_this_process"] = "case_runs_in_this_process"
+    scope: Literal["case_runs_in_this_process", "case_runs_with_durable_metadata"] = "case_runs_in_this_process"
 
 
 class PendingReviewRun(Contract):
@@ -133,7 +135,7 @@ class AuditPage(Contract):
     events: tuple[AuditSummary, ...]
     next_after: int
     has_more: bool
-    scope: Literal["in_memory_workflow_audit"] = "in_memory_workflow_audit"
+    scope: Literal["in_memory_workflow_audit", "durable_workflow_audit"] = "in_memory_workflow_audit"
 
 
 class OutputSchemaError(Contract):
@@ -162,7 +164,7 @@ class TelemetryEvent(Contract):
     reviewer_user_id: UUID | None = None
     tool: str | None = None
     status: str | None = None
-    provider: Literal["groq", "bedrock", "fake", "other"] | None = None
+    provider: Literal["bedrock", "fake", "other"] | None = None
     invalid_response_stage: Literal["provider_envelope", "json_guardrail", "output_schema"] | None = None
     invalid_response_category: Literal["bedrock_empty_output", "bedrock_nonempty_json_rejected"] | None = None
     output_schema_errors: tuple[OutputSchemaError, ...] | None = Field(default=None, max_length=MAX_SCHEMA_ERRORS)

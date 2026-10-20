@@ -11,7 +11,7 @@
 ![Backend](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
 ![Orchestration](https://img.shields.io/badge/Agent-LangGraph-1C3C3C)
 ![Hosting](https://img.shields.io/badge/Hosting-CloudFront%20%2B%20S3%20%2B%20Fargate-FF9900)
-![LLM](https://img.shields.io/badge/LLM-Groq-F55036)
+![LLM](https://img.shields.io/badge/LLM-Amazon%20Bedrock-FF9900)
 ![Safety](https://img.shields.io/badge/Decisions-Human--in--the--Loop-6F42C1)
 
 **[Open the CloudFront demo](https://d26tisze27u224.cloudfront.net/)** · **[Architecture](#6-current-aws-cloudfront-architecture)** · **[Case walkthrough](#16-end-to-end-example-damaged-laptop)** · **[Interview guide](#23-how-to-explain-novamind-in-an-interview)**
@@ -53,11 +53,27 @@
 ![NovaMind AWS CloudFront Architecture](./project-pic/NovaMind%20AWS%20Agentic%20Architecture%20Overview-cloudfont.png)
 
 
+## Project Overview
+
+**My NovaMind AI** project is an Agentic AI customer-resolution decision-support platform.
+
+### How It Works
+* **Trigger:** When a customer raises a refund complaint, the application checks the customer's order, trusted delivery evidence, and predefined business policies.
+* **Core Technology:**
+  * **Python** evaluates refund eligibility.
+  * **LangGraph** coordinates the investigation and review workflow.
+  * **Amazon Bedrock** supports constrained AI reasoning.
+* **Human-in-the-Loop:** The system creates a proposal for human approval rather than automatically issuing a refund.
+
+> ⚠️ **Current Status:** This is a demonstration platform. Real payment processing and product-return integrations are not implemented.
+
+
+
 ## 1. Executive summary
 
 **NovaMind** is a bounded Agentic AI customer-resolution application. It helps support teams investigate issues such as a damaged laptop, an incorrect item, a possible return, or a replacement request. Rather than trusting a model to invent a decision or directly change business systems, NovaMind combines:
 
-- **Groq-hosted LLM reasoning:** interprets the support problem and selects a *requested* next step.
+- **Amazon Bedrock reasoning:** interprets the support problem and selects a *requested* next step.
 - **Application-managed tools:** securely look up case, customer, order, policy, inventory, eligibility and knowledge information.
 - **Deterministic rules:** Python code performs authoritative checks instead of relying on an LLM's interpretation of a policy.
 - **LangGraph orchestration:** expresses multi-step reasoning, conditional routes, limits, and a pause for human review.
@@ -82,7 +98,7 @@ The critical design principle is:
 | Container runtime | ECS Fargate, one running backend task in verified deployment |
 | API routing | CloudFront `/api/*` → internet-facing ALB HTTP port `80` → ECS target port `8000` |
 | AI orchestration | Bounded agent loop, LangGraph and HITL workflow |
-| LLM endpoint | External Groq API; configured model `openai/gpt-oss-20b` |
+| LLM endpoint | Amazon Bedrock Converse API; configured with `BEDROCK_MODEL_ID` |
 | Reference retrieval | Local lexical/token-cosine retrieval; **not** a vector-database RAG service |
 | App state | Some runtime/business/workflow state is process-local; not durable HA |
 | Authentication | Server-configured bearer credentials with CUSTOMER, REVIEWER and ADMIN roles |
@@ -177,9 +193,7 @@ flowchart LR
   CF -->|Default behavior: static assets| S3[(Private Amazon S3\nReact/Vite dist)]
   CF -->|/api/*, HTTP :80 to origin| ALB[Internet-facing ALB]
   ALB -->|Target group HTTP :8000| ECS[ECS Fargate\nFastAPI + LangGraph]
-  ECS -->|Outbound HTTPS| NAT[NAT Gateway]
-  NAT --> IGW[Internet Gateway]
-  IGW --> GROQ[External Groq LLM API]
+  ECS -->|AWS API HTTPS| BEDROCK[Amazon Bedrock Converse]
   SM[AWS Secrets Manager] -.->|Injected at task startup| ECS
   ECR[Amazon ECR] -.->|Container image pull| ECS
   ECS -.->|Container logs| CW[CloudWatch Logs]
@@ -261,7 +275,7 @@ The earlier ALB/ECS frontend architecture is **historical**, not the currently d
 | **Public subnets (2 AZs)** | ALB placement; public NAT Gateway | IGW via public route table |
 | **Private subnets (2 AZs)** | No-public-IP ECS backend placement | ALB ingress, NAT outbound |
 | **Internet Gateway** | Internet access for suitable public resources | Public route table, NAT traffic |
-| **NAT Gateway** | Outbound internet for private ECS, including Groq | Private route table, public subnet, IGW |
+| **NAT Gateway** | Outbound internet for private ECS when no VPC endpoint is used | Private route table, public subnet, IGW |
 | **Elastic IP** | NAT Gateway public IPv4 address | NAT Gateway |
 | **ALB** | Receives CloudFront `/api/*` requests and forwards to backend target | CloudFront, target group, ECS |
 | **Target group** | Registers ECS task private IP/port and probes `/api/health` | ALB listener, ECS service |
@@ -269,9 +283,9 @@ The earlier ALB/ECS frontend architecture is **historical**, not the currently d
 | **AWS Fargate** | Managed container compute without managing EC2 hosts | ECS service, private subnet ENIs |
 | **ECR** | Stores backend Docker image | ECS image pull |
 | **IAM** | Governs execution-time AWS permissions | ECS execution role, task role |
-| **Secrets Manager** | Holds Groq API key and auth configuration | ECS startup secret injection |
+| **Secrets Manager** | Holds authentication configuration when used | ECS startup secret injection |
 | **CloudWatch Logs** | Centralized backend stdout/stderr logging | ECS awslogs driver |
-| **Groq** (external) | LLM reasoning; not an AWS Bedrock model in this release | FastAPI through NAT/outbound HTTPS |
+| **Amazon Bedrock** | Cloud LLM reasoning through the Converse API | FastAPI through the AWS SDK and task-role permissions |
 
 ### Why two Availability Zones if there is only one backend task?
 
@@ -310,15 +324,15 @@ The ALB spans two AZs and the VPC has a two-AZ network layout. This provides a f
 
 1. An authorized workflow request starts an agent run in FastAPI.
 2. The backend assembles case context and permitted tool descriptions.
-3. The Groq adapter sends a structured model request over outbound HTTPS.
-4. Because ECS is in a private subnet, the network path traverses the private default route → NAT Gateway → public subnet/IGW → Groq.
+3. The Bedrock adapter sends a structured Converse request through the AWS SDK.
+4. The runtime resolves credentials through the standard boto3 provider chain; a task role requires permission to invoke the selected model or inference profile.
 5. Model output is parsed, validated and dispatched **only** through application-managed tools.
 6. The agent may gather further evidence, evaluate rules or create a pending proposal.
 7. A reviewer/admin performs the review step if required; the application returns the recorded result to the UI.
 
-The identity and run APIs label an explicitly selected Groq provider `groq`; the
-diagnostics API uses the same provider category. Scripted local runs retain their
-`local_scripted` identity/run label.
+The identity and run APIs label an explicitly selected Bedrock provider `bedrock`;
+diagnostics use the same provider category. Scripted local runs retain their
+`local_scripted` identity/run label for offline verification.
 
 ### D. Backend image deployment
 
@@ -342,7 +356,7 @@ ALB health probe GET /api/health → 200
 
 ### E. Logging and startup secrets
 
-The **ECS task execution role** gives ECS permission to pull from ECR, write logs to CloudWatch and resolve the two configured Secrets Manager values. Groq and authentication contents enter the task environment rather than a Git-tracked file. The backend's ECS entrypoint writes the auth content to `/dev/shm/novamind/auth.json` and points its auth loader there. The image runs as a non-root user with a **read-only root filesystem**. Startup metadata and application logs go to `/ecs/novamind-backend` (configured 7-day retention). Avoid logging auth headers or tokens.
+The **ECS task execution role** gives ECS permission to pull from ECR, write logs to CloudWatch, and resolve configured authentication material. The application relies on the standard boto3 credential provider chain for Bedrock; credentials never enter a Git-tracked file. The backend's ECS entrypoint writes authentication content to `/dev/shm/novamind/auth.json` and points its auth loader there. The image runs as a non-root user with a **read-only root filesystem**. Startup metadata and application logs go to `/ecs/novamind-backend` (configured 7-day retention). Avoid logging auth headers or tokens.
 
 ## 9. Agentic AI architecture
 
@@ -380,7 +394,7 @@ flowchart TD
 | `backend/app/security.py` | Authentication, role and ownership checks |
 | `backend/app/proposals.py` | Proposal lifecycle |
 | `backend/app/observability.py` | Safe trace/event metadata |
-| `backend/app/groq.py` | External Groq provider adapter |
+| `backend/app/bedrock.py` | Amazon Bedrock Converse provider adapter |
 | `backend/container/ecs_entrypoint.py` | ECS auth material setup and API startup |
 
 > These code paths and behaviors are documented by the uploaded original README. A separate source-code audit would be needed to re-confirm their contents against the current checked-out commit.
@@ -470,7 +484,7 @@ The source calls this retrieval approach **`local_token_cosine_v1`**. It is **no
 | Web frontend | React, Vite, JavaScript, CSS | Built into S3 static assets for current AWS deployment |
 | API/backend | Python 3.12, FastAPI, Uvicorn, Pydantic, HTTPX | Single backend Fargate application |
 | Agent runtime | LangGraph and application-managed Python tools | Bounded tool and HITL flows |
-| Model provider | Groq, OpenAI-compatible HTTP adapter | Current deployed LLM configuration |
+| Model provider | Amazon Bedrock via boto3 Converse | Only supported cloud LLM configuration |
 | Local data/retrieval | Local domain services, JSON knowledge, token cosine | Some deployed state is process-local |
 | Containers | Docker | Current AWS topology needs backend container on Fargate |
 | AWS edge/static | CloudFront, S3, OAC | Viewer HTTPS and private frontend |
@@ -506,7 +520,7 @@ The source README documents three roles: **CUSTOMER**, **REVIEWER**, **ADMIN**. 
 - LLM tool requests are parsed and checked against fixed server-side contracts.
 - Authorization is based on verified server-side identity, not role claims made in a prompt.
 - Sensitive outputs and credentials should not be recorded in logs, screenshots or Git commits.
-- A healthy ECS task is **not** proof that Groq inference, every case state transition or authorization scenario is healthy.
+- A healthy ECS task is **not** proof that Bedrock inference, every case state transition or authorization scenario is healthy.
 
 ## 15. How the application is deployed
 
@@ -532,7 +546,7 @@ For local build and deployment: Python, Node.js/npm, Docker Desktop, AWS CLI v2,
 | 10 | Build Vite frontend and upload to private S3 | `index.html` and hashed assets present |
 | 11 | Create CloudFront OAC + two origins and behaviors | Distribution `Deployed` |
 | 12 | Attach distribution-specific S3 bucket policy | HTTPS frontend loads; direct public S3 remains blocked |
-| 13 | Test API and role-based workflows | CloudFront `/api/health`, customer/admin, Groq scenarios |
+| 13 | Test API and role-based workflows | CloudFront `/api/health`, customer/admin, Bedrock scenarios |
 
 ### Representative read-only validation commands (Windows PowerShell)
 
@@ -571,13 +585,14 @@ These are **checks**, not claims that every command was rerun during README crea
 Deployed ECS settings recorded in our deployment include `FARGATE`, `awsvpc`, CPU `256`, memory `512`, backend port `8000`, task definition `novamind-backend:3`, image digest pinning, a read-only root filesystem, and startup through `python -m backend.container.ecs_entrypoint`. Example nonsecret environment settings:
 
 ```dotenv
-NOVAMIND_LLM_PROVIDER=groq
-GROQ_MODEL=openai/gpt-oss-20b
+NOVAMIND_LLM_PROVIDER=bedrock
+AWS_REGION=<AWS_REGION>
+BEDROCK_MODEL_ID=<BEDROCK_MODEL_ID>
 LANGCHAIN_TRACING_V2=false
 LANGSMITH_TRACING=false
 ```
 
-The actual `GROQ_API_KEY` and `NOVAMIND_AUTH_CONTENT` values are injected from Secrets Manager, **not** recorded in this file.
+AWS credentials and `NOVAMIND_AUTH_CONTENT` values are supplied outside this repository through standard runtime mechanisms, **not** recorded in this file.
 
 ## 16. End-to-end example: damaged laptop
 
@@ -656,12 +671,12 @@ The following paths are carried over from the original repository README. **Chec
 | Secrets scheduled for deletion | Creating same secret returned an error | Check secret metadata first, restore existing secret, verify `AWSCURRENT`; never print values |
 | PowerShell JSON escaping | AWS CLI rejected malformed policy/task JSON | Write JSON to temporary file, inspect validity, use `file://` |
 | UTF-8 BOM | CLI could reject JSON prefixed with BOM on Windows | Write UTF-8 without BOM when required |
-| IAM scope | Task needed startup access to Groq/auth secrets | Use scoped execution-role GetSecretValue permissions for just required ARNs |
+| IAM scope | Task needs Bedrock invocation and authentication-secret access | Use least-privilege task-role model permissions and scoped execution-role GetSecretValue permissions |
 | CloudFront verification restriction | Distribution creation initially rejected | Resolve account restriction; do not tear down healthy ECS/VPC stack |
 | CloudFront name resolution | Initial DNS `NXDOMAIN` / propagation uncertainty | Verify distribution state and DNS resolution instead of guessing |
 | S3 `403 Forbidden` | Private S3 origin blocked CloudFront | Add OAC-specific bucket policy with CloudFront SourceArn; keep Block Public Access on |
 | Mixed historical resource inventories | Documentation referred to an older ALB/VPC and frontend ECS | Separate old deployment from the new CloudFront/S3 architecture |
-| Groq limits/errors | Provider requests can fail even if ECS is healthy | Distinguish AI quota/runtime errors from infrastructure availability |
+| Bedrock limits/errors | Provider requests can fail even if ECS is healthy | Distinguish AI quota/runtime errors from infrastructure availability |
 
 **Operational lesson:** Always separate (1) the resource actually deployed, (2) the configuration you intended, (3) the verification command, and (4) the result you observed. Healthy `/api/health` is necessary, but it does not prove successful AI inference or a complete reviewer approval journey.
 
@@ -673,7 +688,7 @@ The following paths are carried over from the original repository README. **Chec
 - **Network/API:** ALB target group health, HTTP path behavior, network security-group relationships.
 - **Compute:** ECS desired/running/pending counts, task failures, container startup state.
 - **Application:** authentication, case lookup, tools, proposal transitions and safe trace metadata.
-- **LLM:** Groq provider errors, latency, model-output parsing and quota conditions.
+- **LLM:** Bedrock provider errors, latency, model-output parsing and quota conditions.
 - **HITL:** pending/approved/rejected state transitions and reviewer authorization.
 
 ### Read-only operations checklist
@@ -716,7 +731,7 @@ aws cloudfront get-distribution --id EHJ4CWH1Z6Q0P `
 | CloudFront homepage | User confirmed app working | No ongoing uptime monitoring |
 | CloudFront `/api/health` | Expected HTTP 200 | No specific successful output captured in this conversation |
 | Customer/admin case flow | User reported project working and used demo scenarios | Full test artifacts not provided |
-| Live Groq inference | Provider and model configured | No recorded successful inference trace provided here |
+| Live Bedrock inference | Provider and model configured | No recorded successful inference trace provided here |
 
 ## 20. Reliability, scalability and cost
 
@@ -728,7 +743,7 @@ A scalable design would first externalize authoritative business state and LangG
 
 ### Failure modes worth planning for
 
-- Groq timeout/quota exhaustion: fail safely; report provider error without implying the case was resolved.
+- Bedrock timeout/quota exhaustion: fail safely; report provider error without implying the case was resolved.
 - Invalid LLM/tool JSON: reject or retry safely within constraints; do not bypass validation.
 - ECS replacement: any process-local state may be lost.
 - Duplicate proposal/review requests: require idempotency checks and existing-state validation.
@@ -748,7 +763,7 @@ A scalable design would first externalize authoritative business state and LangG
 | Secrets Manager | Secret storage and API costs |
 | CloudWatch | Logs ingestion/storage and optional observability features |
 | ECR | Stored image data/scanning-related costs, depending on configuration |
-| External Groq | Provider's separate quota or usage pricing |
+| Amazon Bedrock | Model inference and related AWS usage pricing |
 
 **Important:** Scaling ECS down to zero does **not** remove ALB, NAT Gateway, S3 or public IPv4 charges. Cleanup must be intentional, scoped to verified resource ownership, and preceded by backups and dry-run review. Do not run a teardown script simply because deployment is complete.
 
@@ -760,7 +775,7 @@ A scalable design would first externalize authoritative business state and LangG
 | End-to-end origin HTTPS | **Not implemented** (HTTP origin) | ACM certificate + HTTPS ALB origin |
 | Private static frontend | **Implemented** with S3/OAC | CI/CD and cache-control optimizations |
 | ECS backend | **Implemented** as one Fargate task | Multiple stateless tasks after shared-state migration |
-| Groq model | **Configured** external provider | Governance, quotas and possible Bedrock adapter |
+| Amazon Bedrock model | **Configured** cloud provider | Governance, quotas and model evaluation |
 | LangGraph tool workflow | **Documented implemented** | Expanded automated integration/evaluation tests |
 | HITL decision | **Documented implemented** | Durable review state and audit trail |
 | Real refund/replacement execution | **Not implemented** | Trusted executor + downstream integrations |
@@ -792,8 +807,7 @@ A scalable design would first externalize authoritative business state and LangG
 
 ### Phase C — AWS-native Generative AI
 
-- Add an Amazon Bedrock adapter behind the existing provider-neutral interface.
-- Compare model quality, tool-selection validity, latency, reliability and cost against Groq.
+- Evaluate model quality, tool-selection validity, latency, reliability and cost within Amazon Bedrock.
 - Apply model governance and evaluation; do not change business authority rules.
 
 ### Phase D — Production retrieval and grounding
@@ -818,23 +832,23 @@ A scalable design would first externalize authoritative business state and LangG
 
 ### One sentence
 
-> I built NovaMind, an AWS-deployed bounded Agentic AI customer-resolution platform where LangGraph and a Groq-hosted LLM investigate support cases through validated tools and propose resolutions, while deterministic rules and authenticated human reviewers retain authority.
+> I built NovaMind, an AWS-deployed bounded Agentic AI customer-resolution platform where LangGraph and Amazon Bedrock investigate support cases through validated tools and propose resolutions, while deterministic rules and authenticated human reviewers retain authority.
 
 ### 30-second pitch
 
-> NovaMind helps customer-support teams investigate issues like damaged products, returns and replacement requests. It is more than a chatbot: a LangGraph workflow lets the AI select approved tools to retrieve cases, orders, policies and inventory, then create a proposed resolution. Application code validates tool calls and business rules; reviewers approve or reject proposals. I deployed the React frontend using private S3 and CloudFront, while a FastAPI backend runs on ECS Fargate behind an ALB. The current model API is Groq, and actual refund or replacement execution is deliberately out of scope.
+> NovaMind helps customer-support teams investigate issues like damaged products, returns and replacement requests. It is more than a chatbot: a LangGraph workflow lets the AI select approved tools to retrieve cases, orders, policies and inventory, then create a proposed resolution. Application code validates tool calls and business rules; reviewers approve or reject proposals. I deployed the React frontend using private S3 and CloudFront, while a FastAPI backend runs on ECS Fargate behind an ALB. The supported cloud model API is Amazon Bedrock, and actual refund or replacement execution is deliberately out of scope.
 
 ### 90-second pitch
 
-> I built NovaMind because customer-support cases require both natural-language understanding and trustworthy verification. A typical damaged-laptop complaint cannot be handled safely by an LLM alone: the system needs to check an order, examine policy, validate eligibility and involve a human when a sensitive resolution is proposed. NovaMind uses structured model output and an explicit allowlist of Python tools. LangGraph coordinates the reasoning/tool loop and pauses for authenticated reviewer approval. The LLM cannot invent permissions or directly execute a refund or shipment. On AWS, CloudFront is the HTTPS entry point. The React/Vite build is stored on private S3 with OAC. `/api/*` requests go through CloudFront to an ALB and FastAPI/LangGraph in private ECS Fargate subnets. Secrets Manager supplies runtime credentials, ECR stores the backend image, CloudWatch collects logs, and a NAT Gateway allows outbound Groq inference. The key design tradeoff is that the current demo uses one backend task and some process-local state, so durable stores and origin HTTPS are future production improvements.
+> I built NovaMind because customer-support cases require both natural-language understanding and trustworthy verification. A typical damaged-laptop complaint cannot be handled safely by an LLM alone: the system needs to check an order, examine policy, validate eligibility and involve a human when a sensitive resolution is proposed. NovaMind uses structured model output and an explicit allowlist of Python tools. LangGraph coordinates the reasoning/tool loop and pauses for authenticated reviewer approval. The LLM cannot invent permissions or directly execute a refund or shipment. On AWS, CloudFront is the HTTPS entry point. The React/Vite build is stored on private S3 with OAC. `/api/*` requests go through CloudFront to an ALB and FastAPI/LangGraph in private ECS Fargate subnets. Standard boto3 credential resolution authorizes Bedrock requests, ECR stores the backend image, and CloudWatch collects logs. The key design tradeoff is that the current demo uses one backend task and some process-local state, so durable stores and origin HTTPS are future production improvements.
 
 ### Three-minute technical walkthrough
 
 > **Problem:** A damaged-delivery case often requires several verified facts across customer, order, policy and inventory information. Manual investigation is slow; allowing an unrestricted model to decide refunds is risky.\n\n**Application design:** I expose a React UI to customers and reviewers, with FastAPI as the API boundary. I treat inputs and model output as untrusted. The model produces a structured JSON request to use an allowlisted application tool or finish. FastAPI validates that request, including Pydantic arguments, authorization and tool name. Tools return evidence to the reasoning loop, which can continue for several bounded steps. Local knowledge retrieval supplies reference snippets; deterministic code decides policy eligibility. LangGraph handles conditional routes and human-review pausing. A reviewer or administrator can approve or reject a proposed resolution; no real refund or replacement is triggered.
 >
-> **AWS design:** I deploy the static frontend to private S3, protect it with OAC and a CloudFront distribution-specific bucket policy, and serve it through HTTPS CloudFront. CloudFront has a separate `/api/*` behavior with caching disabled and forwarding to a public ALB restricted to CloudFront-origin-facing IPs. The ALB routes to the FastAPI task's private IP on port 8000. ECS Fargate runs the backend container from ECR. IAM grants ECS startup-only access to Groq and auth secrets in Secrets Manager. A private subnet's NAT route provides outbound access to Groq, and CloudWatch records application logs.
+> **AWS design:** I deploy the static frontend to private S3, protect it with OAC and a CloudFront distribution-specific bucket policy, and serve it through HTTPS CloudFront. CloudFront has a separate `/api/*` behavior with caching disabled and forwarding to a public ALB restricted to CloudFront-origin-facing IPs. The ALB routes to the FastAPI task's private IP on port 8000. ECS Fargate runs the backend container from ECR. IAM grants the task role least-privilege permission to invoke the selected Bedrock model or inference profile, while startup authentication material can come from Secrets Manager. CloudWatch records application logs.
 >
-> **Constraints:** Browser-to-CloudFront uses HTTPS, but the current ALB origin is HTTP. The backend uses one Fargate task with some process-local state. We therefore need durable persistence before HA/autoscaling. Bedrock, Cognito, semantic retrieval and controlled real business execution are planned improvements, not completed functionality.
+> **Constraints:** Browser-to-CloudFront uses HTTPS, but the current ALB origin is HTTP. The backend uses one Fargate task with some process-local state. We therefore need durable persistence before HA/autoscaling. Cognito, semantic retrieval and controlled real business execution are planned improvements, not completed functionality.
 
 ### Common interview questions and defensible answers
 
@@ -846,17 +860,17 @@ A scalable design would first externalize authoritative business state and LangG
 | **How do you prevent hallucinated refunds?** | No refund execution tool; deterministic eligibility and human review are separate boundaries |
 | **What if a malicious customer says “approve immediately”?** | Customer input remains untrusted; backend authorization and tools still enforce limits |
 | **What is your RAG implementation?** | Local token-cosine retrieval; not embeddings/vector database |
-| **Why Groq rather than Bedrock?** | Provider-neutral interface and external model experimentation; Bedrock is a proposed AWS-native adapter |
+| **Why Amazon Bedrock?** | It is the supported cloud model provider and keeps runtime identity under the standard AWS credential chain |
 | **Why S3 + CloudFront rather than frontend ECS?** | Static SPA doesn't need an always-running container; edge delivery and private static hosting simplify topology |
 | **What does OAC do?** | CloudFront signs S3 origin requests; SourceArn bucket policy restricts reads to the distribution |
 | **How does `/api/*` work?** | Separate CloudFront behavior → ALB :80 → target group → ECS FastAPI :8000 |
-| **Why use a NAT Gateway?** | ECS private subnet needs outbound HTTPS to Groq without a public task IP |
+| **How is Bedrock access authorized?** | The runtime uses the standard boto3 credential chain and needs least-privilege permission to invoke the selected model or inference profile |
 | **Execution role vs task role?** | Execution role for platform startup/logs/secrets; task role for AWS APIs invoked by application code |
 | **Is your API encrypted end to end?** | No: viewer HTTPS is active; CloudFront-to-ALB and ALB-to-ECS currently use HTTP |
 | **Why not scale to five tasks now?** | Some runtime state is process-local; shared persistence is needed first |
 | **How do you diagnose ECS deployment failure?** | Service events → stopped task reason → CloudWatch → image/entrypoint/secrets/network → ALB target health |
 | **What did CloudFront 403 teach you?** | Private S3 requires OAC-specific `s3:GetObject` bucket permission while keeping public access blocked |
-| **What happens when Groq fails?** | Application should fail safely; provider health is separate from ALB health |
+| **What happens when Bedrock fails?** | Application should fail safely; provider health is separate from ALB health |
 | **What is your most important design decision?** | LLM reasons; application validates; deterministic rules and reviewers retain authority |
 | **How would you add real refund execution?** | Separate authorized executor, idempotency, durable audit events and verification |
 | **How would you make it production-ready?** | Origin TLS, identity, shared storage, observability, CI/CD, resilient deployments and comprehensive tests |
@@ -897,6 +911,6 @@ This README is derived from the provided original README, architecture visual, d
 
 **Built by Aamir**  
 **Project:** NovaMind Agentic Customer Resolution Platform  
-**Focus:** Agentic AI · LangGraph · Human-in-the-Loop · AWS CloudFront · Amazon S3 · Amazon ECS Fargate · FastAPI · React · Groq · AWS DevOps
+**Focus:** Agentic AI · LangGraph · Human-in-the-Loop · Amazon Bedrock · AWS CloudFront · Amazon S3 · Amazon ECS Fargate · FastAPI · React · AWS DevOps
 
 > **Core takeaway:** AI can investigate and propose a resolution, but trusted business rules and authenticated humans retain control of sensitive outcomes.

@@ -162,7 +162,7 @@ class Fixture:
             "refusal": [LLMResponse(text=json.dumps(self.proposal()), finish_reason="refusal")],
             "truncated": [LLMResponse(text=json.dumps(self.proposal()), finish_reason="length")],
             "customer_injection": [], "memory_injection": [],
-            "retrieval_injection": [call("search_knowledge", query="refund")],
+            "retrieval_injection": [call("search_knowledge", query="XPolicyProbe", top_k=1)],
             "cross_customer": [call("get_case", case_id=str(self.other_case.id))],
             "step_limit": [call("get_inventory", sku="LAP-1")],
             "proposal_limit": [self.proposal(), self.proposal()],
@@ -193,8 +193,10 @@ def agent_row(spec, mode, fixture):
         memory = f.memory
     if spec.name == "retrieval_injection":
         path = f.directory / "attack-corpus.json"
-        path.write_text(json.dumps([{"source": {"document_id": "attack", "title": "Refund",
-            "version": "v1", "source_uri": "local-knowledge://attack"}, "text": "Refund. " + ATTACK}]), encoding="utf-8")
+        documents = [document.model_dump(mode="json") for document in load_documents(DEFAULT_CORPUS)]
+        documents.append({"source": {"document_id": "attack", "title": "XPolicyProbe",
+            "version": "v1", "source_uri": "local-knowledge://attack"}, "text": "XPolicyProbe. " + ATTACK})
+        path.write_text(json.dumps(documents), encoding="utf-8")
         f.tools = LocalTools(f.cases, f.operations, f.proposals, LocalKnowledgeRetriever(path))
     provider = ScriptedProvider(f.script(spec.name))
     cls = ResolutionAgent if mode == "loop" else GraphResolutionAgent

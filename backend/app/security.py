@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, SecretStr, StringConstraints, model_validator
 
+from .domain import InvestigationExecutionContext
 from .service import CaseService, NotFoundError
 
 
@@ -77,14 +78,26 @@ class LocalAuthenticationProvider:
                 raise ValueError("Duplicate token or conflicting identity")
             self._identities[digest] = identity
             subjects[identity.user_id] = identity
+        self._subjects = subjects
 
     def authenticate(self, token: str) -> AuthenticatedIdentity | None:
         if not isinstance(token, str) or not 16 <= len(token) <= 256 or not token.isascii():
             return None
         return self._identities.get(sha256(token.encode("ascii")).digest())
 
+    def identity_for_user_id(self, user_id: UUID) -> AuthenticatedIdentity | None:
+        """Trusted bootstrap lookup; it never accepts a request credential."""
+        if not isinstance(user_id, UUID):
+            return None
+        identity = self._subjects.get(user_id)
+        return (None if identity is None
+                else AuthenticatedIdentity.model_validate(identity))
+
 
 _identity: ContextVar[AuthenticatedIdentity | None] = ContextVar("authenticated_identity", default=None)
+_investigation_execution: ContextVar[InvestigationExecutionContext | None] = ContextVar(
+    "investigation_execution", default=None,
+)
 
 
 @contextmanager
@@ -108,6 +121,34 @@ def current_identity() -> AuthenticatedIdentity:
     return AuthenticatedIdentity.model_validate(identity)
 
 
+def current_investigation_execution() -> InvestigationExecutionContext | None:
+    """Return the active trusted job scope, if this is a server execution."""
+    context = _investigation_execution.get()
+    return None if context is None else InvestigationExecutionContext.model_validate(context)
+
+
+@contextmanager
+def trusted_investigation_execution(context: InvestigationExecutionContext):
+    """Enter a server-only LangGraph tool scope for one marked job attempt.
+
+    This cannot be combined with an HTTP-authenticated identity.  The caller
+    must obtain ``context`` from the investigation-job repository after it has
+    verified persisted claim, reservation, descriptor, and attempt records.
+    """
+    if _identity.get() is not None or _investigation_execution.get() is not None:
+        raise RuntimeError("Investigation execution cannot be nested in a request identity")
+    context = InvestigationExecutionContext.model_validate(context)
+    scope_token = _investigation_execution.set(context)
+    identity_token = _identity.set(AuthenticatedIdentity(
+        user_id=context.worker_id, role=Role.REVIEWER,
+    ))
+    try:
+        yield context
+    finally:
+        _identity.reset(identity_token)
+        _investigation_execution.reset(scope_token)
+
+
 def require_roles(*roles: Role) -> AuthenticatedIdentity:
     identity = current_identity()
     if identity.role not in roles:
@@ -124,6 +165,9 @@ class Authorization:
 
     @staticmethod
     def customer(customer_id: UUID):
+        execution = current_investigation_execution()
+        if execution is not None and execution.customer_id != customer_id:
+            raise SecurityError()
         identity = current_identity()
         if identity.role == Role.CUSTOMER and identity.customer_id != customer_id:
             raise SecurityError()
@@ -134,24 +178,34 @@ class Authorization:
             record = lookup(resource_id)
         except NotFoundError:
             # Do not distinguish unknown IDs from another customer's IDs.
-            if identity.role == Role.CUSTOMER:
+            if identity.role == Role.CUSTOMER or current_investigation_execution() is not None:
                 raise SecurityError() from None
             raise
         self.customer(record.customer_id)
         return record
 
     def order(self, order_id: UUID):
-        return self._owned(self._cases.get_order, order_id)
+        record = self._owned(self._cases.get_order, order_id)
+        execution = current_investigation_execution()
+        if execution is not None and record.id != execution.order_id:
+            raise SecurityError()
+        return record
 
     def case(self, case_id: UUID):
-        return self._owned(self._cases.get_case, case_id)
+        record = self._owned(self._cases.get_case, case_id)
+        execution = current_investigation_execution()
+        if execution is not None and (
+            record.id != execution.case_id or record.order_id != execution.order_id
+        ):
+            raise SecurityError()
+        return record
 
     def proposal(self, proposal_id: UUID):
         identity = current_identity()
         try:
             record = self._proposals.get(proposal_id)
         except NotFoundError:
-            if identity.role == Role.CUSTOMER:
+            if identity.role == Role.CUSTOMER or current_investigation_execution() is not None:
                 raise SecurityError() from None
             raise
         self.case(record.case_id)

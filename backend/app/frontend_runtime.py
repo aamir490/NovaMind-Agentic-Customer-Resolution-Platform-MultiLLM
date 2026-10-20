@@ -5,20 +5,24 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from hashlib import sha256
 from threading import RLock
 from uuid import UUID, uuid4
 
 from .agent import AgentRequest
+from .graph_agent import GraphState
 from .frontend_contracts import (
     AuditPage, AuditSummary, EventPage, PendingReviewPage, PendingReviewRun, RunEvent, RunPage, RunSnapshot,
 )
-from .hitl import HITLWorkflow, HumanDecision, ResumeRejected
+from .hitl import HITLState, HITLWorkflow, HumanDecision, ResumeRejected
+from .langgraph_checkpoints import SQLiteCheckpointSaver
 from .knowledge import RetrievalResult
-from .llm import StructuredLLM
+from .llm import ProviderFailure, StructuredLLM
 from .observability import ERRORS, TOOLS
+from .persistence import SQLiteWorkflowMetadataRepository
 from .proposals import ProposalStatus, ResolutionProposal
 from .security import Authorization, Role, SecurityError, current_identity, require_roles
+from .service import NotFoundError
+from .workflow_metadata import WorkflowMetadataStatus
 
 
 def now():
@@ -36,11 +40,19 @@ class FrontendError(Exception):
         super().__init__(code)
 
 
+class _UnavailableProvider:
+    """Allows a restored paused review to finish without creating an LLM client."""
+
+    def generate(self, request, *, response_schema):
+        raise ProviderFailure("UNAVAILABLE")
+
+
 @dataclass
 class _Run:
     snapshot: RunSnapshot
     owner: UUID
     fingerprint: str
+    request_id: UUID | None = None
     workflow: HITLWorkflow | None = None
     events: deque = field(default_factory=deque)
 
@@ -50,15 +62,30 @@ class FrontendRuntime:
     # Once full, refuse new starts rather than silently replaying an evicted write.
     def __init__(self, cases, tools, proposals, *, local_provider_factory=None,
                  provider_label="local_scripted", memory=None,
+                 agent_engine="langgraph", strands_model_factory=None,
+                 checkpointer: SQLiteCheckpointSaver | None = None,
+                 workflow_metadata: SQLiteWorkflowMetadataRepository | None = None,
                  max_runs=128, max_active=2, event_capacity=128):
         if not (1 <= max_runs <= 1024 and 1 <= max_active <= 8 and 1 <= event_capacity <= 1024):
             raise ValueError("Invalid local runtime bounds")
         if provider_label not in ("local_scripted", "bedrock"):
             raise ValueError("Invalid provider label")
+        if agent_engine not in ("langgraph", "strands"):
+            raise ValueError("Invalid agent engine")
+        if agent_engine == "strands" and strands_model_factory is None:
+            raise ValueError("Strands agent engine requires a model factory")
+        if (checkpointer is None) != (workflow_metadata is None):
+            raise ValueError("Durable checkpoints require durable workflow metadata")
+        if checkpointer is not None and agent_engine != "langgraph":
+            raise ValueError("Durable checkpoints are only available for LangGraph")
         self.instance_id = uuid4()
         self.provider_factory = local_provider_factory
         self.provider_label = provider_label
+        self.agent_engine = agent_engine
+        self.strands_model_factory = strands_model_factory
         self.memory = memory
+        self._checkpointer = checkpointer
+        self._workflow_metadata = workflow_metadata
         self._cases, self._tools, self._proposals = cases, tools, proposals
         self._max_runs, self._max_active, self._event_capacity = max_runs, max_active, event_capacity
         self._runs, self._requests = {}, {}
@@ -66,6 +93,7 @@ class FrontendRuntime:
         self._closed = False
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(max_workers=max_active, thread_name_prefix="novamind-run")
+        self._restore_durable_runs()
 
     def close(self):
         with self._lock:
@@ -76,9 +104,100 @@ class FrontendRuntime:
         if instance_id != self.instance_id:
             raise FrontendError(409, "INSTANCE_CHANGED_DO_NOT_REPLAY")
 
+    @property
+    def _durable(self):
+        return self._checkpointer is not None
+
+    def _workflow(self, run, *, restoring=False):
+        """Build a LangGraph workflow without invoking a provider during recovery."""
+        provider = (self.provider_factory() if self.provider_factory is not None and not restoring
+                    else _UnavailableProvider())
+        return HITLWorkflow(StructuredLLM(provider), self._tools, self._proposals,
+            memory=self.memory, on_transition=lambda *args: self._transition(run, *args),
+            checkpointer=self._checkpointer, workflow_metadata=self._workflow_metadata,
+            provider_label=self.provider_label)
+
+    def _require_recovery(self, metadata):
+        try:
+            self._workflow_metadata.require_recovery(
+                metadata.workflow_id, owner_user_id=metadata.owner_user_id,
+                case_id=metadata.case_id, expected_status=metadata.status,
+            )
+        except Exception:
+            # A corrupted or already-finalized run is never retried from startup.
+            pass
+
+    def _hydrate_durable_run(self, metadata):
+        """Load one stored workflow state; this is read-only and never resumes it."""
+        if metadata.provider != self.provider_label or metadata.status == WorkflowMetadataStatus.RECOVERY_REQUIRED:
+            return None
+        try:
+            holder = _Run(
+                RunSnapshot(instance_id=self.instance_id, run_id=metadata.run_id,
+                    workflow_id=metadata.workflow_id, case_id=metadata.case_id,
+                    provider=metadata.provider, status=metadata.status.value,
+                    created_at=metadata.created_at, updated_at=metadata.updated_at),
+                metadata.owner_user_id, metadata.request_fingerprint, metadata.request_id,
+                events=deque(maxlen=self._event_capacity),
+            )
+            holder.workflow = self._workflow(holder, restoring=True)
+            state = holder.workflow._graph.get_state(
+                holder.workflow._runtime_config(metadata.workflow_id),
+            )
+            restored = HITLState.model_validate(state.values)
+            review = restored.review
+            if restored.workflow_id != metadata.workflow_id:
+                raise ValueError("workflow mismatch")
+            if metadata.status == WorkflowMetadataStatus.REVIEW_REQUIRED:
+                if (review is None or state.next != ("human_review",)
+                        or not any(task.interrupts for task in state.tasks)):
+                    raise ValueError("missing paused review")
+                proposal = self._proposals.get(review.proposal_id)
+                if (proposal.status != ProposalStatus.PENDING_REVIEW
+                        or proposal.case_id != metadata.case_id
+                        or not self._proposals.matches_workflow_review(
+                            proposal.id, workflow_id=review.workflow_id,
+                            case_id=review.case_id, review_id=review.review_id)):
+                    raise ValueError("review binding mismatch")
+            holder.snapshot = holder.snapshot.model_copy(update={
+                "conversation_id": restored.agent.request.conversation_id,
+                "review": review,
+                "reviewed_status": restored.reviewed_status,
+                "resolution_draft": restored.agent.resolution_draft,
+                "error": safe_error(restored.error),
+            })
+            self._runs[metadata.run_id] = holder
+            self._requests[(metadata.owner_user_id, metadata.request_id)] = metadata.run_id
+            return holder
+        except Exception:
+            if metadata.status in (
+                WorkflowMetadataStatus.RUNNING, WorkflowMetadataStatus.RESUMING,
+                WorkflowMetadataStatus.REVIEW_REQUIRED,
+            ):
+                self._require_recovery(metadata)
+            return None
+
+    def _restore_durable_runs(self):
+        if not self._durable:
+            return
+        # Only REVIEW_REQUIRED runs are exposed after restart. In-flight work is
+        # marked for explicit recovery instead of replaying an agent/tool call.
+        for metadata in self._workflow_metadata.active_runs():
+            if metadata.status == WorkflowMetadataStatus.REVIEW_REQUIRED:
+                self._hydrate_durable_run(metadata)
+            else:
+                self._require_recovery(metadata)
+
     def _authorized(self, run_id):
         identity = current_identity()
         run = self._runs.get(run_id)
+        if run is None and self._durable:
+            try:
+                metadata = self._workflow_metadata.get_by_run_id(run_id)
+            except NotFoundError:
+                metadata = None
+            if metadata is not None:
+                run = self._hydrate_durable_run(metadata)
         if run is None:
             if identity.role == Role.CUSTOMER:
                 raise SecurityError()
@@ -98,7 +217,8 @@ class FrontendRuntime:
     def _transition(self, run, node, phase, state):
         with self._lock:
             run.snapshot = run.snapshot.model_copy(update={"workflow_id": state.workflow_id,
-                "conversation_id": state.agent.request.conversation_id, "review": state.review})
+                "conversation_id": state.agent.request.conversation_id, "review": state.review,
+                "resolution_draft": state.agent.resolution_draft})
             self._publish(run, "NODE", phase, node=node)
             if node not in ("load_case", "execute_tool"):
                 return
@@ -129,7 +249,8 @@ class FrontendRuntime:
         identity = current_identity()
         Authorization(self._cases).case(body.case_id)
         self.check_instance(body.instance_id)
-        fingerprint = sha256(body.model_dump_json().encode()).hexdigest()
+        request = AgentRequest.model_validate(body.model_dump(exclude={"instance_id", "request_id"}))
+        fingerprint = HITLWorkflow._fingerprint(request)
         key = (identity.user_id, body.request_id)
         with self._lock:
             if key in self._requests:
@@ -137,7 +258,21 @@ class FrontendRuntime:
                 if fingerprint != run.fingerprint:
                     raise FrontendError(409, "REQUEST_ID_CONFLICT")
                 return run.snapshot
-            if self.provider_factory is None:
+            if self._durable:
+                try:
+                    existing = self._workflow_metadata.get_by_request(identity.user_id, body.request_id)
+                except NotFoundError:
+                    existing = None
+                if existing is not None:
+                    if (existing.case_id != request.case_id
+                            or existing.request_fingerprint != fingerprint
+                            or existing.provider != self.provider_label):
+                        raise FrontendError(409, "REQUEST_ID_CONFLICT")
+                    run = self._hydrate_durable_run(existing)
+                    if run is None:
+                        raise FrontendError(409, "REQUEST_RECOVERY_REQUIRED")
+                    return run.snapshot
+            if self.provider_factory is None and self.agent_engine != "strands":
                 raise FrontendError(503, "PROVIDER_UNAVAILABLE")
             if len(self._runs) >= self._max_runs:
                 raise FrontendError(503, "RUN_RETENTION_FULL")
@@ -147,15 +282,15 @@ class FrontendRuntime:
                 self.memory.load(body.conversation_id, body.case_id)
             self._reserve()
             timestamp = now()
-            run = _Run(RunSnapshot(instance_id=self.instance_id, run_id=uuid4(), case_id=body.case_id,
+            run_id = uuid4()
+            run = _Run(RunSnapshot(instance_id=self.instance_id, run_id=run_id, case_id=body.case_id,
                 conversation_id=body.conversation_id, provider=self.provider_label,
                 status="RUNNING", created_at=timestamp, updated_at=timestamp,
                 trace_id=trace_id),
-                identity.user_id, fingerprint, events=deque(maxlen=self._event_capacity))
+                identity.user_id, fingerprint, body.request_id, events=deque(maxlen=self._event_capacity))
             self._runs[run.snapshot.run_id] = run
             self._requests[key] = run.snapshot.run_id
             self._publish(run, "STATE", "RUNNING")
-            request = AgentRequest.model_validate(body.model_dump(exclude={"instance_id", "request_id"}))
             self._submit(run, request, resume=False)
             return run.snapshot
 
@@ -170,10 +305,20 @@ class FrontendRuntime:
     def _execute(self, run, payload, resume):
         try:
             if not resume:
-                run.workflow = HITLWorkflow(StructuredLLM(self.provider_factory()), self._tools,
-                    self._proposals, memory=self.memory,
-                    on_transition=lambda *args: self._transition(run, *args))
-            result = run.workflow.resume(payload) if resume else run.workflow.start(payload)
+                if self.agent_engine == "strands":
+                    from .strands_agent import StrandsWorkflow
+                    run.workflow = StrandsWorkflow(self._tools,
+                        model_factory=self.strands_model_factory,
+                        memory=self.memory,
+                        on_transition=lambda *args: self._transition(run, *args))
+                else:
+                    run.workflow = self._workflow(run) if self._durable else HITLWorkflow(
+                        StructuredLLM(self.provider_factory()), self._tools, self._proposals,
+                        memory=self.memory, on_transition=lambda *args: self._transition(run, *args))
+            result = run.workflow.resume(payload) if resume else run.workflow.start(
+                payload, workflow_id=run.snapshot.run_id, run_id=run.snapshot.run_id,
+                request_id=run.request_id,
+            ) if self._durable else run.workflow.start(payload)
             with self._lock:
                 if isinstance(result, ResumeRejected):
                     run.snapshot = run.snapshot.model_copy(update={"status": "REVIEW_REQUIRED", "error": result.error})
@@ -182,7 +327,8 @@ class FrontendRuntime:
                         "workflow_id": result.workflow_id, "status": result.status,
                         "conversation_id": result.conversation_id or run.snapshot.conversation_id,
                         "review": result.review or run.snapshot.review, "reviewed_status": result.reviewed_status,
-                        "message": result.message, "error": safe_error(result.error)})
+                        "message": result.message, "resolution_draft": result.resolution_draft,
+                        "error": safe_error(result.error)})
                 self._publish(run, "STATE", run.snapshot.status, error=run.snapshot.error)
         except Exception:
             with self._lock:
@@ -211,19 +357,86 @@ class FrontendRuntime:
                 has_more=cursor < run.snapshot.last_sequence, first_available_sequence=first,
                 dropped_events=first - 1, gap=after < first - 1)
 
+    def _snapshot_from_metadata(self, metadata):
+        """Project durable metadata for selection; checkpoint hydration stays lazy."""
+        return RunSnapshot(
+            instance_id=self.instance_id, run_id=metadata.run_id,
+            workflow_id=metadata.workflow_id, case_id=metadata.case_id,
+            provider=metadata.provider, status=metadata.status.value,
+            created_at=metadata.created_at, updated_at=metadata.updated_at,
+        )
+
     def list_for_case(self, case_id, offset, limit):
         Authorization(self._cases).case(case_id)
         identity = current_identity()
         with self._lock:
+            if self._durable:
+                owner_user_id = identity.user_id if identity.role == Role.CUSTOMER else None
+                # Fetch one extra record to keep pagination bounded and avoid
+                # instantiating historical workflows or their model providers.
+                records = self._workflow_metadata.visible_runs_for_case(
+                    case_id, owner_user_id, offset, limit + 1,
+                )
+                items = tuple(self._snapshot_from_metadata(record) for record in records[:limit])
+                return RunPage(
+                    items=items,
+                    next_offset=offset + limit if len(records) > limit else None,
+                    scope="case_runs_with_durable_metadata",
+                )
             records = [run.snapshot for run in self._runs.values() if run.snapshot.case_id == case_id
                        and (identity.role != Role.CUSTOMER or run.owner == identity.user_id)]
             return RunPage(items=tuple(records[offset:offset + limit]),
                 next_offset=offset + limit if offset + limit < len(records) else None)
 
+    def resolution_draft_for_case(self, case_id):
+        """Read the newest validated graph draft without resuming a workflow."""
+        require_roles(Role.ADMIN)
+        Authorization(self._cases).case(case_id)
+        with self._lock:
+            live = [run.snapshot for run in self._runs.values()
+                    if run.snapshot.case_id == case_id and run.snapshot.resolution_draft is not None]
+            newest = (max(live, key=lambda snapshot: snapshot.updated_at) if live else None)
+            if not self._durable:
+                return newest.resolution_draft if newest else None
+            # Checkpoints are append-only and this is a bounded, read-only
+            # projection.  It deliberately never constructs a provider or
+            # resumes a run while locating the draft for an admin decision.
+            records = self._workflow_metadata.visible_runs_for_case(case_id, None, 0, 1024)
+            for record in reversed(records):
+                try:
+                    checkpoint = self._checkpointer.get_tuple({"configurable": {
+                        "thread_id": str(record.workflow_id),
+                    }})
+                    values = checkpoint.checkpoint.get("channel_values", {}) if checkpoint else {}
+                    agent = GraphState.model_validate(values.get("agent"))
+                    if (agent.resolution_draft is not None
+                            and (newest is None or record.updated_at >= newest.updated_at)):
+                        newest = RunSnapshot(
+                            instance_id=self.instance_id, run_id=record.run_id,
+                            case_id=case_id, workflow_id=record.workflow_id,
+                            provider=record.provider, status=record.status.value,
+                            created_at=record.created_at, updated_at=record.updated_at,
+                            resolution_draft=agent.resolution_draft,
+                        )
+                except Exception:
+                    # A malformed historical checkpoint must not result in a
+                    # synthesized decision or automatic recovery attempt.
+                    continue
+            return newest.resolution_draft if newest else None
+
     def pending_reviews(self):
         require_roles(Role.REVIEWER, Role.ADMIN)
         authorization = Authorization(self._cases, self._proposals)
         with self._lock:
+            if self._durable:
+                # The automatic dispatcher owns no FrontendRuntime object.  A
+                # newly paused durable graph is therefore hydrated here using
+                # its checkpoint only; this does not create a model client or
+                # restart an in-flight workflow.
+                for metadata in self._workflow_metadata.active_runs():
+                    if (metadata.status == WorkflowMetadataStatus.REVIEW_REQUIRED
+                            and metadata.run_id not in self._runs):
+                        self._hydrate_durable_run(metadata)
             items = []
             for run in self._runs.values():
                 snapshot, review = run.snapshot, run.snapshot.review
@@ -287,4 +500,5 @@ class FrontendRuntime:
                     error=safe_error(event.error or getattr(entry, "error", None))))
             cursor = summaries[-1].sequence if summaries else after
             return AuditPage(run_id=run_id, events=tuple(summaries), next_after=cursor,
-                             has_more=bool(records and cursor < records[-1].sequence))
+                             has_more=bool(records and cursor < records[-1].sequence),
+                             scope="durable_workflow_audit" if self._durable else "in_memory_workflow_audit")

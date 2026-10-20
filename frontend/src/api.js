@@ -49,6 +49,57 @@ function myCase(supportCase) {
     updated_at: supportCase.updated_at };
 }
 
+const resolutionActions = ['APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT', 'REQUEST_MORE_EVIDENCE', 'ESCALATE'];
+const draftIssueTypes = ['damaged', 'wrong_item', 'missing_item', 'delayed_delivery', 'malfunction', 'return', 'refund_not_received'];
+const draftDecisions = ['REQUEST_EVIDENCE', 'ESCALATE'];
+
+function customerResolution(payload, caseId) {
+  const supportCase = myCase(payload?.case);
+  requireResponse(supportCase.id === caseId, 'case resolution');
+  const decision = payload.latest;
+  requireResponse(decision === null || (decision && resolutionActions.includes(decision.action)
+    && isText(decision.customer_message) && Array.from(decision.customer_message).length <= 2000
+    && isTimestamp(decision.decided_at)), 'case resolution');
+  return { case: supportCase, latest: decision === null ? null : {
+    action: decision.action, customerMessage: decision.customer_message,
+    decidedAt: decision.decided_at,
+  } };
+}
+
+function adminResolutionDraft(payload) {
+  if (payload === null) return null;
+  requireResponse(payload && draftIssueTypes.includes(payload.issue_type)
+    && draftDecisions.includes(payload.recommended_decision)
+    && isTextList(payload.verified_facts) && payload.verified_facts.length >= 1 && payload.verified_facts.length <= 8
+    && isTextList(payload.missing_evidence) && payload.missing_evidence.length >= 1 && payload.missing_evidence.length <= 6
+    && isText(payload.decision_reason) && Array.from(payload.decision_reason).length <= 1200
+    && isText(payload.customer_facing_response) && Array.from(payload.customer_facing_response).length <= 1200
+    && payload.actions_executed === false, 'resolution draft');
+  return { issueType: payload.issue_type, recommendedDecision: payload.recommended_decision,
+    verifiedFacts: payload.verified_facts, missingEvidence: payload.missing_evidence,
+    decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response };
+}
+
+function staffResolution(payload, caseId) {
+  requireResponse(payload?.case && isUuid(payload.case.id) && payload.case.id === caseId
+    && isText(payload.case.status) && Array.isArray(payload.history) && payload.history.length <= 1000,
+  'case resolution');
+  const project = (decision) => {
+    requireResponse(decision && resolutionActions.includes(decision.action)
+      && isText(decision.reason) && Array.from(decision.reason).length <= 2000
+      && isText(decision.customer_message) && Array.from(decision.customer_message).length <= 2000
+      && isUuid(decision.admin_user_id) && isTimestamp(decision.decided_at), 'case resolution');
+    return { action: decision.action, reason: decision.reason, customerMessage: decision.customer_message,
+      adminUserId: decision.admin_user_id, decidedAt: decision.decided_at };
+  };
+  const history = payload.history.map(project);
+  const latest = payload.latest === null ? null : project(payload.latest);
+  requireResponse((latest === null && history.length === 0)
+    || (latest !== null && history.length > 0
+      && latest.decidedAt === history.at(-1).decidedAt && latest.action === history.at(-1).action), 'case resolution');
+  return { case: payload.case, latest, history };
+}
+
 function knowledgeEvidence(event) {
   // Optional evidence must never interrupt run tracking. Missing or invalid
   // evidence is unavailable, distinct from a confirmed retrieval with no hits.
@@ -106,11 +157,12 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
   // One in-memory client per identity. Never persist credentials or put them in URLs.
   const lifetime = new AbortController();
 
-  async function request(path, { method = 'GET', body, signal } = {}) {
+  async function request(path, { method = 'GET', body, signal, idempotencyKey } = {}) {
     if (lifetime.signal.aborted) throw new Error('This browser session has ended.');
     const response = await fetcher(`/api${path}`, {
       method, cache: 'no-store', credentials: 'omit', redirect: 'error',
       headers: { ...(globalThis.location?.hostname?.endsWith('.ngrok-free.app') ? { 'ngrok-skip-browser-warning': 'true' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
         ...(body ? { 'Content-Type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.any([AbortSignal.timeout(5000), lifetime.signal, ...(signal ? [signal] : [])]),
@@ -269,14 +321,16 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
         items: order.items.map((it) => ({ sku: it.sku, name: it.name, quantity: it.quantity })) };
     },
 
-    async createMyCase({ orderId, subject, description }) {
+    async createMyCase({ orderId, subject, description, idempotencyKey }) {
       // SECURITY: customer_id is NEVER sent — the backend derives it from the
       // authenticated identity. Only order_id, subject, and description are sent.
       requireResponse(isUuid(orderId), 'case order_id');
       requireResponse(isText(subject) && Array.from(subject).length <= 200, 'case subject');
       requireResponse(isText(description) && Array.from(description).length <= 4000, 'case description');
+      const key = idempotencyKey ?? globalThis.crypto?.randomUUID?.();
+      requireResponse(isUuid(key), 'case idempotency key');
       const body = { order_id: orderId, subject: subject.trim(), description: description.trim() };
-      const supportCase = await request('/my/cases', { method: 'POST', body });
+      const supportCase = await request('/my/cases', { method: 'POST', body, idempotencyKey: key });
       requireResponse(isUuid(supportCase?.id) && isUuid(supportCase.customer_id)
         && isUuid(supportCase.order_id) && isText(supportCase.subject)
         && isText(supportCase.description) && isText(supportCase.status)
@@ -306,6 +360,13 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
       return supportCase;
     },
 
+    async getMyCaseResolution(caseId, options) {
+      requireResponse(isUuid(caseId), 'case id');
+      return customerResolution(await get(`/cases/${encodeURIComponent(caseId)}/resolution`, {
+        signal: options?.signal,
+      }), caseId);
+    },
+
     async listMyOrders() {
       const orders = await get('/my/orders');
       requireResponse(Array.isArray(orders) && orders.length <= 10000, 'my orders list');
@@ -325,6 +386,29 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
         get(`/orders/${encodeURIComponent(supportCase.order_id)}`),
       ]);
       return { supportCase, customer, order };
+    },
+    async caseResolution(caseId, options) {
+      requireResponse(isUuid(caseId), 'case id');
+      return staffResolution(await get(`/cases/${encodeURIComponent(caseId)}/resolution`, {
+        signal: options?.signal,
+      }), caseId);
+    },
+    async caseResolutionDraft(caseId, options) {
+      requireResponse(isUuid(caseId), 'case id');
+      return adminResolutionDraft(await get(`/cases/${encodeURIComponent(caseId)}/resolution-draft`, {
+        signal: options?.signal,
+      }));
+    },
+    async resolveCase(caseId, { action, reason, customerMessage, evidenceReviewed }) {
+      requireResponse(isUuid(caseId) && resolutionActions.includes(action), 'case resolution');
+      requireResponse(isText(reason) && Array.from(reason).length <= 2000, 'case resolution reason');
+      requireResponse(isText(customerMessage) && Array.from(customerMessage).length <= 2000,
+        'customer response');
+      requireResponse(typeof evidenceReviewed === 'boolean', 'evidence review confirmation');
+      return staffResolution(await request(`/cases/${encodeURIComponent(caseId)}/resolution`, {
+        method: 'POST', body: { action, reason: reason.trim(), customer_message: customerMessage.trim(),
+          evidence_reviewed: evidenceReviewed },
+      }), caseId);
     },
     async item(sku) {
       const inventory = await get(`/inventory/${encodeURIComponent(sku)}`);

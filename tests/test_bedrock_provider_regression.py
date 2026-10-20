@@ -1,13 +1,4 @@
-"""
-Regression tests for the Groq → Bedrock provider migration.
-
-Covers:
-- GROQ_* env vars are now unconditionally rejected (retired provider).
-- `groq` selector is rejected by bootstrap.
-- Bedrock with AWS_PROFILE passes through without error.
-- Provider literals in frontend contracts and runtime no longer include 'groq'.
-- StructuredLLM no longer labels any provider as 'groq'.
-"""
+"""Offline regression tests for Bedrock provider selection and labeling."""
 
 import json
 import os
@@ -49,39 +40,28 @@ def _mock_boto3():
     return client, boto3, botocore, config
 
 
-class GroqRetirementTests(unittest.TestCase):
-    """GROQ_* vars and the 'groq' selector must be refused at bootstrap."""
+class BedrockSelectionSafetyTests(unittest.TestCase):
+    """Only explicit, valid Bedrock configuration creates a cloud provider."""
 
     def setUp(self):
         self.enterContext(patch.dict(os.environ, {}, clear=True))
 
-    def test_groq_selector_is_rejected(self):
-        os.environ.update({"NOVAMIND_LLM_PROVIDER": "groq", "GROQ_API_KEY": "test-key"})
+    def test_unset_selector_leaves_cloud_provider_unavailable(self):
+        self.assertIsNone(_llm_provider())
+
+    def test_unknown_selector_is_rejected(self):
+        os.environ["NOVAMIND_LLM_PROVIDER"] = "unsupported"
         with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
             _llm_provider()
 
-    def test_groq_key_alone_is_rejected(self):
-        os.environ["GROQ_API_KEY"] = "test-only-key"
-        with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
+    def test_bedrock_requires_region_and_model_id(self):
+        os.environ["NOVAMIND_LLM_PROVIDER"] = "bedrock"
+        with self.assertRaisesRegex(RuntimeError, "^Container Bedrock configuration is invalid$"):
             _llm_provider()
 
-    def test_groq_model_alone_is_rejected(self):
-        os.environ["GROQ_MODEL"] = "openai/gpt-oss-20b"
-        with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
-            _llm_provider()
-
-    def test_groq_key_with_bedrock_selector_is_rejected(self):
-        os.environ.update({**BEDROCK_CONFIG, "GROQ_API_KEY": "leaked-key"})
-        with self.assertRaisesRegex(RuntimeError, "^Container LLM provider selection is invalid$"):
-            _llm_provider()
-
-    def test_groq_key_with_offline_selector_is_rejected(self):
-        os.environ.update({
-            "NOVAMIND_LLM_PROVIDER": "local_scripted",
-            "NOVAMIND_OFFLINE_TESTING": "true",
-            "GROQ_API_KEY": "must-not-be-read",
-        })
-        with self.assertRaises(RuntimeError):
+    def test_bedrock_rejects_invalid_region(self):
+        os.environ.update({**BEDROCK_CONFIG, "AWS_REGION": "not-a-region"})
+        with self.assertRaisesRegex(RuntimeError, "^Container Bedrock configuration is invalid$"):
             _llm_provider()
 
 
@@ -127,9 +107,9 @@ class BedrockWithProfileTests(unittest.TestCase):
 
 
 class ProviderLabelContractTests(unittest.TestCase):
-    """Provider literals in application contracts must not include 'groq'."""
+    """Public provider contracts accept only supported runtime labels."""
 
-    def test_identity_response_provider_literal_excludes_groq(self):
+    def test_identity_response_rejects_unknown_provider_label(self):
         from pydantic import ValidationError
         with self.assertRaises(ValidationError):
             IdentityResponse(
@@ -137,31 +117,31 @@ class ProviderLabelContractTests(unittest.TestCase):
                           "role": "ADMIN", "customer_id": None},
                 can_review=True, can_view_diagnostics=True,
                 instance_id="00000000-0000-4000-8000-000000000002",
-                provider="groq",
+                provider="unsupported",
                 memory_available=False,
             )
 
-    def test_run_snapshot_provider_literal_excludes_groq(self):
+    def test_run_snapshot_rejects_unknown_provider_label(self):
         from pydantic import ValidationError
         with self.assertRaises(ValidationError):
             RunSnapshot(
                 instance_id="00000000-0000-4000-8000-000000000001",
                 run_id="00000000-0000-4000-8000-000000000002",
                 case_id="00000000-0000-4000-8000-000000000003",
-                provider="groq",
+                provider="unsupported",
                 status="RUNNING",
                 created_at="2026-10-15T00:00:00Z",
                 updated_at="2026-10-15T00:00:00Z",
             )
 
-    def test_frontend_runtime_rejects_groq_provider_label(self):
+    def test_frontend_runtime_rejects_unknown_provider_label(self):
         with self.assertRaises(ValueError):
-            FrontendRuntime(None, None, None, provider_label="groq")
+            FrontendRuntime(None, None, None, provider_label="unsupported")
 
-    def test_create_app_rejects_groq_provider_label(self):
+    def test_create_app_rejects_unknown_provider_label(self):
         from pydantic import ValidationError
         with self.assertRaises((ValueError, ValidationError)):
-            create_app(provider_label="groq")  # type: ignore[arg-type]
+            create_app(provider_label="unsupported")  # type: ignore[arg-type]
 
     def test_telemetry_event_provider_literal_still_accepts_bedrock_and_fake(self):
         """Diagnostics vocabulary kept for historical events."""
@@ -180,7 +160,7 @@ class ProviderLabelContractTests(unittest.TestCase):
 
 
 class StructuredLLMProviderLabelTests(unittest.TestCase):
-    """StructuredLLM must label BedrockProvider as 'bedrock', never 'groq'."""
+    """StructuredLLM exposes stable diagnostic labels for Bedrock and test doubles."""
 
     def setUp(self):
         self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("No network")))
@@ -199,7 +179,7 @@ class StructuredLLMProviderLabelTests(unittest.TestCase):
         with admin_scope():
             return observer.snapshot()
 
-    def test_bedrock_provider_is_labelled_bedrock_not_groq(self):
+    def test_bedrock_provider_is_labelled_bedrock(self):
         from backend.app.agent import AgentDecision
         from backend.app.observability import LocalObserver, observing
         observer = LocalObserver(capacity=10)
@@ -213,9 +193,8 @@ class StructuredLLMProviderLabelTests(unittest.TestCase):
         llm_events = [e for e in events if e["operation"] == "llm"]
         self.assertEqual(len(llm_events), 1)
         self.assertEqual(llm_events[0]["provider"], "bedrock")
-        self.assertNotEqual(llm_events[0]["provider"], "groq")
 
-    def test_unknown_provider_class_falls_back_to_other_not_groq(self):
+    def test_unknown_provider_class_falls_back_to_other(self):
         from backend.app.agent import AgentDecision
         from backend.app.observability import LocalObserver, observing
 

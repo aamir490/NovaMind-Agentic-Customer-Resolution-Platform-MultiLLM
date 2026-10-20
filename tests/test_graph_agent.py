@@ -1,6 +1,7 @@
 """Phase 9 graph routing and parity tests; all generation is scripted and local."""
 
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from unittest.mock import Mock, patch
 from uuid import uuid4
@@ -23,6 +24,19 @@ class GraphAgentTests(baseline.AgentTests):
         self.agent = GraphResolutionAgent(StructuredLLM(self.provider), self.tools, AgentConfig(max_steps=max_steps))
         self.state = self.agent.run_state(request or self.request)
         return self.state.final_result
+
+    def test_case_mismatch_prevents_proposal_creation(self):
+        # The graph, unlike the legacy loop, binds proposal identity to the
+        # immutable request before validating or dispatching the tool call.
+        result = self.run_script([
+            self.proposal(case_id=str(uuid4())), baseline.FINAL,
+        ])
+        self.assertEqual(result.status, "HUMAN_REVIEW_REQUIRED")
+        self.assertIsNone(result.error)
+        proposals = self.proposals.list_for_case(self.case.id)
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0].case_id, self.case.id)
+        self.assertEqual(self.state.history[-2].decision.arguments["case_id"], str(self.case.id))
 
     def test_explicit_routing_and_loop_nodes(self):
         self.run_script([baseline.call("get_inventory", sku="LAP-1"), baseline.FINAL])
@@ -117,7 +131,11 @@ class GraphAgentTests(baseline.AgentTests):
                 expected = original.run(self.request)
                 actual = self.run_script(script, max_steps=2)
                 self.assertEqual(actual, expected)
-                self.assertEqual(self.provider.requests, original_provider.requests)
+                # LangGraph adds server-selected, citable policy context; the
+                # legacy loop deliberately remains unchanged.
+                graph_context = json.loads(self.provider.requests[0].messages[-1].content)
+                self.assertIn("grounded_policy_evidence", graph_context)
+                self.assertTrue(graph_context["grounded_policy_evidence"]["policy_passages"])
 
     def test_proposal_behavioral_parity_ignoring_server_ids_and_timestamps(self):
         now = datetime.now(timezone.utc)

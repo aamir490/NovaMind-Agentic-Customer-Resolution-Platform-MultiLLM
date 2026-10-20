@@ -120,7 +120,9 @@ class IntakeTestBase(unittest.TestCase):
         ))
 
     def post_my_case(self, token, body):
-        return self.client.post("/api/my/cases", headers=self.hdrs(token), json=body)
+        headers = self.hdrs(token)
+        headers["Idempotency-Key"] = str(uuid4())
+        return self.client.post("/api/my/cases", headers=headers, json=body)
 
     def valid_body(self, order_id):
         return {

@@ -1,6 +1,8 @@
 """Local interrupt/resume workflow. Human review is never exposed to the LLM."""
 
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from threading import RLock
 from typing import Callable, Literal
 from uuid import UUID, uuid4
@@ -12,7 +14,10 @@ from langgraph.types import Command, interrupt
 from langsmith import tracing_context
 from pydantic import ConfigDict, ValidationError
 
-from .agent import AgentConfig, AgentRequest, AgentResult, AuditEntry, Contract
+from .agent import (
+    AgentConfig, AgentRequest, AgentResult, AuditEntry, Contract,
+    agent_request_fingerprint,
+)
 from .domain import Description
 from .graph_agent import GraphResolutionAgent, GraphState
 from .llm import StructuredLLM
@@ -22,6 +27,10 @@ from .tools import LocalTools
 from .conversations import ConversationService, ConversationError, finish_memory
 from .security import Role, current_identity, require_roles
 from .observability import observed
+from .workflow_metadata import (
+    WorkflowMetadataRepository, WorkflowMetadataStatus, WorkflowRunReservation,
+)
+from .resolution_drafts import ResolutionDraft
 
 
 class ReviewRequired(Contract):
@@ -74,6 +83,7 @@ class WorkflowResult(Contract):
     review: ReviewRequired | None = None
     reviewed_status: Literal["APPROVED", "REJECTED"] | None = None
     agent_result: AgentResult | None = None
+    resolution_draft: ResolutionDraft | None = None
     error: str | None = None
     actions_executed: Literal[False] = False
 
@@ -86,12 +96,19 @@ class ResumeRejected(Contract):
 class HITLWorkflow:
     def __init__(self, llm: StructuredLLM, tools: LocalTools, proposals: ProposalService,
                  config: AgentConfig | None = None, *, memory: ConversationService | None = None,
-                 on_transition: Callable[[str, str, HITLState], None] | None = None) -> None:
+                 on_transition: Callable[[str, str, HITLState], None] | None = None,
+                 checkpointer=None,
+                 workflow_metadata: WorkflowMetadataRepository | None = None,
+                 provider_label: Literal["local_scripted", "bedrock"] = "local_scripted") -> None:
+        if (checkpointer is None) != (workflow_metadata is None):
+            raise ValueError("Durable checkpoints require durable workflow metadata")
         self._config = config or AgentConfig()
         self._baseline = GraphResolutionAgent(llm, tools, self._config, memory=memory)
         self._memory = memory
         self._on_transition = on_transition
         self._proposals = proposals
+        self._workflow_metadata = workflow_metadata
+        self._provider_label = provider_label
         self._lock = RLock()
         self._runs: dict[UUID, str] = {}
         graph = StateGraph(HITLState)
@@ -115,7 +132,37 @@ class HITLWorkflow:
         graph.add_edge("human_review", END)
         graph.add_edge("finalize", END)
         graph.add_edge("fail_safely", END)
-        self._graph = graph.compile(checkpointer=InMemorySaver())
+        self._graph = graph.compile(checkpointer=checkpointer or InMemorySaver())
+
+    @staticmethod
+    def _fingerprint(request: AgentRequest) -> str:
+        """Hash request data for durable metadata without storing customer text."""
+        return agent_request_fingerprint(request)
+
+    def _transition_metadata(self, workflow_id: UUID, target: WorkflowMetadataStatus) -> None:
+        if self._workflow_metadata is None:
+            return
+        run = self._workflow_metadata.get(workflow_id)
+        if run.status == target:
+            return
+        self._workflow_metadata.transition(
+            workflow_id, owner_user_id=run.owner_user_id, case_id=run.case_id,
+            expected_status=run.status, status=target,
+        )
+
+    def _mark_recovery_or_failure(self, workflow_id: UUID) -> None:
+        if self._workflow_metadata is None:
+            return
+        try:
+            run = self._workflow_metadata.get(workflow_id)
+            if run.status in (WorkflowMetadataStatus.RUNNING, WorkflowMetadataStatus.RESUMING):
+                self._transition_metadata(workflow_id, WorkflowMetadataStatus.FAILED)
+            elif run.status == WorkflowMetadataStatus.REVIEW_REQUIRED:
+                self._transition_metadata(workflow_id, WorkflowMetadataStatus.RECOVERY_REQUIRED)
+        except Exception:
+            # Metadata failure must never cause an automatic retry of a possibly
+            # committed proposal/review operation.
+            pass
 
     def _instrument(self, name, node):
         # Trusted, passive host callback. Sink failures cannot affect graph decisions
@@ -200,11 +247,18 @@ class HITLWorkflow:
         review = ReviewRequired(workflow_id=state.workflow_id, case_id=live.case_id,
             proposal_id=live.id, review_id=uuid4(), action=live.action, rationale=live.rationale)
         try:
+            if self._workflow_metadata is not None:
+                run = self._workflow_metadata.get(review.workflow_id)
+                if run.case_id != review.case_id:
+                    return self._failure(state, "PROPOSAL_CHANGED")
+                if run.status != WorkflowMetadataStatus.REVIEW_REQUIRED:
+                    self._transition_metadata(review.workflow_id, WorkflowMetadataStatus.REVIEW_REQUIRED)
             self._proposals.bind_workflow_review(
                 live.id, workflow_id=review.workflow_id, case_id=review.case_id,
                 review_id=review.review_id,
             )
-        except ConflictError:
+        except Exception:
+            self._mark_recovery_or_failure(review.workflow_id)
             return self._failure(state, "PROPOSAL_CHANGED")
         agent = GraphState.model_validate({**state.agent.model_dump(), "error": None})
         return self._update(state, review=review, agent=agent, audit=(*state.audit,
@@ -252,6 +306,7 @@ class HITLWorkflow:
             except Exception:
                 # Never retry a possibly committed review automatically.
                 self._runs[workflow_id] = "FAILED"
+                self._mark_recovery_or_failure(workflow_id)
                 snapshot = self._graph.get_state(config)
                 if snapshot.values:
                     state = HITLState.model_validate(snapshot.values)
@@ -275,6 +330,9 @@ class HITLWorkflow:
                 status="FAILED" if agent_result is None or agent_result.error else "COMPLETED",
                 agent_result=agent_result, error=agent_result.error if agent_result else "WORKFLOW_ERROR",
                 message=agent_result.customer_response if agent_result else "Workflow stopped. No action was executed.")
+        # The draft is built from verified application records before the LLM
+        # runs, so it remains available even while a proposal is paused for HITL.
+        result = result.model_copy(update={"resolution_draft": state.agent.resolution_draft})
         if state.agent.memory_started:
             result = result.model_copy(update={"conversation_id": state.agent.request.conversation_id})
             try:
@@ -286,14 +344,38 @@ class HITLWorkflow:
                 result = result.model_copy(update={"error": failure.code,
                     "message": result.message + " Conversation response could not be saved; do not replay the operation."})
         self._runs[workflow_id] = result.status
+        if self._workflow_metadata is not None:
+            try:
+                if result.status == "COMPLETED":
+                    self._transition_metadata(workflow_id, WorkflowMetadataStatus.COMPLETED)
+                elif result.status == "FAILED":
+                    self._mark_recovery_or_failure(workflow_id)
+                elif result.status == "REVIEW_REQUIRED":
+                    run = self._workflow_metadata.get(workflow_id)
+                    if run.status != WorkflowMetadataStatus.REVIEW_REQUIRED:
+                        self._mark_recovery_or_failure(workflow_id)
+                elif result.status == "REVIEWED":
+                    run = self._workflow_metadata.get(workflow_id)
+                    if run.status != WorkflowMetadataStatus.REVIEWED:
+                        self._mark_recovery_or_failure(workflow_id)
+            except Exception:
+                self._mark_recovery_or_failure(workflow_id)
         return result
 
     @observed("hitl.start")
-    def start(self, request: AgentRequest) -> WorkflowResult:
-        current_identity()
+    def start(self, request: AgentRequest, *, workflow_id: UUID | None = None,
+              run_id: UUID | None = None, request_id: UUID | None = None) -> WorkflowResult:
+        """Start a workflow; durable hosts may supply their already-issued IDs."""
+        identity = current_identity()
         request = AgentRequest.model_validate(request)
         with self._lock:
-            workflow_id = uuid4()
+            workflow_id = workflow_id or uuid4()
+            if self._workflow_metadata is not None:
+                self._workflow_metadata.reserve(WorkflowRunReservation(
+                    workflow_id=workflow_id, run_id=run_id or uuid4(), case_id=request.case_id,
+                    owner_user_id=identity.user_id, request_id=request_id or uuid4(),
+                    request_fingerprint=self._fingerprint(request), provider=self._provider_label,
+                ))
             self._runs[workflow_id] = "RUNNING"
             return self._drive(workflow_id, {"workflow_id": str(workflow_id),
                                           "agent": GraphState(request=request).model_dump(mode="json")})
@@ -306,10 +388,18 @@ class HITLWorkflow:
         except ValidationError:
             return ResumeRejected(error="INVALID_INPUT")
         with self._lock:
-            if decision.workflow_id not in self._runs:
-                return ResumeRejected(error="UNKNOWN_WORKFLOW")
-            if self._runs[decision.workflow_id] != "REVIEW_REQUIRED":
-                return ResumeRejected(error="NOT_PAUSED")
+            if self._workflow_metadata is not None:
+                try:
+                    run = self._workflow_metadata.get(decision.workflow_id)
+                except NotFoundError:
+                    return ResumeRejected(error="UNKNOWN_WORKFLOW")
+                if run.status != WorkflowMetadataStatus.REVIEW_REQUIRED:
+                    return ResumeRejected(error="NOT_PAUSED")
+            else:
+                if decision.workflow_id not in self._runs:
+                    return ResumeRejected(error="UNKNOWN_WORKFLOW")
+                if self._runs[decision.workflow_id] != "REVIEW_REQUIRED":
+                    return ResumeRejected(error="NOT_PAUSED")
             with tracing_context(enabled=False):
                 snapshot = self._graph.get_state(self._runtime_config(decision.workflow_id))
             state = HITLState.model_validate(snapshot.values)
@@ -328,6 +418,11 @@ class HITLWorkflow:
                 return ResumeRejected(error="REVIEW_MISMATCH")
             if proposal.status != ProposalStatus.PENDING_REVIEW:
                 return ResumeRejected(error="ALREADY_REVIEWED")
+            if self._workflow_metadata is not None:
+                try:
+                    self._transition_metadata(decision.workflow_id, WorkflowMetadataStatus.RESUMING)
+                except Exception:
+                    return ResumeRejected(error="NOT_PAUSED")
             self._runs[decision.workflow_id] = "RESUMING"
             return self._drive(decision.workflow_id, Command(resume=decision.model_dump(mode="json")))
 
@@ -335,7 +430,12 @@ class HITLWorkflow:
         """Local diagnostic history, separate from the minimal reviewer payload."""
         require_roles(Role.REVIEWER, Role.ADMIN)
         with self._lock, tracing_context(enabled=False):
-            if workflow_id not in self._runs:
+            if self._workflow_metadata is not None:
+                try:
+                    self._workflow_metadata.get(workflow_id)
+                except NotFoundError:
+                    raise KeyError("Unknown workflow") from None
+            elif workflow_id not in self._runs:
                 raise KeyError("Unknown workflow")
             state = HITLState.model_validate(self._graph.get_state(self._runtime_config(workflow_id)).values)
             return tuple(event.model_copy(deep=True) for event in state.audit)

@@ -16,6 +16,11 @@ from .conversations import (ConversationService, ConversationError,
 from .security import SecurityError
 from .guardrails import GuardrailError, check_payload
 from .observability import observed
+from .resolution_drafts import InvestigationPlan, ResolutionDraft, build_investigation_plan
+from .evidence_grounding import (
+    EvidenceGrounding, GroundedResponse, apply_grounded_response,
+    build_evidence_grounding, policy_query_for,
+)
 
 
 class GraphState(Contract):
@@ -31,6 +36,13 @@ class GraphState(Contract):
     created: bool = False
     refund_requested: bool = False
     refund_outcome: str | None = None
+    resolution_draft: ResolutionDraft | None = None
+    model_resolution_draft: ResolutionDraft | None = None
+    investigation_plan: InvestigationPlan | None = None
+    model_investigation_plan: InvestigationPlan | None = None
+    knowledge_grounding: EvidenceGrounding | None = None
+    generated_resolution_draft: ResolutionDraft | None = None
+    tool_calls: int = Field(default=0, strict=True, ge=0, le=32)
     error: str | None = None
     final_result: AgentResult | None = None
     node_path: tuple[str, ...] = ()
@@ -116,25 +128,68 @@ class GraphResolutionAgent:
         if not result.ok:
             return self._update(state, "load_case", staged_event=event, error=result.error.code)
         try:
+            resolution_draft = self._tools.build_resolution_draft(
+                state.request.case_id, state.request.message,
+            )
+            investigation_plan = build_investigation_plan(
+                resolution_draft,
+                request_text=" ".join((result.data.subject, result.data.description, state.request.message)),
+                refund_requested=state.request.resolution_intent == "refund",
+                max_tool_calls=self._config.max_steps,
+            )
+        except Exception:
+            resolution_draft = None
+            investigation_plan = None
+        try:
             check_payload(state.request.model_dump(mode="json"))
+            if resolution_draft is None:
+                raise ValueError("Resolution draft is unavailable")
+            knowledge_grounding = build_evidence_grounding(
+                resolution_draft,
+                self._tools.retrieve_grounded_policy(policy_query_for(resolution_draft.issue_type)),
+            )
+        except SecurityError as failure:
+            return self._update(state, "load_case", history=(event,), error=failure.code,
+                                staged_event=AuditEntry(step=0, error=failure.code))
+        except GuardrailError as failure:
+            return self._update(state, "load_case", history=(event,), error=failure.code,
+                                staged_event=AuditEntry(step=0, error=failure.code))
+        except Exception:
+            # Do not proceed to model reasoning without citable application-owned
+            # policy context.  No citation can be fabricated on this path.
+            return self._update(state, "load_case", history=(event,), error="KNOWLEDGE_UNAVAILABLE",
+                                staged_event=AuditEntry(step=0, error="KNOWLEDGE_UNAVAILABLE"))
+        try:
             conversation_id, memory_context = begin_memory(
                 self._memory, state.request.conversation_id, state.request.case_id, state.request.message)
         except (ConversationError, SecurityError, GuardrailError) as failure:
             return self._update(state, "load_case", history=(event,), error=failure.code,
                                 staged_event=AuditEntry(step=0, error=failure.code))
         request = AgentRequest(**{**state.request.model_dump(), "conversation_id": conversation_id})
-        descriptions = self._tools.describe()
+        # The provider receives only schemas authorized by the immutable plan.
+        # Server-side dispatch still checks the same allowlist independently.
+        all_descriptions = self._tools.describe()
+        descriptions = [item for item in all_descriptions if (
+            investigation_plan is None or item.name in investigation_plan.allowed_tools
+        )]
         instructions = agent_instructions(descriptions)
         messages = [LLMMessage(role="system", content=instructions)]
         if memory_context is not None:
             messages.append(LLMMessage(role="user", content=memory_context))
         messages.append(LLMMessage(role="user", content=json.dumps({
             "request": request.model_dump(mode="json"), "case_result": result.model_dump(mode="json"),
+            "grounded_resolution_draft": (resolution_draft.model_dump(mode="json")
+                                          if resolution_draft is not None else None),
+            "grounded_investigation_plan": (investigation_plan.model_dump(mode="json")
+                                              if investigation_plan is not None else None),
+            "grounded_policy_evidence": knowledge_grounding.model_dump(mode="json"),
         })))
         return self._update(state, "load_case", history=(event,), request=request,
                             memory_started=conversation_id is not None,
                             refund_requested=request.resolution_intent == "refund",
-                            allowed_names=tuple(item.name for item in descriptions), messages=tuple(messages))
+                            allowed_names=tuple(item.name for item in descriptions), messages=tuple(messages),
+                            resolution_draft=resolution_draft, investigation_plan=investigation_plan,
+                            knowledge_grounding=knowledge_grounding)
 
     @staticmethod
     def _after_load_case(state: GraphState) -> str:
@@ -231,27 +286,41 @@ class GraphResolutionAgent:
         if not answer.ok:
             return self._update(state, "reason", steps=step, error=answer.code,
                                 staged_event=AuditEntry(step=step, llm_failure=answer))
-        return self._update(state, "reason", steps=step, decision=answer.data.decision)
+        changes = {"steps": step, "decision": answer.data.decision}
+        if answer.data.resolution_draft == state.resolution_draft:
+            changes["model_resolution_draft"] = answer.data.resolution_draft
+        if answer.data.investigation_plan == state.investigation_plan:
+            changes["model_investigation_plan"] = answer.data.investigation_plan
+        generated = (apply_grounded_response(
+            state.resolution_draft, state.knowledge_grounding, answer.data.grounded_response,
+        ) if state.resolution_draft is not None and state.knowledge_grounding is not None else None)
+        if generated is not None:
+            changes["generated_resolution_draft"] = generated
+        return self._update(state, "reason", **changes)
 
     def _execute_tool(self, state: GraphState) -> dict:
         call = state.decision
+        # A proposal is always for the immutable, authorized request case.  The
+        # model may choose a proposed action and rationale, but never its target.
+        if isinstance(call, ToolCall) and call.name == "create_resolution_proposal":
+            call = call.model_copy(update={"arguments": {
+                **call.arguments, "case_id": str(state.request.case_id),
+            }})
         error = None
         if not isinstance(call, ToolCall):
             error = "INVALID_RESPONSE"
         elif call.name not in state.allowed_names:
             error = "UNKNOWN_TOOL"
+        elif (state.investigation_plan is not None
+              and call.name not in state.investigation_plan.allowed_tools):
+            error = "UNKNOWN_TOOL"
+        elif state.investigation_plan is not None and state.tool_calls >= state.investigation_plan.max_tool_calls:
+            error = "STEP_LIMIT"
         elif call.name == "create_resolution_proposal":
             if state.created:
                 error = "PROPOSAL_LIMIT"
             elif call.arguments.get("action") in ("refund", "refund_investigation") and not state.refund_requested:
                 error = "REFUND_INTENT_REQUIRED"
-            else:
-                try:
-                    same_case = UUID(str(call.arguments.get("case_id"))) == state.request.case_id
-                except ValueError:
-                    same_case = False
-                if not same_case:
-                    error = "CASE_MISMATCH"
         if error:
             return self._update(state, "execute_tool", error=error,
                                 staged_event=AuditEntry(step=state.steps, decision=call, error=error))
@@ -276,6 +345,7 @@ class GraphResolutionAgent:
             return self._update(state, "record_result", **changes, error="GRAPH_ERROR")
         if not result.ok:
             return self._update(state, "record_result", **changes, error=result.error.code)
+        changes["tool_calls"] = state.tool_calls + 1
         call = event.decision
         if call.name in ("create_resolution_proposal", "get_proposal_status"):
             record = result.data.model_dump(mode="json")
@@ -308,7 +378,14 @@ class GraphResolutionAgent:
         return AgentResult(status="FAILED" if error else "HUMAN_REVIEW_REQUIRED" if ids else "INFORMATIONAL",
                            conversation_id=state.request.conversation_id if state.memory_started else None,
                            customer_response=message, steps_used=state.steps, history=history,
-                           pending_proposal_ids=ids, error=error)
+                           pending_proposal_ids=ids,
+                           resolution_draft=(state.model_resolution_draft
+                                             if state.model_resolution_draft == state.resolution_draft
+                                             else (state.generated_resolution_draft or state.resolution_draft)),
+                           investigation_plan=(state.model_investigation_plan
+                                               if state.model_investigation_plan == state.investigation_plan
+                                               else state.investigation_plan),
+                           error=error)
 
     def _finalize(self, state: GraphState) -> dict:
         history = (*state.history, AuditEntry(step=state.steps, decision=state.decision))

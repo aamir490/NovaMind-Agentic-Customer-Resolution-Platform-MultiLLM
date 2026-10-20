@@ -13,11 +13,13 @@ Security contract
 - The existing POST /api/cases (admin/staff) route is untouched.
 """
 
+from datetime import datetime, timezone
 from typing import Annotated
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Request
 
-from .domain import SupportCase
+from .domain import CaseStatus, SupportCase
 from .routes import Service
 from .schemas import CaseCreate, CustomerCaseCreate
 from .security import Authorization, Role, require_roles
@@ -26,7 +28,8 @@ router = APIRouter(prefix="/api/my", tags=["customer-cases"])
 
 
 @router.post("/cases", response_model=SupportCase, status_code=201)
-def create_my_case(body: CustomerCaseCreate, service: Service) -> SupportCase:
+def create_my_case(body: CustomerCaseCreate, request: Request, service: Service,
+                   idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")]) -> SupportCase:
     """
     Create a support case for the authenticated customer.
 
@@ -54,4 +57,21 @@ def create_my_case(body: CustomerCaseCreate, service: Service) -> SupportCase:
         subject=body.subject,
         description=body.description,
     )
+    jobs = request.app.state.investigation_jobs
+    if jobs is not None:
+        timestamp = datetime.now(timezone.utc)
+        support_case = SupportCase(
+            id=uuid4(), status=CaseStatus.OPEN, created_at=timestamp, updated_at=timestamp,
+            **case_input.model_dump(),
+        )
+        persisted, job, created = jobs.submit(
+            support_case, owner_user_id=identity.user_id, idempotency_key=idempotency_key,
+        )
+        # The dispatcher is explicitly server-configured and is default-off.
+        # Dispatch only the just-created job: duplicate customer retries and
+        # process restarts must never replay an attempt.
+        dispatcher = request.app.state.investigation_dispatcher
+        if created and dispatcher is not None:
+            dispatcher.submit(job.id)
+        return persisted
     return service.create_case(case_input)

@@ -257,9 +257,15 @@ class ConversationTests(unittest.TestCase):
         for change in ({"status": "APPROVED"}, {"reviewer_name": "Admin"}):
             result, _ = self.run_agent(script=[self.proposal(**change)])
             self.assertEqual(result.error, "INVALID_INPUT")
-        result, _ = self.run_agent(script=[self.proposal(case_id=str(self.other_case().id))])
-        self.assertEqual(result.error, "CASE_MISMATCH")
-        self.assertEqual(self.proposals.list_for_case(self.case.id), [])
+        other = self.other_case()
+        result, provider = self.run_agent(script=[self.proposal(case_id=str(other.id)), baseline.FINAL])
+        self.assertEqual((result.status, result.error), ("HUMAN_REVIEW_REQUIRED", None))
+        self.assertEqual(len(provider.requests), 2)
+        self.assertFalse(result.actions_executed)
+        self.assertEqual(len(result.pending_proposal_ids), 1)
+        proposal = self.proposals.get(result.pending_proposal_ids[0])
+        self.assertEqual(proposal.case_id, self.case.id)
+        self.assertEqual(self.proposals.list_for_case(other.id), [])
         self.assertEqual(self.cases.get_order(self.order.id), self.order)
         self.assertEqual(self.app.state.business_operations.get_inventory("LAP-1").available_quantity, 5)
 
@@ -347,9 +353,11 @@ class ConversationTests(unittest.TestCase):
     def test_rag_failure_and_step_budget_remain_safe_with_memory(self):
         retriever = Mock()
         retriever.search.side_effect = RuntimeError("secret")
+        healthy_tools = self.tools
         self.tools = LocalTools(self.cases, self.app.state.business_operations, self.proposals, retriever)
         result, _ = self.run_agent(script=[baseline.call("search_knowledge", query="photo")])
         self.assertEqual(result.error, "KNOWLEDGE_UNAVAILABLE")
+        self.tools = healthy_tools
         result, provider = self.run_agent(script=[baseline.call("get_inventory", sku="LAP-1")], config=AgentConfig(max_steps=1))
         self.assertEqual(result.error, "STEP_LIMIT")
         self.assertEqual(len(provider.requests), 1)

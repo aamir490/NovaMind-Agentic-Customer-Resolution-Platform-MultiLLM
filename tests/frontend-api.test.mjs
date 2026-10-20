@@ -79,8 +79,57 @@ test('identity and run snapshots accept Bedrock and scripted labels but reject r
     assert.equal((await api.identity()).provider, provider);
     assert.equal((await api.startRun({ instance_id, request_id: id(5), case_id, message: 'Review' })).provider, provider);
   }
-  identity.provider = 'groq';
+  identity.provider = 'unsupported';
   await assert.rejects(api.identity(), /Unexpected identity response/);
-  snapshot.provider = 'groq';
+  snapshot.provider = 'unsupported';
   await assert.rejects(api.startRun({ instance_id, request_id: id(5), case_id, message: 'Review' }), /invalid run snapshot/);
+});
+
+test('admin resolution sends an explicit human decision without actor or AI execution fields', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1);
+  const decision = { action: 'APPROVE_REPLACEMENT', reason: 'Verified damage from supplied evidence.',
+    customer_message: 'Your replacement request has been approved.', admin_user_id: id(2),
+    decided_at: '2026-10-19T00:00:00Z' };
+  const calls = [];
+  const api = createApi(async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, json: async () => ({ case: { id: caseId, status: 'resolved' }, latest: decision,
+      history: [decision] }) };
+  });
+  const result = await api.resolveCase(caseId, { action: decision.action, reason: decision.reason,
+    customerMessage: decision.customer_message, evidenceReviewed: true });
+  assert.equal(result.case.status, 'resolved');
+  assert.equal(result.latest.adminUserId, id(2));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `/api/cases/${caseId}/resolution`);
+  assert.equal(calls[0].options.method, 'POST');
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    action: 'APPROVE_REPLACEMENT', reason: decision.reason,
+    customer_message: decision.customer_message, evidence_reviewed: true,
+  });
+});
+
+test('admin draft projection is bounded and never accepts an executed action', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1);
+  const draft = { issue_type: 'delayed_delivery', recommended_decision: 'ESCALATE',
+    verified_facts: ['order_id:00000000-0000-4000-8000-000000000002'],
+    missing_evidence: ['trusted shipment tracking status'],
+    decision_reason: 'Tracking evidence is required before a delivery conclusion.',
+    customer_facing_response: 'We are escalating this request for review.', actions_executed: false };
+  const calls = [];
+  const api = createApi(async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, json: async () => draft };
+  });
+  assert.deepEqual(await api.caseResolutionDraft(caseId), {
+    issueType: 'delayed_delivery', recommendedDecision: 'ESCALATE',
+    verifiedFacts: draft.verified_facts, missingEvidence: draft.missing_evidence,
+    decisionReason: draft.decision_reason, customerFacingResponse: draft.customer_facing_response,
+  });
+  assert.equal(calls[0].url, `/api/cases/${caseId}/resolution-draft`);
+  assert.equal(calls[0].options.method, 'GET');
+  draft.actions_executed = true;
+  await assert.rejects(api.caseResolutionDraft(caseId), /invalid resolution draft/);
 });

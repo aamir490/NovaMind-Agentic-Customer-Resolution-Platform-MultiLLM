@@ -67,7 +67,8 @@ class DomainTests(unittest.TestCase):
             OrderCreate(customer_id=self.customer.id, items=[])
 
     def test_complete_transition_matrix(self):
-        allowed = {("open", "in_review"), ("open", "escalated"), ("in_review", "escalated")}
+        allowed = {("open", "in_review"), ("open", "escalated"),
+                   ("in_review", "escalated"), ("in_review", "resolved")}
         for current in CaseStatus:
             for target in CaseStatus:
                 with self.subTest(current=current, target=target):

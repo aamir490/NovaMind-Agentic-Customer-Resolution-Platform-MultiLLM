@@ -301,7 +301,7 @@ export default function AIWorkspace({ api, identity }) {
             <h2 id="run-request-title">Start a resolution run</h2>
           </div>
           <span className={`ai-provider-badge ${identity.provider === 'unavailable' ? 'ai-provider-badge--unavailable' : ''}`}>
-            {identity.provider === 'groq' ? 'Groq' : identity.provider === 'bedrock' ? 'Amazon Bedrock'
+            {identity.provider === 'bedrock' ? 'Amazon Bedrock'
               : identity.provider === 'local_scripted' ? 'Local scripted' : 'Provider unavailable'}
           </span>
         </div>
@@ -521,8 +521,8 @@ export default function AIWorkspace({ api, identity }) {
                 {snapshot.workflow_id && <div><dt>Workflow ID</dt><dd className="case-mono">{snapshot.workflow_id}</dd></div>}
                 {snapshot.conversation_id && <div><dt>Conversation ID</dt><dd className="case-mono">{snapshot.conversation_id}</dd></div>}
                 {snapshot.trace_id && <div><dt>Trace ID</dt><dd className="case-mono">{snapshot.trace_id}</dd></div>}
-                <div><dt>Provider</dt><dd>{snapshot.provider === 'groq' ? 'Groq'
-                  : snapshot.provider === 'bedrock' ? 'Amazon Bedrock' : 'Local scripted'}</dd></div>
+                <div><dt>Provider</dt><dd>{snapshot.provider === 'bedrock'
+                  ? 'Amazon Bedrock' : 'Local scripted'}</dd></div>
                 <div><dt>Created</dt><dd><time dateTime={snapshot.created_at}>{snapshot.created_at}</time></dd></div>
                 <div><dt>Updated</dt><dd><time dateTime={snapshot.updated_at}>{snapshot.updated_at}</time></dd></div>
               </dl>

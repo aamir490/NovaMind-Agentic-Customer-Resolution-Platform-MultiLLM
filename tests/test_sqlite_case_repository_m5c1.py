@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from uuid import uuid4
 
-from backend.app.domain import Customer, Order, OrderItem
-from backend.app.persistence import SQLiteCaseRepository, SQLitePersistence
+from backend.app.domain import CaseStatus, Customer, Order, OrderItem, ResolutionAction
+from backend.app.persistence import PersistenceError, SQLiteCaseRepository, SQLitePersistence
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 from backend.app.service import CaseService, ConflictError, NotFoundError
 
@@ -81,6 +81,107 @@ class SQLiteCaseRepositoryTests(unittest.TestCase):
         service = CaseService()
         customer = service.create_customer(CustomerCreate(name="In-memory default"))
         self.assertEqual(service.get_customer(customer.id), customer)
+
+    def test_admin_resolution_persists_resolved_status(self):
+        service = self.service(initialize=True)
+        customer = service.create_customer(CustomerCreate(name="Resolution owner"))
+        order = service.create_order(self.order_request(customer.id))
+        case = service.create_case(CaseCreate(
+            customer_id=customer.id, order_id=order.id,
+            subject="Damaged item", description="The delivered laptop has visible damage.",
+        ))
+        service.update_status(case.id, CaseStatus.IN_REVIEW)
+
+        resolved, _decision = service.resolve_case(
+            case.id, action=ResolutionAction.DECLINE_REPLACEMENT,
+            reason="Evidence does not support replacement.",
+            customer_message="Please provide additional photos if you would like us to reassess.",
+            admin_user_id=uuid4(), evidence_reviewed=False,
+        )
+
+        self.assertEqual(resolved.status, CaseStatus.RESOLVED)
+        self.assertEqual(self.service().get_case(case.id).status, CaseStatus.RESOLVED)
+
+    def test_resolution_history_is_ordered_and_survives_recreation(self):
+        service = self.service(initialize=True)
+        customer = service.create_customer(CustomerCreate(name="History owner"))
+        order = service.create_order(self.order_request(customer.id))
+        case = service.create_case(CaseCreate(
+            customer_id=customer.id, order_id=order.id,
+            subject="Damaged item", description="The delivered laptop has visible damage.",
+        ))
+        requested, first = service.resolve_case(
+            case.id, action=ResolutionAction.REQUEST_MORE_EVIDENCE,
+            reason="Additional photos are required.",
+            customer_message="Please upload clear photos of the damage.",
+            admin_user_id=uuid4(), evidence_reviewed=False,
+        )
+        resolved, second = service.resolve_case(
+            case.id, action=ResolutionAction.APPROVE_REPLACEMENT,
+            reason="The submitted photos confirm transit damage.",
+            customer_message="Your replacement request has been approved.",
+            admin_user_id=uuid4(), evidence_reviewed=True,
+        )
+
+        reopened = self.service()
+        self.assertEqual(requested.status, CaseStatus.IN_REVIEW)
+        self.assertEqual(resolved.status, CaseStatus.RESOLVED)
+        self.assertEqual(reopened.get_case(case.id), resolved)
+        self.assertEqual(reopened.resolution_history(case.id), (first, second))
+
+    def test_decision_insert_failure_rolls_back_status_and_history(self):
+        service = self.service(initialize=True)
+        customer = service.create_customer(CustomerCreate(name="Rollback owner"))
+        order = service.create_order(self.order_request(customer.id))
+        case = service.create_case(CaseCreate(
+            customer_id=customer.id, order_id=order.id,
+            subject="Damaged item", description="The delivered laptop has visible damage.",
+        ))
+        service.update_status(case.id, CaseStatus.IN_REVIEW)
+        store = SQLitePersistence(self.path)
+        with store.transaction() as connection:
+            connection.execute(
+                """CREATE TRIGGER reject_case_resolution_decision
+                   BEFORE INSERT ON case_resolution_decisions
+                   BEGIN SELECT RAISE(ABORT, 'forced decision insert failure'); END"""
+            )
+
+        with self.assertRaises(PersistenceError):
+            service.resolve_case(
+                case.id, action=ResolutionAction.DECLINE_REPLACEMENT,
+                reason="The evidence does not support replacement.",
+                customer_message="Please submit additional evidence for reassessment.",
+                admin_user_id=uuid4(), evidence_reviewed=False,
+            )
+
+        reopened = self.service()
+        self.assertEqual(reopened.get_case(case.id).status, CaseStatus.IN_REVIEW)
+        self.assertEqual(reopened.resolution_history(case.id), ())
+
+    def test_duplicate_final_resolution_does_not_create_another_decision(self):
+        service = self.service(initialize=True)
+        customer = service.create_customer(CustomerCreate(name="Duplicate owner"))
+        order = service.create_order(self.order_request(customer.id))
+        case = service.create_case(CaseCreate(
+            customer_id=customer.id, order_id=order.id,
+            subject="Damaged item", description="The delivered laptop has visible damage.",
+        ))
+        service.update_status(case.id, CaseStatus.IN_REVIEW)
+        _resolved, decision = service.resolve_case(
+            case.id, action=ResolutionAction.DECLINE_REPLACEMENT,
+            reason="The evidence does not support replacement.",
+            customer_message="Please submit additional evidence for reassessment.",
+            admin_user_id=uuid4(), evidence_reviewed=False,
+        )
+
+        with self.assertRaises(ConflictError):
+            service.resolve_case(
+                case.id, action=ResolutionAction.DECLINE_REPLACEMENT,
+                reason="The evidence does not support replacement.",
+                customer_message="Please submit additional evidence for reassessment.",
+                admin_user_id=uuid4(), evidence_reviewed=False,
+            )
+        self.assertEqual(self.service().resolution_history(case.id), (decision,))
 
 
 if __name__ == "__main__":

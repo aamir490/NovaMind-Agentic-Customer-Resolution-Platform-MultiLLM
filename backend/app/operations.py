@@ -207,6 +207,20 @@ class BusinessOperations:
             raise NotFoundError("Policy not found")
         return self._policies[policy_id]
 
+    def has_trusted_delivery_evidence(self, case_id: UUID) -> bool:
+        """Return only evidence availability for a case; never expose a fact to a model."""
+        case = self._cases.get_case(case_id)
+        order = self._cases.get_order(case.order_id)
+        for item in order.items:
+            if self._evidence_repository is not None:
+                fact = self._evidence_repository.get_delivery_fact(case.id, item.sku)
+            else:
+                with self._evidence_lock:
+                    fact = self._delivery_facts.get((case.id, item.sku))
+            if fact is not None:
+                return True
+        return False
+
     @observed("eligibility")
     def check_eligibility(self, order_id: UUID, request: EligibilityInput,
                           *, case_id: UUID | None = None) -> EligibilityResult:

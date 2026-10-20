@@ -94,7 +94,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(updated["status"], "in_review")
         self.assertEqual(self.request("PATCH", path, {"status": "in_review"}), (200, updated))
         self.assertEqual(self.request("PATCH", path, {"status": "open"})[0], 409)
-        self.assertEqual(self.request("PATCH", path, {"status": "resolved"})[0], 422)
+        self.assertEqual(self.request("PATCH", path, {"status": "resolved"})[0], 409)
         self.assertEqual(self.request("PATCH", path, {"status": "escalated"})[0], 200)
         self.assertEqual(self.request("PATCH", path, {"status": "in_review"})[0], 409)
 

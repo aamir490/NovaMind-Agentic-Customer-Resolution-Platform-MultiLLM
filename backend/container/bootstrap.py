@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from backend.app.bedrock import BedrockProvider
 from backend.app.domain import Customer
@@ -14,7 +14,9 @@ from backend.app.llm import FakeLLMProvider, LLMResponse
 from backend.app.main import create_app
 from backend.app.operations import AuthoritativeDeliveryFact, TrustedDeliverySource
 from backend.app.schemas import CaseCreate, OrderCreate
-from backend.app.security import LocalAuthenticationProvider, LocalCredential, Role
+from backend.app.security import (
+    AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential, Role,
+)
 
 
 class _OfflineScriptedProvider:
@@ -34,6 +36,12 @@ class _OfflineScriptedProvider:
 
 _OFFLINE_DEMO_SOURCE = TrustedDeliverySource(id="offline-demo-fulfillment")
 _BEDROCK_DEMO_SOURCE = TrustedDeliverySource(id="bedrock-demo-fulfillment")
+_STRANDS_NOVA_LITE_MODEL_IDS = frozenset({
+    "amazon.nova-lite-v1:0",
+    "us.amazon.nova-lite-v1:0",
+    "eu.amazon.nova-lite-v1:0",
+    "apac.amazon.nova-lite-v1:0",
+})
 
 
 def _offline_demo_enabled():
@@ -128,11 +136,57 @@ def _authentication_provider():
     return provider, startup_customers
 
 
+def _sqlite_database_path():
+    """Read an optional, absolute host-managed SQLite location."""
+    location = os.environ.get("NOVAMIND_SQLITE_PATH")
+    if location is None:
+        return None
+    try:
+        path = Path(location)
+        if not location or not path.is_absolute() or (path.exists() and not path.is_file()):
+            raise ValueError("Invalid SQLite path")
+    except Exception:
+        raise RuntimeError("Container SQLite persistence configuration is invalid") from None
+    return path
+
+
+def _automatic_dispatcher_configuration(
+        auth_provider: LocalAuthenticationProvider | None,
+) -> tuple[bool, AuthenticatedIdentity | None]:
+    """Resolve the opt-in dispatcher worker from the server credential registry.
+
+    Environment values select only an already-configured staff subject; they
+    cannot create an identity, read a bearer token, or select a customer.
+    Missing configuration remains disabled.  Any partial or malformed opt-in
+    configuration stops startup rather than silently changing execution mode.
+    """
+    enabled = os.environ.get("NOVAMIND_AUTOMATIC_DISPATCHER")
+    worker_value = os.environ.get("NOVAMIND_DISPATCHER_USER_ID")
+    if enabled is None:
+        if worker_value is not None:
+            raise RuntimeError("Container automatic dispatcher configuration is invalid")
+        return False, None
+    if enabled == "false":
+        if worker_value is not None:
+            raise RuntimeError("Container automatic dispatcher configuration is invalid")
+        return False, None
+    if enabled != "true" or not worker_value or auth_provider is None:
+        raise RuntimeError("Container automatic dispatcher configuration is invalid")
+    try:
+        worker_id = UUID(worker_value)
+        if str(worker_id) != worker_value:
+            raise ValueError("Non-canonical worker ID")
+        identity = auth_provider.identity_for_user_id(worker_id)
+        if identity is None or identity.role not in (Role.REVIEWER, Role.ADMIN):
+            raise ValueError("Dispatcher identity is not staff")
+    except Exception:
+        raise RuntimeError("Container automatic dispatcher configuration is invalid") from None
+    return True, identity
+
+
 def _llm_provider():
     # Reject retired configuration under every selector; never ignore a stale key.
     if any(name.startswith("GEMINI_") for name in os.environ):
-        raise RuntimeError("Container LLM provider selection is invalid")
-    if any(name.startswith("GROQ_") for name in os.environ):
         raise RuntimeError("Container LLM provider selection is invalid")
     selected = os.environ.get("NOVAMIND_LLM_PROVIDER")
     offline = os.environ.get("NOVAMIND_OFFLINE_TESTING")
@@ -148,8 +202,6 @@ def _llm_provider():
         if offline != "true" or cloud_configuration:
             raise RuntimeError("Container offline provider selection is invalid")
         return _OfflineScriptedProvider()
-    if selected == "groq":
-        raise RuntimeError("Container LLM provider selection is invalid")
     if selected == "bedrock":
         if offline is not None:
             raise RuntimeError("Container Bedrock configuration is invalid")
@@ -173,12 +225,48 @@ def _llm_provider():
     raise RuntimeError("Container LLM provider selection is invalid")
 
 
+def _agent_engine():
+    """Read and validate the server-only NOVAMIND_AGENT_ENGINE selector."""
+    engine = os.environ.get("NOVAMIND_AGENT_ENGINE", "langgraph")
+    if engine not in ("langgraph", "strands"):
+        raise RuntimeError("Container agent engine selection is invalid")
+    if engine == "strands" and os.environ.get("NOVAMIND_LLM_PROVIDER") != "bedrock":
+        raise RuntimeError("Container Strands agent engine requires Bedrock provider")
+    if engine == "strands":
+        _strands_model_id()
+    return engine
+
+
+def _strands_model_id():
+    """Return the only Bedrock model IDs approved for the Strands agent."""
+    model_id = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
+    if model_id not in _STRANDS_NOVA_LITE_MODEL_IDS:
+        raise RuntimeError("Container Strands model selection is invalid")
+    return model_id
+
+
+def _strands_model_factory():
+    """Create a Strands BedrockModel for the investigation agent.
+
+    Uses the same AWS_REGION and BEDROCK_MODEL_ID as the Bedrock provider.
+    The Strands SDK is imported lazily so the container starts without it installed.
+    """
+    from strands.models import BedrockModel
+    return BedrockModel(
+        model_id=_strands_model_id(),
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+    )
+
+
 def create_container_app():
     """Absent configuration stays default-deny; invalid configuration stops startup."""
     auth_provider, startup_customers = _authentication_provider()
+    automatic_dispatcher, dispatcher_identity = _automatic_dispatcher_configuration(auth_provider)
+    sqlite_path = _sqlite_database_path()
     offline_demo = _offline_demo_enabled()
     bedrock_demo = _bedrock_demo_enabled()
     provider = _llm_provider()
+    agent_engine = _agent_engine()
     demo_sources = tuple(source for enabled, source in (
         (offline_demo, _OFFLINE_DEMO_SOURCE), (bedrock_demo, _BEDROCK_DEMO_SOURCE),
     ) if enabled)
@@ -187,8 +275,13 @@ def create_container_app():
                          local_provider_factory=(lambda: provider) if provider is not None else None,
                          provider_label=os.environ["NOVAMIND_LLM_PROVIDER"] if provider is not None
                                         else "local_scripted",
+                         agent_engine=agent_engine,
+                         strands_model_factory=_strands_model_factory if agent_engine == "strands" else None,
+                         sqlite_path=sqlite_path,
                          startup_customers=startup_customers,
-                         trusted_delivery_sources=demo_sources)
+                         trusted_delivery_sources=demo_sources,
+                         automatic_dispatcher=automatic_dispatcher,
+                         dispatcher_identity=dispatcher_identity)
         if offline_demo:
             _seed_demo(app, startup_customers, source=_OFFLINE_DEMO_SOURCE,
                        sku="LAP-1", product_name="ProBook Laptop 15",
