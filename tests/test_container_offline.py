@@ -98,7 +98,7 @@ class OfflineContainerTests(unittest.IsolatedAsyncioTestCase):
             customer_id=CUSTOMER_ID, order_id=order.id,
             subject="Offline refund", description="Verify deterministic tracking.",
         ))
-        identity = await self.request(app, "GET", "/api/identity")
+        identity = await self.request(app, "GET", "/api/identity", token=REVIEWER_TOKEN)
         self.assertEqual(identity.status_code, 200)
         self.assertEqual(identity.json()["provider"], "local_scripted")
         body = {
@@ -107,17 +107,17 @@ class OfflineContainerTests(unittest.IsolatedAsyncioTestCase):
             "message": "Check refund eligibility for OFF-1.",
             "resolution_intent": "refund", "refund_sku": "OFF-1",
         }
-        started = await self.request(app, "POST", "/api/runs", body)
+        started = await self.request(app, "POST", "/api/runs", body, token=REVIEWER_TOKEN)
         self.assertEqual(started.status_code, 202, started.text)
         run_id = started.json()["run_id"]
         for _ in range(200):
-            snapshot = await self.request(app, "GET", f"/api/runs/{run_id}")
+            snapshot = await self.request(app, "GET", f"/api/runs/{run_id}", token=REVIEWER_TOKEN)
             if snapshot.json()["status"] not in ("RUNNING", "RESUMING"):
                 break
             await asyncio.sleep(0.01)
         self.assertEqual(snapshot.status_code, 200)
         self.assertNotEqual(snapshot.json()["status"], "RUNNING")
-        events = await self.request(app, "GET", f"/api/runs/{run_id}/events?after=0")
+        events = await self.request(app, "GET", f"/api/runs/{run_id}/events?after=0", token=REVIEWER_TOKEN)
         self.assertEqual(events.status_code, 200, events.text)
         self.assertIn("evaluate_refund", {
             event["node"] for event in events.json()["events"] if event["node"] is not None
@@ -138,17 +138,17 @@ class OfflineContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(eligible.json()["refund_eligible"])
         self.assertEqual(eligible.json()["assessment_basis"], "trusted_delivery_record")
 
-        identity = await self.request(app, "GET", "/api/identity")
+        identity = await self.request(app, "GET", "/api/identity", token=REVIEWER_TOKEN)
         started = await self.request(app, "POST", "/api/runs", {
             "instance_id": identity.json()["instance_id"],
             "request_id": str(uuid4()), "case_id": str(cases[0].id),
             "message": "Request human review of the synthetic LAP-1 refund.",
             "resolution_intent": "refund", "refund_sku": "LAP-1",
-        })
+        }, token=REVIEWER_TOKEN)
         self.assertEqual(started.status_code, 202, started.text)
         run_id = started.json()["run_id"]
         for _ in range(200):
-            snapshot = await self.request(app, "GET", f"/api/runs/{run_id}")
+            snapshot = await self.request(app, "GET", f"/api/runs/{run_id}", token=REVIEWER_TOKEN)
             if snapshot.json()["status"] != "RUNNING":
                 break
             await asyncio.sleep(0.01)

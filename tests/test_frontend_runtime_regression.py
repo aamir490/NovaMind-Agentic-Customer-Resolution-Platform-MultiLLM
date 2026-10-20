@@ -28,7 +28,7 @@ import httpx
 from backend.app.llm import LLMResponse
 from backend.app.main import create_app
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
-from backend.app.security import AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential
+from backend.app.security import AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential, Role
 
 
 class ScriptedProvider:
@@ -71,9 +71,7 @@ class EventsEmptyDequeRegressionTests(unittest.IsolatedAsyncioTestCase):
             CaseCreate(customer_id=customer.id, order_id=order.id,
                        subject="Test case", description="Regression test")
         )
-        identity = AuthenticatedIdentity(
-            user_id=uuid4(), role="CUSTOMER", customer_id=customer.id
-        )
+        identity = AuthenticatedIdentity(user_id=uuid4(), role=Role.REVIEWER)
         token = "regression-test-token-0001"
         self.app.state.auth_provider = LocalAuthenticationProvider(
             (LocalCredential(token=token, identity=identity),)

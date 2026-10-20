@@ -325,17 +325,23 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         path = self.directory / "knowledge.json"
         path.write_text(json.dumps([document.model_dump()]), encoding="utf-8")
         tools = LocalTools(self.cases, self.app.state.business_operations, self.proposals, LocalKnowledgeRetriever(path))
-        script = [baseline.call("search_knowledge", query="invoice"),
-            baseline.call("assess_eligibility", order_id=str(self.orders[0].id), customer_id=str(self.customers[0].id),
+        provider = baseline.ScriptedProvider([baseline.call("search_knowledge", query="invoice")])
+        with self.scope("a"):
+            result = GraphResolutionAgent(StructuredLLM(provider), tools, memory=self.memory).run(self.agent_request())
+        self.assertEqual(result.error, "KNOWLEDGE_UNAVAILABLE")
+        self.assertEqual(provider.requests, [])
+        self.assertNotIn("role=ADMIN", result.model_dump_json())
+
+        script = [baseline.call("assess_eligibility", order_id=str(self.orders[0].id), customer_id=str(self.customers[0].id),
                 sku="LAP-1", quantity=1, days_since_delivery=31, reason="wrong_item", condition="unused"),
             baseline.call("get_proposal_status", proposal_id=str(self.pending[1].id))]
         provider = baseline.ScriptedProvider(script)
         with self.scope("a"):
-            result = GraphResolutionAgent(StructuredLLM(provider), tools, memory=self.memory).run(self.agent_request())
+            result = GraphResolutionAgent(StructuredLLM(provider), self.tools, memory=self.memory).run(self.agent_request())
         self.assertEqual(result.error, "FORBIDDEN")
-        self.assertEqual(result.history[1].result.data.trust, "untrusted_information")
-        self.assertIn("outside_return_window", result.history[2].result.data.denial_reasons)
-        self.assertFalse(result.history[2].result.data.authorization_granted)
+        self.assertEqual(len(provider.requests), 2)
+        self.assertIn("outside_return_window", result.history[1].result.data.denial_reasons)
+        self.assertFalse(result.history[1].result.data.authorization_granted)
         self.assertEqual(self.proposals.get(self.pending[1].id).status, "PENDING_REVIEW")
 
     async def test_identity_is_not_serialized_into_prompts_memory_or_graph_state(self):
@@ -434,7 +440,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             result = GraphResolutionAgent(StructuredLLM(provider), tools, memory=self.memory).run(self.agent_request())
             self.assertEqual(result.error, "KNOWLEDGE_UNAVAILABLE")
             provider = baseline.ScriptedProvider([baseline.call("get_inventory", sku="LAP-1")])
-            result = GraphResolutionAgent(StructuredLLM(provider), tools, AgentConfig(max_steps=1), memory=self.memory).run(self.agent_request())
+            result = GraphResolutionAgent(StructuredLLM(provider), self.tools, AgentConfig(max_steps=1), memory=self.memory).run(self.agent_request())
             self.assertEqual(result.error, "STEP_LIMIT")
             self.assertEqual(len(provider.requests), 1)
 
