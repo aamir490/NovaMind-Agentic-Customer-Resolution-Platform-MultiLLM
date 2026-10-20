@@ -42,7 +42,8 @@ export function auditCases(payload) {
 }
 
 export function auditRuns(page, binding, offset) {
-  check(page?.scope === 'case_runs_in_this_process' && Array.isArray(page.items) && page.items.length <= 50
+  check(['case_runs_in_this_process', 'case_runs_with_durable_metadata'].includes(page?.scope)
+    && Array.isArray(page.items) && page.items.length <= 50
     && (page.next_offset === null || (count(page.next_offset) && page.next_offset === offset + 50 && page.items.length === 50)));
   const seen = new Set();
   const items = page.items.map((item) => {
@@ -58,7 +59,7 @@ export function auditRuns(page, binding, offset) {
 }
 
 export function auditPage(page, binding, after) {
-  check(page?.run_id === binding.run_id && page.scope === 'in_memory_workflow_audit'
+  check(page?.run_id === binding.run_id && ['in_memory_workflow_audit', 'durable_workflow_audit'].includes(page.scope)
     && Array.isArray(page.events) && page.events.length <= 50 && count(page.next_after)
     && typeof page.has_more === 'boolean');
   const events = page.events.map((event, index) => {

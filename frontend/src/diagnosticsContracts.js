@@ -27,7 +27,7 @@ const optionalFields = {
   workflow_id: uuid, case_id: uuid, proposal_id: uuid, reviewer_user_id: uuid,
   tool: oneOf([...auditTools, 'unknown']), status: oneOf(['INFORMATIONAL', 'HUMAN_REVIEW_REQUIRED', 'FAILED',
     'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'PENDING_REVIEW', 'APPROVED', 'REJECTED']),
-  provider: oneOf(['groq', 'bedrock', 'fake', 'other']),
+  provider: oneOf(['bedrock', 'fake', 'other']),
   invalid_response_stage: oneOf(['provider_envelope', 'json_guardrail', 'output_schema']),
   invalid_response_category: oneOf(['bedrock_empty_output', 'bedrock_nonempty_json_rejected']),
   output_schema_errors_truncated: (value) => typeof value === 'boolean',

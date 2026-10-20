@@ -13,7 +13,9 @@ import httpx
 import yaml
 
 from backend.app.schemas import CaseCreate, OrderCreate
-from backend.container.bootstrap import _OfflineScriptedProvider, _llm_provider, create_container_app
+from backend.container.bootstrap import (
+    _OfflineScriptedProvider, _llm_provider, _sqlite_database_path, create_container_app,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +69,6 @@ class OfflineContainerTests(unittest.IsolatedAsyncioTestCase):
             {"NOVAMIND_LLM_PROVIDER": "local_scripted"},
             {"NOVAMIND_OFFLINE_TESTING": "true"},
             {**OFFLINE, "NOVAMIND_OFFLINE_TESTING": "TRUE"},
-            {**OFFLINE, "GROQ_API_KEY": "must-not-be-read"},
             {**OFFLINE, "AWS_PROFILE": "must-not-be-read"},
             {**OFFLINE, "BEDROCK_MODEL_ID": "must-not-be-read"},
         )
@@ -205,6 +206,53 @@ class OfflineContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(demo, {"services": {"backend": {"environment": {
             "NOVAMIND_OFFLINE_DEMO_DATA": "true",
         }}}})
+
+    def test_sqlite_path_is_opt_in_and_persistence_overlay_mounts_a_named_volume(self):
+        self.assertIsNone(_sqlite_database_path())
+        with patch.dict(os.environ, {"NOVAMIND_SQLITE_PATH": "relative.sqlite"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                _sqlite_database_path()
+
+        database = Path(self.enterContext(TemporaryDirectory())) / "novamind.sqlite"
+        with patch.dict(os.environ, {"NOVAMIND_SQLITE_PATH": str(database)}, clear=True):
+            self.assertEqual(_sqlite_database_path(), database)
+
+        base = yaml.safe_load((ROOT / "compose.yaml").read_text())
+        backend = base["services"]["backend"]
+        self.assertTrue(backend["read_only"])
+        self.assertNotIn("volumes", backend)
+
+        overlay = yaml.safe_load((ROOT / "compose.persistence.yaml").read_text())
+        self.assertEqual(set(overlay), {"services", "volumes"})
+        self.assertEqual(set(overlay["services"]), {"backend"})
+        persisted_backend = overlay["services"]["backend"]
+        self.assertEqual(persisted_backend["environment"], {
+            "NOVAMIND_SQLITE_PATH": "/srv/state/novamind/novamind.sqlite",
+        })
+        self.assertEqual(persisted_backend["volumes"], [{
+            "type": "volume", "source": "novamind_sqlite", "target": "/srv/state",
+        }])
+        self.assertEqual(overlay["volumes"], {
+            "novamind_sqlite": {"name": "${NOVAMIND_SQLITE_VOLUME:-novamind_sqlite}"},
+        })
+        self.assertNotIn("read_only", persisted_backend["volumes"][0])
+        self.assertNotIn("NOVAMIND_AGENT_ENGINE", persisted_backend["environment"])
+        self.assertNotIn("networks", persisted_backend)
+        self.assertNotIn("secrets", persisted_backend)
+
+        # Persistence is additive: it does not select a provider, credentials,
+        # demo data, or a different agent engine in any existing overlay.
+        for filename in (
+            "compose.auth.yaml", "compose.offline.yaml", "compose.demo.yaml",
+            "compose.bedrock.yaml", "compose.bedrock.demo.yaml",
+        ):
+            with self.subTest(overlay=filename):
+                other = yaml.safe_load((ROOT / filename).read_text())["services"]["backend"]
+                self.assertNotIn("NOVAMIND_SQLITE_PATH", other.get("environment", {}))
+
+        runtime = (ROOT / "backend/Dockerfile").read_text().rsplit("FROM ", 1)[1]
+        self.assertIn("RUN install -d -o 10001 -g 10001 -m 0750 /srv/state/novamind", runtime)
+        self.assertIn("USER 10001:10001", runtime)
 
 
 if __name__ == "__main__":

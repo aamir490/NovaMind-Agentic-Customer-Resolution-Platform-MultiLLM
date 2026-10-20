@@ -34,7 +34,9 @@ test('support intake retries failures, blocks duplicates, and stays successful u
       },
       transform(code, id) {
         if (/(?:CustomerPortal|ReportProblem)\.jsx$/.test(id)) {
-          return code.replace("import { useState } from 'react';", "import { useState } from 'virtual:intake-navigation-state';");
+          return code
+            .replace("import { useState } from 'react';", "import { useState } from 'virtual:intake-navigation-state';")
+            .replace("import { useRef, useState } from 'react';", "import { useRef, useState } from 'virtual:intake-navigation-state';");
         }
       },
       load(id) {
@@ -49,6 +51,12 @@ test('support intake retries failures, blocks duplicates, and stays successful u
             const index = current.index++;
             if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial;
             return [slots[index], value => { slots[index] = typeof value === 'function' ? value(slots[index]) : value; }];
+          }
+          export function useRef(initial) {
+            const { slots } = current;
+            const index = current.index++;
+            if (!(index in slots)) slots[index] = { current: initial };
+            return slots[index];
           }`;
       },
     }, react()] });
@@ -60,10 +68,15 @@ test('support intake retries failures, blocks duplicates, and stays successful u
   const { default: MySupportRequests } = await server.ssrLoadModule('/src/MySupportRequests.jsx');
   const order = { id: '00000000-0000-4000-8000-000000000020', items: [{ sku: 'LAP-1', name: 'Laptop', quantity: 1 }] };
   const created = { id: '00000000-0000-4000-8000-000000000030', subject: 'Wrong item', status: 'open' };
-  let calls = 0, resolveRequest, rejectRequest;
+  let calls = 0, resolveRequest, rejectRequest, firstIdempotencyKey;
   const api = { createMyCase(body) {
     calls++;
-    assert.deepEqual(body, { orderId: order.id, subject: 'Wrong item', description: 'The item does not match my order.' });
+    assert.equal(body.orderId, order.id);
+    assert.equal(body.subject, 'Wrong item');
+    assert.equal(body.description, 'The item does not match my order.');
+    assert.match(body.idempotencyKey, /^[0-9a-f-]{36}$/i);
+    if (firstIdempotencyKey === undefined) firstIdempotencyKey = body.idempotencyKey;
+    else assert.equal(body.idempotencyKey, firstIdempotencyKey, 'retry must reuse its idempotency key');
     return new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject; });
   } };
   const portalSlots = [], intakeSlots = [];

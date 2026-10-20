@@ -395,6 +395,35 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
                 )
             except sqlite3.IntegrityError:
                 raise PersistenceError("CHECKPOINT_CONFLICT") from None
+            # LangGraph can submit a task write just before its corresponding
+            # checkpoint reaches the saver.  Stage those writes with the
+            # workflow scope, then attach them in the same transaction that
+            # creates the checkpoint.  They are never visible as pending
+            # writes for another checkpoint or workflow.
+            staged = connection.execute(
+                """SELECT task_id, write_index, channel, value_type, value_blob,
+                          value_hash, task_path
+                   FROM langgraph_checkpoint_staged_writes
+                   WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
+                   ORDER BY task_path, task_id, write_index""",
+                (thread_id, checkpoint_ns, checkpoint_id),
+            ).fetchall()
+            for row in staged:
+                connection.execute(
+                    """INSERT INTO langgraph_checkpoint_writes
+                       (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index,
+                        channel, value_type, value_blob, value_hash, task_path)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (thread_id, checkpoint_ns, checkpoint_id, row["task_id"],
+                     row["write_index"], row["channel"], row["value_type"],
+                     row["value_blob"], row["value_hash"], row["task_path"]),
+                )
+            if staged:
+                connection.execute(
+                    """DELETE FROM langgraph_checkpoint_staged_writes
+                       WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?""",
+                    (thread_id, checkpoint_ns, checkpoint_id),
+                )
         return self._config(thread_id, checkpoint_ns, checkpoint_id)
 
     def put_writes(
@@ -416,18 +445,23 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
             serialized.append((WRITES_IDX_MAP.get(channel, index), channel, value_type, value_blob, value_hash))
         with self._persistence.transaction() as connection:
             self._ensure_workflow(connection, thread_id)
-            if connection.execute(
+            exists = connection.execute(
                 """SELECT 1 FROM langgraph_checkpoints
                    WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?""",
                 (thread_id, checkpoint_ns, checkpoint_id),
-            ).fetchone() is None:
+            ).fetchone()
+            staged = exists is None
+            if staged and connection.execute(
+                """SELECT 1 FROM langgraph_checkpoints
+                   WHERE checkpoint_ns = ? AND checkpoint_id = ?""",
+                (checkpoint_ns, checkpoint_id),
+            ).fetchone() is not None:
                 raise PersistenceError("CHECKPOINT_SCOPE_MISMATCH")
-            # LangGraph submits task writes in the background. A later checkpoint
-            # may therefore become the head before writes for its parent arrive.
-            # Accept only checkpoints on the current head's parent chain; this
-            # permits that contract without accepting writes to an abandoned fork.
-            on_current_lineage = connection.execute(
-                """WITH RECURSIVE lineage(checkpoint_id, parent_checkpoint_id) AS (
+            if not staged:
+                # Delayed parent writes are valid, but a write can never target
+                # an abandoned branch.
+                on_current_lineage = connection.execute(
+                    """WITH RECURSIVE lineage(checkpoint_id, parent_checkpoint_id) AS (
                        SELECT checkpoint_id, parent_checkpoint_id
                        FROM langgraph_checkpoints
                        WHERE thread_id = ? AND checkpoint_ns = ?
@@ -443,15 +477,19 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
                         AND parent.checkpoint_id = child.parent_checkpoint_id
                    )
                    SELECT 1 FROM lineage WHERE checkpoint_id = ?""",
-                (thread_id, checkpoint_ns, thread_id, checkpoint_ns,
-                 thread_id, checkpoint_ns, checkpoint_id),
-            ).fetchone()
-            if on_current_lineage is None:
-                raise PersistenceError("CHECKPOINT_CONFLICT")
+                    (thread_id, checkpoint_ns, thread_id, checkpoint_ns,
+                     thread_id, checkpoint_ns, checkpoint_id),
+                ).fetchone()
+                if on_current_lineage is None:
+                    raise PersistenceError("CHECKPOINT_CONFLICT")
+            writes_table = (
+                "langgraph_checkpoint_staged_writes" if staged
+                else "langgraph_checkpoint_writes"
+            )
             for write_index, channel, value_type, value_blob, value_hash in serialized:
                 existing = connection.execute(
-                    """SELECT channel, value_type, value_blob, value_hash, task_path
-                       FROM langgraph_checkpoint_writes
+                    f"""SELECT channel, value_type, value_blob, value_hash, task_path
+                       FROM {writes_table}
                        WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
                          AND task_id = ? AND write_index = ?""",
                     (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index),
@@ -465,13 +503,13 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
                     # Negative indexes are LangGraph's special ERROR/SCHEDULED/
                     # INTERRUPT/RESUME slots. Their contract is last-write-wins.
                     connection.execute(
-                        """DELETE FROM langgraph_checkpoint_writes
+                        f"""DELETE FROM {writes_table}
                            WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
                              AND task_id = ? AND write_index = ?""",
                         (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index),
                     )
                 connection.execute(
-                    """INSERT INTO langgraph_checkpoint_writes
+                    f"""INSERT INTO {writes_table}
                        (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index,
                         channel, value_type, value_blob, value_hash, task_path)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -484,6 +522,7 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
         with self._persistence.transaction() as connection:
             self._ensure_workflow(connection, thread_id)
             connection.execute("DELETE FROM langgraph_checkpoint_writes WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM langgraph_checkpoint_staged_writes WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM langgraph_checkpoints WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM langgraph_checkpoint_blobs WHERE thread_id = ?", (thread_id,))
 

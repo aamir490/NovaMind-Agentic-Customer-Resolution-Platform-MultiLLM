@@ -4,6 +4,13 @@ function date(value) {
   return <time dateTime={value}>{new Date(value).toLocaleString()}</time>;
 }
 
+const resolutionLabels = {
+  APPROVE_REPLACEMENT: 'Replacement approved',
+  DECLINE_REPLACEMENT: 'Replacement declined',
+  REQUEST_MORE_EVIDENCE: 'More evidence requested',
+  ESCALATE: 'Escalated for specialist review',
+};
+
 // A new selection mounts a fresh read, clearing old data and cancelling its request.
 export default function MySupportRequests({ api }) {
   const [caseId, setCaseId] = useState(null);
@@ -19,9 +26,16 @@ function SupportRequestRead({ api, caseId, onSelect }) {
     setState({ phase: 'loading' });
     async function load() {
       try {
-        const data = caseId
-          ? await api.getMyCase(caseId, { signal: controller.signal })
-          : await api.listMyCases({ signal: controller.signal });
+        let data;
+        if (caseId) {
+          const supportCase = await api.getMyCase(caseId, { signal: controller.signal });
+          const resolution = typeof api.getMyCaseResolution === 'function'
+            ? await api.getMyCaseResolution(caseId, { signal: controller.signal })
+            : null;
+          data = resolution ? { ...supportCase, resolution } : supportCase;
+        } else {
+          data = await api.listMyCases({ signal: controller.signal });
+        }
         if (!controller.signal.aborted) setState({ phase: 'ready', data });
       } catch (error) {
         if (!controller.signal.aborted) setState({ phase: 'error',
@@ -66,6 +80,15 @@ function SupportRequestRead({ api, caseId, onSelect }) {
             <div><dt>Created</dt><dd>{date(state.data.created_at)}</dd></div>
             <div><dt>Updated</dt><dd>{date(state.data.updated_at)}</dd></div>
           </dl>
+          {state.data.resolution?.latest && <section className="customer-resolution" aria-labelledby="customer-resolution-heading">
+            <h3 id="customer-resolution-heading">Latest case decision</h3>
+            <dl className="case-facts">
+              <div><dt>Status</dt><dd>{state.data.resolution.case.status}</dd></div>
+              <div><dt>Decision</dt><dd>{resolutionLabels[state.data.resolution.latest.action]}</dd></div>
+              <div><dt>Response</dt><dd>{state.data.resolution.latest.customerMessage}</dd></div>
+              <div><dt>Decided</dt><dd>{date(state.data.resolution.latest.decidedAt)}</dd></div>
+            </dl>
+          </section>}
         </div>
       ) : state.data.length === 0 ? (
         <div className="customer-empty" role="status">

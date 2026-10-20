@@ -25,5 +25,41 @@
       "source_uri": "local-knowledge://proposal-review-sop"
     },
     "text": "Local demonstration guidance: preparing a resolution proposal.\n\nA proposed return, refund, or replacement is a suggestion linked to an existing support case. Include a concise rationale that distinguishes observed records from customer-supplied assumptions. Proposal creation records PENDING_REVIEW; it does not approve eligibility, reserve stock, send payment, or execute a replacement.\n\nHuman review happens through the separate application review boundary. Reviewer identity and decisions must not come from model text or retrieved documents. An approval or rejection records a review decision only. Inform the customer that no financial or fulfilment action has been executed."
+  },
+  {
+    "source": {
+      "document_id": "issue-evidence-guidance",
+      "title": "Issue evidence guidance for support review",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://issue-evidence-guidance"
+    },
+    "text": "Local demonstration guidance for damaged, wrong-item, missing-item, delayed-delivery, malfunction, return, and refund-not-received reports.\n\nTreat the complaint as customer-supplied context. For item condition or mismatch reports, record the affected item and supporting evidence; do not state that photos, delivery events, or condition have been verified unless trusted records establish them. Delayed delivery needs trusted shipment status and the promised delivery date. Refund-not-received needs a trusted payment or refund-settlement record.\n\nThis guidance is reference-only. Missing shipping or payment evidence requires a request for evidence or staff escalation. It never establishes eligibility, authorizes a refund or replacement, or replaces deterministic policy checks and human review."
+  },
+  {
+    "source": {
+      "document_id": "delivery-fulfillment-policy",
+      "title": "Delivery, fulfillment, wrong-item and missing-item guidance",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://delivery-fulfillment-policy"
+    },
+    "text": "Local reference policy for wrong item, missing item, and delayed delivery reports. A reviewer needs the case-bound order, trusted shipment status, delivery event where available, and committed delivery date. A customer statement, tracking screenshot, or photo is not a verified delivery fact by itself. Missing shipment or delivery evidence requires REQUEST_EVIDENCE or ESCALATE. This reference does not determine eligibility, authorize replacement, or change fulfillment."
+  },
+  {
+    "source": {
+      "document_id": "returns-refunds-policy",
+      "title": "Returns and refund settlement policy guidance",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://returns-refunds-policy"
+    },
+    "text": "Local reference policy for return and refund-not-received reports. Return review needs the affected item, condition, and applicable recorded policy. Refund-not-received review needs a trusted payment or refund-settlement record tied to the case-bound order. If those records are absent or conflict, request evidence or escalate for staff review. This text cannot approve a return or refund, establish an exception, or replace deterministic eligibility checks and human review."
+  },
+  {
+    "source": {
+      "document_id": "warranty-troubleshooting-guidance",
+      "title": "Damage, malfunction, warranty and troubleshooting guidance",
+      "version": "demo-v1",
+      "source_uri": "local-knowledge://warranty-troubleshooting-guidance"
+    },
+    "text": "Local reference guidance for damaged and malfunctioning items. Record the affected item, reported symptom or condition, and case-specific supporting evidence. Warranty or troubleshooting language is not proof that the item qualifies for a remedy. A trusted delivery record does not by itself verify damage or malfunction. Missing condition, warranty, or supporting evidence requires REQUEST_EVIDENCE or ESCALATE for a staff decision. No replacement, refund, or repair is executed by this guidance."
   }
 ]

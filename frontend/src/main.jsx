@@ -54,6 +54,127 @@ function ThemeSwitcher({ value, onChange }) {
   </div>;
 }
 
+function GatewayIcon({ children }) {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
+    strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>;
+}
+
+function PortalArtwork({ type }) {
+  if (type === 'admin') {
+    return <svg className="portal-artwork" viewBox="0 0 210 122" fill="none" aria-hidden="true">
+      <rect x="12" y="10" width="186" height="102" rx="12" className="art-screen" />
+      <path d="M12 32h186" className="art-line" /><circle cx="29" cy="21" r="3" className="art-dot" />
+      <circle cx="40" cy="21" r="3" className="art-dot art-dot--muted" /><circle cx="51" cy="21" r="3" className="art-dot art-dot--muted" />
+      <rect x="29" y="47" width="50" height="7" rx="3.5" className="art-line" /><rect x="29" y="62" width="36" height="5" rx="2.5" className="art-line art-line--muted" />
+      <rect x="29" y="76" width="43" height="5" rx="2.5" className="art-line art-line--muted" />
+      <path d="M101 91V72M119 91V58M137 91V43M155 91V65" className="art-bars" /><path d="M93 91h74" className="art-line" />
+      <path d="M99 57c13-15 25 3 37-13s22 5 34-11" className="art-trend" />
+    </svg>;
+  }
+  return <svg className="portal-artwork" viewBox="0 0 210 122" fill="none" aria-hidden="true">
+    <rect x="12" y="10" width="186" height="102" rx="12" className="art-screen art-screen--violet" />
+    <path d="M12 32h186" className="art-line art-line--violet" /><circle cx="29" cy="21" r="3" className="art-dot art-dot--violet" />
+    <circle cx="40" cy="21" r="3" className="art-dot art-dot--muted" /><circle cx="51" cy="21" r="3" className="art-dot art-dot--muted" />
+    <circle cx="41" cy="53" r="11" className="art-avatar" /><path d="M27 80c2-12 26-12 29 0" className="art-line art-line--violet" />
+    <path d="M88 48h69M88 62h46M88 76h58" className="art-line art-line--muted" />
+    <path d="M142 75h37a7 7 0 0 1 7 7v15a7 7 0 0 1-7 7h-18l-10 8v-8h-9a7 7 0 0 1-7-7V82a7 7 0 0 1 7-7Z" className="art-bubble" />
+    <path d="M151 88h20M151 96h13" className="art-line art-line--violet" />
+  </svg>;
+}
+
+function PortalGateway({ screen, status, message, themePreference, onThemeChange, onChoose, onBack, onSubmit }) {
+  const isLogin = screen === 'admin' || screen === 'customer';
+  const isCustomerLogin = screen === 'customer';
+  const title = isCustomerLogin ? 'Customer Portal' : 'Admin & Reviewer Portal';
+  const description = isCustomerLogin
+    ? 'Use your existing customer access token to view your orders and support requests.'
+    : 'Use an existing administrator or reviewer access token to open the operations workspace.';
+
+  return <div className="gateway-shell">
+    <a className="skip-link" href="#portal-content">Skip to portal content</a>
+    <header className="gateway-topbar">
+      <a className="gateway-brand" href="#portal-content" aria-label="NovaMind AI home">
+        <span className="gateway-logo-lockup">
+          <img src={logoUrl} alt="NovaMind AI" width="160" height="80" />
+          <span>Built by Aamir</span>
+        </span>
+        <span className="gateway-brand-divider" aria-hidden="true" />
+        <span className="gateway-brand-copy">
+          <span>AI-assisted customer resolution</span>
+          <strong>NovaMind AI Customer<br />Resolution Platform</strong>
+        </span>
+      </a>
+      <ThemeSwitcher value={themePreference} onChange={onThemeChange} />
+    </header>
+
+    <main id="portal-content" className="gateway-content" tabIndex={-1}>
+      {!isLogin ? <>
+        <section className="gateway-hero" aria-labelledby="gateway-title">
+          <h1 id="gateway-title"><span>AI-Powered</span> Customer Resolution</h1>
+          <p className="gateway-lead">
+            Investigate customer complaints with case evidence and policy checks, orchestrate AI-assisted
+            workflows with LangGraph and Amazon Bedrock, then keep consequential decisions under human approval.
+          </p>
+          <div className="gateway-capabilities" aria-label="Platform capabilities">
+            <span>Evidence-led investigation</span><span>Policy eligibility</span><span>Human review</span>
+          </div>
+        </section>
+
+        <section className="portal-choice-grid" aria-label="Choose a portal">
+          <article className="portal-choice portal-choice--staff">
+            <span className="portal-choice-icon" aria-hidden="true"><GatewayIcon><path d="M4 20v-9l8-6 8 6v9M9 20v-5h6v5M3 20h18" /></GatewayIcon></span>
+            <PortalArtwork type="admin" />
+            <p className="eyebrow">Operations team</p>
+            <h2>Admin Portal</h2>
+            <p>Monitor cases, guide AI workflows, review proposals, and inspect audit and diagnostic data.</p>
+            <button type="button" onClick={() => onChoose('admin')}>Open Admin Portal <span aria-hidden="true">→</span></button>
+            <small>Reviewer accounts open the staff workspace with their permitted tools.</small>
+          </article>
+          <article className="portal-choice portal-choice--customer">
+            <span className="portal-choice-icon" aria-hidden="true"><GatewayIcon><path d="M6 3h12l2 5v13H4V8l2-5ZM4 8h16M9 12a3 3 0 0 0 6 0" /></GatewayIcon></span>
+            <PortalArtwork type="customer" />
+            <p className="eyebrow">My account</p>
+            <h2>Customer Portal</h2>
+            <p>Browse the catalog, create demo orders, report an issue, and follow your own support requests.</p>
+            <button type="button" className="button-secondary" onClick={() => onChoose('customer')}>Open Customer Portal <span aria-hidden="true">→</span></button>
+            <small>Only records returned for the authenticated customer are displayed.</small>
+          </article>
+        </section>
+
+        <section className="gateway-process" aria-labelledby="process-title">
+          <div><p className="eyebrow">How it works</p><h2 id="process-title">From issue to resolution</h2></div>
+          <ol>
+            <li className="process-step process-step--customer"><strong>1</strong><span className="process-icon"><GatewayIcon><path d="M5 4h14v12H9l-4 4zM8 8h7M8 12h4" /></GatewayIcon></span><div><b>Customer Issue</b><span>Customer submits details and supporting evidence.</span></div></li>
+            <li className="process-arrow" aria-hidden="true">→</li>
+            <li className="process-step process-step--ai"><strong>2</strong><span className="process-icon"><GatewayIcon><path d="M7 7h10v10H7zM10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M17 10h4M3 14h4M17 14h4" /></GatewayIcon></span><div><b>AI Analysis</b><span>AI checks evidence and policy before preparing a recommendation.</span></div></li>
+            <li className="process-arrow" aria-hidden="true">→</li>
+            <li className="process-step process-step--human"><strong>3</strong><span className="process-icon"><GatewayIcon><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM4 21a8 8 0 0 1 16 0" /></GatewayIcon></span><div><b>Human Approval</b><span>A trained reviewer considers and approves the final decision.</span></div></li>
+          </ol>
+        </section>
+      </> : <section className="portal-login" aria-labelledby="portal-login-title">
+        <button type="button" className="gateway-back" onClick={onBack}><span aria-hidden="true">←</span> All portals</button>
+        <span className="portal-login-icon" aria-hidden="true"><GatewayIcon><path d="M12 3a5 5 0 0 0-5 5v3H5v10h14V11h-2V8a5 5 0 0 0-5-5Zm-3 8V8a3 3 0 0 1 6 0v3" /></GatewayIcon></span>
+        <p className="eyebrow">Secure local sign-in</p>
+        <h1 id="portal-login-title">{title}</h1>
+        <p>{description}</p>
+        <form className="portal-login-form" onSubmit={onSubmit} autoComplete="off">
+          <label htmlFor="local-access-token">Access token
+            <input id="local-access-token" name="token" type="password" required minLength={16} maxLength={256}
+              autoComplete="off" spellCheck={false} autoCapitalize="none" disabled={status === 'checking'}
+              aria-describedby="portal-login-help portal-login-status" />
+          </label>
+          <p id="portal-login-status" className={`portal-login-status ${status}`} role="status" aria-live="polite">{message}</p>
+          <button type="submit" disabled={status === 'checking'}>
+            {status === 'checking' ? 'Verifying identity…' : `Continue to ${isCustomerLogin ? 'Customer' : 'Staff'} Portal`}
+          </button>
+          <p id="portal-login-help" className="portal-login-help">Your token is verified by the local API and held only in this page’s memory. Reloading or signing out clears it.</p>
+        </form>
+      </section>}
+    </main>
+    <footer className="gateway-footer">Local demonstration environment <span aria-hidden="true">·</span> API identity is the source of role access</footer>
+  </div>;
+}
+
 function App() {
   const [health, setHealth] = useState('idle');
   const [activeView, setActiveView] = useState('cases');
@@ -64,13 +185,17 @@ function App() {
   const [themePreference, setThemePreference] = useState(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => globalThis.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [portalScreen, setPortalScreen] = useState('landing');
   const identityClient = useRef(null);
 
   // Derive whether this session is a customer; drives what is shown/hidden.
   const isCustomer = session?.identity?.role === 'CUSTOMER';
+  const portalName = isCustomer ? 'Customer Portal' : session?.identity?.role === 'REVIEWER' ? 'Staff Portal' : 'Admin Portal';
+  const availableStaffViews = staffViews.filter((entry) => entry.id !== 'diagnostics'
+    || session?.identity?.can_view_diagnostics === true);
 
   // Staff view state — only relevant when not a customer.
-  const view = staffViews.find((entry) => entry.id === activeView) ?? staffViews[0];
+  const view = availableStaffViews.find((entry) => entry.id === activeView) ?? availableStaffViews[0];
 
   useEffect(() => {
     const query = globalThis.matchMedia?.('(prefers-color-scheme: dark)');
@@ -101,6 +226,7 @@ function App() {
     clearIdentity();
     setIdentityStatus('signed-out');
     setIdentityMessage('Signed out locally. Credentials and workspace data have been cleared. Submitted runs are not cancelled.');
+    setPortalScreen('landing');
   }
 
   async function confirmIdentity(event) {
@@ -129,7 +255,11 @@ function App() {
       setSession({ identity, api: candidate });
       setSessionVersion((version) => version + 1);
       setIdentityStatus('authenticated');
-      setIdentityMessage('Identity confirmed by the local API.');
+      const customer = identity.role === 'CUSTOMER';
+      setActiveView(customer ? 'cases' : 'dashboard');
+      setIdentityMessage(customer
+        ? 'Identity confirmed by the local API. Customer Portal opened.'
+        : `Identity confirmed by the local API. ${identity.role === 'REVIEWER' ? 'Staff' : 'Admin'} Portal opened.`);
     } catch (error) {
       if (identityClient.current !== candidate) return;
       clearIdentity();
@@ -164,6 +294,19 @@ function App() {
     online: 'The local API is responding. This check confirms connectivity only.',
     offline: 'The local API is unavailable. Check that the backend is running, then try again.',
   };
+
+  if (!session) {
+    return <PortalGateway
+      screen={portalScreen}
+      status={identityStatus}
+      message={identityMessage}
+      themePreference={themePreference}
+      onThemeChange={setThemePreference}
+      onChoose={setPortalScreen}
+      onBack={() => { setPortalScreen('landing'); setIdentityStatus('signed-out'); setIdentityMessage('Enter your existing local access token to confirm your identity.'); }}
+      onSubmit={confirmIdentity}
+    />;
+  }
 
   return (
     <div className="app-shell">
@@ -210,9 +353,9 @@ function App() {
             </>
           ) : (
             <>
-              <p className="nav-label">Workspace</p>
+              <p className="nav-label">{portalName}</p>
               <div className="nav-items">
-                {staffViews.map((entry) => (
+                {availableStaffViews.map((entry) => (
                   <button key={entry.id} type="button" className="nav-item"
                     aria-current={activeView === entry.id ? 'page' : undefined}
                     aria-controls="workspace"
@@ -283,7 +426,7 @@ function App() {
         {/* Topbar */}
         <header className="topbar">
           <p className="breadcrumb">
-            <span>Workspace</span>
+            <span>{portalName}</span>
             <span aria-hidden="true">/</span>
             {isCustomer ? 'Customer portal' : view.label}
           </p>
@@ -352,7 +495,7 @@ function App() {
           <div className="page-heading">
             <div>
               <p className="eyebrow">{isCustomer ? 'NovaMind AI' : 'Customer resolution'}</p>
-              <h1 aria-live="polite">{isCustomer ? 'Customer portal' : view.title}</h1>
+              <h1 aria-live="polite">{isCustomer ? 'Customer Dashboard' : view.title}</h1>
               <p className="intro">
                 {isCustomer
                   ? 'Browse products, place a demo order, and track your orders.'
@@ -411,7 +554,7 @@ function App() {
             )}
             {/* Keep the case workspace mounted so navigation preserves an in-progress review. */}
             <div className="workspace-grid cases-layout" hidden={activeView !== 'cases'}>
-              <CaseReview key={sessionVersion} api={session?.api} />
+              <CaseReview key={sessionVersion} api={session?.api} identity={session?.identity} />
               <aside className="workspace-rail" aria-label="Workspace information">
                 <section className="connection-panel" aria-labelledby="connection-title">
                   <div className="panel-heading">

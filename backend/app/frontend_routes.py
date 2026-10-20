@@ -47,7 +47,7 @@ def identity(runtime: Runtime):
     subject = current_identity()
     privileged = subject.role in (Role.REVIEWER, Role.ADMIN)
     return IdentityResponse(identity=subject, can_review=privileged, can_view_diagnostics=privileged,
-        instance_id=runtime.instance_id, provider=runtime.provider_label if runtime.provider_factory else "unavailable",
+        instance_id=runtime.instance_id, provider=runtime.provider_label if (runtime.provider_factory or runtime.strands_model_factory) else "unavailable",
         memory_available=runtime.memory is not None)
 
 
@@ -58,6 +58,7 @@ def pending_reviews(runtime: Runtime):
 
 @router.post("/runs", response_model=RunSnapshot, status_code=202)
 def start_run(body: RunStart, request: Request, runtime: Runtime):
+    require_roles(Role.REVIEWER, Role.ADMIN)
     return runtime.start(body, trace_id=UUID(request.state.trace_id))
 
 

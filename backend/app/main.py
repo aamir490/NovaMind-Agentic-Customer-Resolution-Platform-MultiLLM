@@ -1,6 +1,7 @@
 """Local API entry point; optional trusted-host workflow and conversation composition."""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Callable, Literal
 
 from fastapi import FastAPI, Request
@@ -14,7 +15,10 @@ from .proposal_routes import router as proposal_router
 from .proposals import ProposalService
 from .service import CaseService, ConflictError, NotFoundError
 from .tools import LocalTools
-from .security import AuthenticationProvider, LocalAuthenticationProvider, SecurityError, authenticated
+from .security import (
+    AuthenticatedIdentity, AuthenticationProvider, LocalAuthenticationProvider,
+    Role, SecurityError, authenticated,
+)
 from .observability import LocalObserver, observing, span
 from .conversations import ConversationError, ConversationService, ConversationStore
 from .frontend_routes import router as frontend_router, conversation_status
@@ -26,6 +30,12 @@ from .customer_orders import CustomerOrderService
 from .customer_order_routes import router as customer_order_router
 from .customer_case_routes import router as customer_case_router
 from .domain import Customer
+from .langgraph_checkpoints import SQLiteCheckpointSaver
+from .dispatcher import AutomaticInvestigationDispatcher
+from .persistence import (
+    SQLiteCaseRepository, SQLitePersistence, SQLiteProposalRepository,
+    SQLiteInvestigationJobRepository, SQLiteWorkflowMetadataRepository,
+)
 
 
 class HealthResponse(BaseModel):
@@ -41,14 +51,33 @@ def health() -> HealthResponse:
 def create_app(*, auth_provider: AuthenticationProvider | None = None,
                observer: LocalObserver | None = None, local_provider_factory: Callable[[], LLMProvider] | None = None,
                provider_label: Literal["local_scripted", "bedrock"] = "local_scripted",
+               agent_engine: Literal["langgraph", "strands"] = "langgraph",
+               strands_model_factory: Callable[[], object] | None = None,
                conversation_store: ConversationStore | None = None,
+               sqlite_path: str | Path | None = None,
                startup_customers: tuple[Customer, ...] = (),
-               trusted_delivery_sources: tuple[TrustedDeliverySource, ...] = ()) -> FastAPI:
+               trusted_delivery_sources: tuple[TrustedDeliverySource, ...] = (),
+               automatic_dispatcher: bool = False,
+               dispatcher_identity: AuthenticatedIdentity | None = None) -> FastAPI:
+    if not isinstance(automatic_dispatcher, bool):
+        raise ValueError("automatic_dispatcher must be a boolean")
+    if automatic_dispatcher and dispatcher_identity is None:
+        raise ValueError("Automatic dispatcher requires a server-owned worker identity")
+    if automatic_dispatcher and (sqlite_path is None or agent_engine != "langgraph"
+                                 or local_provider_factory is None):
+        raise ValueError("Automatic dispatcher requires SQLite, LangGraph, and a provider")
+    if automatic_dispatcher:
+        dispatcher_identity = AuthenticatedIdentity.model_validate(dispatcher_identity)
+        if dispatcher_identity.role not in (Role.REVIEWER, Role.ADMIN):
+            raise ValueError("Automatic dispatcher requires a staff identity")
     @asynccontextmanager
     async def lifespan(app):
         try:
             yield
         finally:
+            dispatcher = app.state.investigation_dispatcher
+            if dispatcher is not None:
+                dispatcher.close()
             app.state.frontend_runtime.close()
 
     app = FastAPI(
@@ -57,7 +86,22 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
         version="0.13.0",
         lifespan=lifespan,
     )
-    app.state.case_service = CaseService()
+    persistence = None
+    if sqlite_path is not None:
+        database_path = Path(sqlite_path)
+        if not database_path.is_absolute():
+            raise ValueError("SQLite persistence path must be absolute")
+        # SQLitePersistence opens short-lived connections per transaction, so
+        # migrations complete before the app begins serving and no connection
+        # needs to outlive this application instance.
+        persistence = SQLitePersistence(database_path, initialize=True)
+    app.state.sqlite_persistence = persistence
+    app.state.investigation_jobs = (
+        SQLiteInvestigationJobRepository(persistence) if persistence is not None else None
+    )
+    app.state.case_service = CaseService(
+        SQLiteCaseRepository(persistence) if persistence is not None else None
+    )
     # Seed deterministic startup customers before the app begins serving requests.
     # This is the only authorised call site for seed_customer(); no HTTP route
     # may call it. A seeded record does not itself grant authentication — a valid
@@ -70,6 +114,7 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     )
     app.state.proposal_service = ProposalService(
         app.state.case_service, app.state.business_operations,
+        SQLiteProposalRepository(persistence) if persistence is not None else None,
     )
     app.state.local_tools = LocalTools(
         app.state.case_service, app.state.business_operations, app.state.proposal_service,
@@ -83,7 +128,23 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     memory = ConversationService(conversation_store, app.state.case_service) if conversation_store is not None else None
     app.state.frontend_runtime = FrontendRuntime(app.state.case_service, app.state.local_tools,
         app.state.proposal_service, local_provider_factory=local_provider_factory,
-        provider_label=provider_label, memory=memory)
+        provider_label=provider_label, memory=memory,
+        agent_engine=agent_engine, strands_model_factory=strands_model_factory,
+        checkpointer=(SQLiteCheckpointSaver(persistence)
+                      if persistence is not None and agent_engine == "langgraph" else None),
+        workflow_metadata=(SQLiteWorkflowMetadataRepository(persistence)
+                           if persistence is not None and agent_engine == "langgraph" else None))
+    app.state.investigation_dispatcher = None
+    if automatic_dispatcher:
+        # These dependencies are guaranteed above and are never read from an
+        # HTTP request or customer-owned record.
+        app.state.investigation_dispatcher = AutomaticInvestigationDispatcher(
+            app.state.investigation_jobs, worker_id=dispatcher_identity.user_id,
+            provider_factory=local_provider_factory, provider_label=provider_label,
+            tools=app.state.local_tools, proposals=app.state.proposal_service,
+            checkpointer=SQLiteCheckpointSaver(persistence),
+            workflow_metadata=SQLiteWorkflowMetadataRepository(persistence),
+        )
 
     @app.middleware("http")
     async def authentication(request: Request, call_next):

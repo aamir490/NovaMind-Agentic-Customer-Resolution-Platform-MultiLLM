@@ -1,0 +1,120 @@
+"""Opt-in, server-owned dispatch of a freshly submitted investigation job.
+
+This is intentionally a one-shot hand-off, not a queue worker or recovery
+loop.  A durable attempt marker is written before LangGraph is invoked, and a
+later process start never calls this code for an existing job.
+"""
+
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
+from uuid import UUID
+
+from .agent import AgentRequest
+from .hitl import HITLWorkflow, WorkflowResult
+from .langgraph_checkpoints import SQLiteCheckpointSaver
+from .llm import StructuredLLM
+from .persistence import SQLiteInvestigationJobRepository, SQLiteWorkflowMetadataRepository
+
+
+class AutomaticInvestigationDispatcher:
+    """Dispatch one newly-created job using only a configured staff identity."""
+
+    def __init__(self, jobs: SQLiteInvestigationJobRepository, *, worker_id: UUID,
+                 provider_factory, provider_label: str, tools, proposals,
+                 checkpointer: SQLiteCheckpointSaver,
+                 workflow_metadata: SQLiteWorkflowMetadataRepository,
+                 lease_seconds: int = 60) -> None:
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("Dispatcher lease_seconds must be a positive integer")
+        if provider_label not in ("local_scripted", "bedrock"):
+            raise ValueError("Invalid dispatcher provider label")
+        self._jobs = jobs
+        self._worker_id = UUID(str(worker_id))
+        self._provider_factory = provider_factory
+        self._provider_label = provider_label
+        self._tools = tools
+        self._proposals = proposals
+        self._checkpointer = checkpointer
+        self._workflow_metadata = workflow_metadata
+        self._lease_seconds = lease_seconds
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="novamind-dispatch")
+        self._lock = RLock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=True)
+
+    def submit(self, job_id: UUID) -> bool:
+        """Queue a newly-created job outside the customer request context.
+
+        Context variables holding the authenticated customer are intentionally
+        not copied into this server worker.  The only identity used by the
+        execution path is the configured staff identity below.
+        """
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._executor.submit(self.dispatch, job_id)
+            except RuntimeError:
+                return False
+        return True
+
+    def dispatch(self, job_id: UUID) -> WorkflowResult | None:
+        """Attempt the one permitted dispatch for ``job_id``.
+
+        Failures after a claim become recovery-required.  They are never
+        retried here or on startup; a ``None`` result intentionally leaves the
+        customer intake response independent of internal execution details.
+        """
+        claim = self._jobs.claim(
+            job_id, worker_id=self._worker_id, lease_seconds=self._lease_seconds,
+        )
+        if claim is None:
+            return None
+        try:
+            self._jobs.bind_claim(
+                claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+                provider=self._provider_label,
+            )
+            # Read and validate the immutable descriptor before reserving the
+            # sole attempt.  It is revalidated from SQLite again in the scope.
+            self._jobs.execution_request(
+                claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+            )
+            attempt = self._jobs.mark_execution_attempt(
+                claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+            )
+            with self._jobs.execution_context(
+                claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+                attempt_id=attempt.attempt_id,
+            ) as execution:
+                request = AgentRequest.model_validate_json(execution.agent_request_json)
+                workflow = HITLWorkflow(
+                    StructuredLLM(self._provider_factory()), self._tools, self._proposals,
+                    checkpointer=self._checkpointer,
+                    workflow_metadata=self._workflow_metadata,
+                    provider_label=self._provider_label,
+                )
+                result = workflow.start(
+                    request, workflow_id=execution.workflow_id,
+                    run_id=execution.execution_id, request_id=execution.execution_id,
+                )
+            if result.status == "FAILED":
+                self._jobs.require_recovery(
+                    claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+                )
+            return result
+        except Exception:
+            # The first durable claim is sufficient to identify this as an
+            # ambiguous operation.  Never let a later automatic dispatch turn
+            # it back into pending work.
+            try:
+                self._jobs.require_recovery(
+                    claim.job.id, worker_id=self._worker_id, claim_id=claim.claim_id,
+                )
+            except Exception:
+                pass
+            return None

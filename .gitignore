@@ -73,3 +73,9 @@ NOTES-NOVAMIND-LOCAL.md
 
 /project-pic/
 /NOTES-NOVAMIND-LOCAL.md
+
+# Additional local database protection
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

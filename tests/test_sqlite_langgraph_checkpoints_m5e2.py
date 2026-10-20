@@ -91,6 +91,23 @@ class SQLiteLangGraphCheckpointTests(unittest.TestCase):
             ("task-1", "review", {"decision": "pending"}),
         ])
 
+    def test_early_task_writes_are_atomically_attached_to_their_checkpoint(self):
+        checkpoint = self._checkpoint({"phase": "scheduled"})
+        early = self._config(checkpoint_id=checkpoint["id"])
+        self.saver.put_writes(early, (("review", {"decision": "pending"}),), "task-early")
+
+        saved = self.saver.put(
+            self._config(), checkpoint, {"source": "loop", "step": 1}, {"state": "1"},
+        )
+        restored = self.saver.get_tuple(saved)
+        self.assertEqual(restored.pending_writes, [
+            ("task-early", "review", {"decision": "pending"}),
+        ])
+        with SQLitePersistence(self.path).transaction() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM langgraph_checkpoint_staged_writes"
+            ).fetchone()[0], 0)
+
     def test_delayed_parent_writes_remain_valid_after_head_advances(self):
         parent = self.saver.put(
             self._config(), self._checkpoint({"step": 0}, "1"),

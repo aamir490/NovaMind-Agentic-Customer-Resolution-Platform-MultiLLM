@@ -5,11 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
-from typing import ContextManager, Iterator, Protocol
-from uuid import UUID
+from typing import ContextManager, Iterator, Literal, Protocol
+from uuid import UUID, uuid4
 
-from .domain import Customer, Order, OrderItem, SupportCase
+from .domain import (
+    CaseResolutionDecision, CaseStatus, Customer, Order, OrderItem,
+    InvestigationExecutionIdentity, InvestigationJob, InvestigationJobClaim,
+    InvestigationExecutionAttempt, InvestigationExecutionContext, InvestigationJobStatus,
+    InvestigationRecoveryReason,
+    ResolutionAction, SupportCase, can_transition,
+)
+from .agent import AgentRequest, agent_request_fingerprint
 from .operations import (
     AuthoritativeDeliveryFact, EligibilityEvidence, EligibilityResult,
     TrustedDeliverySource,
@@ -19,6 +27,7 @@ from .proposals import (
     WorkflowReviewBinding,
 )
 from .service import ConflictError, NotFoundError
+from .security import trusted_investigation_execution
 from .workflow_metadata import (
     WORKFLOW_STATUS_TRANSITIONS, WorkflowMetadataStatus, WorkflowReservationResult,
     WorkflowRunEvent, WorkflowRunMetadata, WorkflowRunReservation,
@@ -49,6 +58,7 @@ class WorkflowRepository(Protocol):
 class Migration:
     version: int
     statements: tuple[str, ...]
+    requires_foreign_keys_off: bool = False
 
 
 MIGRATIONS = (
@@ -667,6 +677,241 @@ MIGRATIONS = (
              ) THEN RAISE(ABORT, 'invalid human-review audit event') END;
            END""",
     )),
+    Migration(7, (
+        # SQLite cannot alter a CHECK constraint in place.  Rebuild the parent
+        # table within the existing migration transaction so existing child
+        # foreign keys remain valid when the replacement takes its name.
+        """CREATE TABLE support_cases_v7 (
+            case_id TEXT PRIMARY KEY NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(customer_id),
+            order_id TEXT NOT NULL REFERENCES orders(order_id),
+            subject TEXT NOT NULL CHECK(length(trim(subject)) BETWEEN 1 AND 200),
+            description TEXT NOT NULL CHECK(length(trim(description)) BETWEEN 1 AND 4000),
+            status TEXT NOT NULL CHECK(status IN ('open', 'in_review', 'escalated', 'resolved')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """INSERT INTO support_cases_v7
+           (case_id, customer_id, order_id, subject, description, status, created_at, updated_at)
+           SELECT case_id, customer_id, order_id, subject, description, status, created_at, updated_at
+           FROM support_cases""",
+        "DROP TRIGGER validate_delivery_fact_bindings",
+        "DROP TABLE support_cases",
+        "ALTER TABLE support_cases_v7 RENAME TO support_cases",
+        "CREATE INDEX support_cases_customer ON support_cases(customer_id, updated_at, case_id)",
+        "CREATE INDEX support_cases_order ON support_cases(order_id, case_id)",
+        """CREATE TRIGGER validate_delivery_fact_bindings
+           BEFORE INSERT ON delivery_facts BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM support_cases c
+               JOIN orders o ON o.order_id = c.order_id
+               JOIN order_items i ON i.order_id = o.order_id
+               WHERE c.case_id = NEW.case_id
+                 AND c.order_id = NEW.order_id
+                 AND c.customer_id = NEW.customer_id
+                 AND o.customer_id = NEW.customer_id
+                 AND i.sku = NEW.sku
+                 AND NEW.quantity <= i.quantity
+             ) THEN RAISE(ABORT, 'invalid delivery fact bindings') END;
+           END""",
+    ), requires_foreign_keys_off=True),
+    Migration(8, (
+        """CREATE TABLE case_resolution_decisions (
+            decision_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT NOT NULL REFERENCES support_cases(case_id),
+            sequence INTEGER NOT NULL CHECK(sequence >= 1),
+            action TEXT NOT NULL CHECK(action IN
+                ('APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT', 'REQUEST_MORE_EVIDENCE')),
+            reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+            customer_message TEXT NOT NULL CHECK(length(trim(customer_message)) BETWEEN 1 AND 2000),
+            admin_user_id TEXT NOT NULL CHECK(length(trim(admin_user_id)) BETWEEN 1 AND 120),
+            decided_at TEXT NOT NULL,
+            UNIQUE(case_id, sequence)
+        )""",
+        """CREATE INDEX case_resolution_decisions_case
+           ON case_resolution_decisions(case_id, sequence)""",
+        """CREATE TRIGGER validate_case_resolution_decision_insert
+           BEFORE INSERT ON case_resolution_decisions BEGIN
+             SELECT CASE WHEN NEW.sequence <> coalesce((
+               SELECT max(sequence) + 1 FROM case_resolution_decisions
+               WHERE case_id = NEW.case_id
+             ), 1)
+             THEN RAISE(ABORT, 'invalid case resolution decision sequence') END;
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM support_cases c
+               WHERE c.case_id = NEW.case_id AND (
+                 (NEW.action = 'REQUEST_MORE_EVIDENCE' AND c.status = 'in_review') OR
+                 (NEW.action IN ('APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT')
+                  AND c.status = 'resolved')
+               )
+             ) THEN RAISE(ABORT, 'invalid case resolution decision status') END;
+           END""",
+        """CREATE TRIGGER immutable_case_resolution_decisions_update
+           BEFORE UPDATE ON case_resolution_decisions BEGIN
+             SELECT RAISE(ABORT, 'case resolution decisions are immutable');
+           END""",
+        """CREATE TRIGGER immutable_case_resolution_decisions_delete
+           BEFORE DELETE ON case_resolution_decisions BEGIN
+             SELECT RAISE(ABORT, 'case resolution decisions are immutable');
+           END""",
+    )),
+    Migration(9, (
+        """CREATE TABLE langgraph_checkpoint_staged_writes (
+            thread_id TEXT NOT NULL REFERENCES workflow_runs(workflow_id),
+            checkpoint_ns TEXT NOT NULL,
+            checkpoint_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            write_index INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            value_type TEXT NOT NULL,
+            value_blob BLOB NOT NULL,
+            value_hash TEXT NOT NULL CHECK(length(value_hash) = 64),
+            task_path TEXT NOT NULL,
+            PRIMARY KEY(thread_id, checkpoint_ns, checkpoint_id, task_id, write_index)
+        )""",
+        """CREATE INDEX langgraph_checkpoint_staged_writes_scope
+           ON langgraph_checkpoint_staged_writes(thread_id, checkpoint_ns, checkpoint_id)""",
+    )),
+    Migration(10, (
+        """CREATE TABLE investigation_jobs (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT UNIQUE NOT NULL REFERENCES support_cases(case_id),
+            customer_id TEXT NOT NULL REFERENCES customers(customer_id),
+            owner_user_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) = 36),
+            request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+            status TEXT NOT NULL CHECK(status = 'PENDING'),
+            created_at TEXT NOT NULL,
+            UNIQUE(customer_id, idempotency_key)
+        )""",
+        "CREATE INDEX investigation_jobs_case ON investigation_jobs(case_id)",
+        "CREATE INDEX investigation_jobs_pending ON investigation_jobs(status, created_at, job_id)",
+    )),
+    Migration(11, (
+        """CREATE TABLE investigation_jobs_v11 (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT UNIQUE NOT NULL REFERENCES support_cases(case_id),
+            customer_id TEXT NOT NULL REFERENCES customers(customer_id),
+            owner_user_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) = 36),
+            request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+            status TEXT NOT NULL CHECK(status IN ('PENDING', 'CLAIMED', 'RECOVERY_REQUIRED')),
+            claim_id TEXT,
+            claimed_by TEXT,
+            claimed_at TEXT,
+            lease_expires_at TEXT,
+            recovery_reason TEXT CHECK(recovery_reason IS NULL OR recovery_reason IN ('LEASE_EXPIRED', 'CLAIM_AMBIGUOUS')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(customer_id, idempotency_key),
+            CHECK(
+                (status = 'PENDING' AND claim_id IS NULL AND claimed_by IS NULL
+                 AND claimed_at IS NULL AND lease_expires_at IS NULL AND recovery_reason IS NULL)
+                OR
+                (status = 'CLAIMED' AND claim_id IS NOT NULL AND claimed_by IS NOT NULL
+                 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL AND recovery_reason IS NULL)
+                OR
+                (status = 'RECOVERY_REQUIRED' AND claim_id IS NOT NULL AND claimed_by IS NOT NULL
+                 AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL AND recovery_reason IS NOT NULL)
+            )
+        )""",
+        """INSERT INTO investigation_jobs_v11
+           (job_id, case_id, customer_id, owner_user_id, idempotency_key, request_fingerprint,
+            status, claim_id, claimed_by, claimed_at, lease_expires_at, recovery_reason,
+            created_at, updated_at)
+           SELECT job_id, case_id, customer_id, owner_user_id, idempotency_key, request_fingerprint,
+                  status, NULL, NULL, NULL, NULL, NULL, created_at, created_at
+             FROM investigation_jobs""",
+        "DROP TABLE investigation_jobs",
+        "ALTER TABLE investigation_jobs_v11 RENAME TO investigation_jobs",
+        "CREATE INDEX investigation_jobs_case ON investigation_jobs(case_id)",
+        "CREATE INDEX investigation_jobs_pending ON investigation_jobs(status, created_at, job_id)",
+        "CREATE INDEX investigation_jobs_claimed ON investigation_jobs(status, lease_expires_at, job_id)",
+    )),
+    Migration(12, (
+        "ALTER TABLE investigation_jobs ADD COLUMN workflow_id TEXT REFERENCES workflow_runs(workflow_id)",
+        "ALTER TABLE investigation_jobs ADD COLUMN bound_at TEXT",
+        """CREATE UNIQUE INDEX investigation_jobs_workflow
+           ON investigation_jobs(workflow_id) WHERE workflow_id IS NOT NULL""",
+    )),
+    Migration(13, (
+        "ALTER TABLE investigation_jobs ADD COLUMN agent_request_json TEXT",
+        """ALTER TABLE investigation_jobs ADD COLUMN agent_request_fingerprint TEXT
+           CHECK(agent_request_fingerprint IS NULL OR length(agent_request_fingerprint) = 64)""",
+    )),
+    Migration(14, (
+        """CREATE TRIGGER immutable_investigation_job_request_descriptor_update
+           BEFORE UPDATE OF agent_request_json, agent_request_fingerprint ON investigation_jobs
+           WHEN OLD.agent_request_json IS NOT NULL OR OLD.agent_request_fingerprint IS NOT NULL
+           BEGIN
+             SELECT RAISE(ABORT, 'investigation request descriptor is immutable');
+           END""",
+    )),
+    Migration(15, (
+        "ALTER TABLE investigation_jobs ADD COLUMN execution_attempt_id TEXT",
+        "ALTER TABLE investigation_jobs ADD COLUMN execution_attempted_at TEXT",
+        """CREATE TRIGGER validate_investigation_job_execution_attempt_pair
+           BEFORE UPDATE OF execution_attempt_id, execution_attempted_at ON investigation_jobs
+           WHEN (NEW.execution_attempt_id IS NULL) <> (NEW.execution_attempted_at IS NULL)
+           BEGIN
+             SELECT RAISE(ABORT, 'investigation execution attempt metadata must be paired');
+           END""",
+        """CREATE TRIGGER immutable_investigation_job_execution_attempt_update
+           BEFORE UPDATE OF execution_attempt_id, execution_attempted_at ON investigation_jobs
+           WHEN OLD.execution_attempt_id IS NOT NULL OR OLD.execution_attempted_at IS NOT NULL
+           BEGIN
+             SELECT RAISE(ABORT, 'investigation execution attempt is immutable');
+           END""",
+    )),
+    Migration(16, (
+        "DROP TRIGGER validate_case_resolution_decision_insert",
+        "DROP TRIGGER immutable_case_resolution_decisions_update",
+        "DROP TRIGGER immutable_case_resolution_decisions_delete",
+        """CREATE TABLE case_resolution_decisions_v16 (
+            decision_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT NOT NULL REFERENCES support_cases(case_id),
+            sequence INTEGER NOT NULL CHECK(sequence >= 1),
+            action TEXT NOT NULL CHECK(action IN
+                ('APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT', 'REQUEST_MORE_EVIDENCE', 'ESCALATE')),
+            reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+            customer_message TEXT NOT NULL CHECK(length(trim(customer_message)) BETWEEN 1 AND 2000),
+            admin_user_id TEXT NOT NULL CHECK(length(trim(admin_user_id)) BETWEEN 1 AND 120),
+            decided_at TEXT NOT NULL,
+            UNIQUE(case_id, sequence)
+        )""",
+        """INSERT INTO case_resolution_decisions_v16
+           SELECT decision_id, case_id, sequence, action, reason, customer_message,
+                  admin_user_id, decided_at
+           FROM case_resolution_decisions""",
+        "DROP TABLE case_resolution_decisions",
+        "ALTER TABLE case_resolution_decisions_v16 RENAME TO case_resolution_decisions",
+        """CREATE INDEX case_resolution_decisions_case
+           ON case_resolution_decisions(case_id, sequence)""",
+        """CREATE TRIGGER validate_case_resolution_decision_insert
+           BEFORE INSERT ON case_resolution_decisions BEGIN
+             SELECT CASE WHEN NEW.sequence <> coalesce((
+               SELECT max(sequence) + 1 FROM case_resolution_decisions
+               WHERE case_id = NEW.case_id
+             ), 1)
+             THEN RAISE(ABORT, 'invalid case resolution decision sequence') END;
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM support_cases c
+               WHERE c.case_id = NEW.case_id AND (
+                 (NEW.action = 'REQUEST_MORE_EVIDENCE' AND c.status = 'in_review') OR
+                 (NEW.action IN ('APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT') AND c.status = 'resolved') OR
+                 (NEW.action = 'ESCALATE' AND c.status = 'escalated')
+               )
+             ) THEN RAISE(ABORT, 'invalid case resolution decision status') END;
+           END""",
+        """CREATE TRIGGER immutable_case_resolution_decisions_update
+           BEFORE UPDATE ON case_resolution_decisions BEGIN
+             SELECT RAISE(ABORT, 'case resolution decisions are immutable');
+           END""",
+        """CREATE TRIGGER immutable_case_resolution_decisions_delete
+           BEFORE DELETE ON case_resolution_decisions BEGIN
+             SELECT RAISE(ABORT, 'case resolution decisions are immutable');
+           END""",
+    )),
 )
 
 
@@ -726,7 +971,6 @@ class SQLitePersistence(SQLiteUnitOfWork):
         try:
             connection = sqlite3.connect(self._path.as_uri() + "?mode=rw", uri=True, timeout=5)
             connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("BEGIN IMMEDIATE")
             connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)")
             applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
             known = {migration.version for migration in MIGRATIONS}
@@ -735,13 +979,26 @@ class SQLitePersistence(SQLiteUnitOfWork):
             for migration in MIGRATIONS:
                 if migration.version in applied:
                     continue
-                for statement in migration.statements:
-                    connection.execute(statement)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                    (migration.version,),
-                )
-            connection.commit()
+                if migration.requires_foreign_keys_off:
+                    # SQLite cannot rebuild a referenced parent table with
+                    # enforcement enabled. Validate within the migration
+                    # transaction, then restore enforcement before returning.
+                    connection.execute("PRAGMA foreign_keys=OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in migration.statements:
+                        connection.execute(statement)
+                    if (migration.requires_foreign_keys_off
+                            and connection.execute("PRAGMA foreign_key_check").fetchone() is not None):
+                        raise PersistenceError("PERSISTENCE_UNAVAILABLE")
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                        (migration.version,),
+                    )
+                    connection.commit()
+                finally:
+                    if migration.requires_foreign_keys_off:
+                        connection.execute("PRAGMA foreign_keys=ON")
         except PersistenceError:
             if connection is not None:
                 connection.rollback()
@@ -785,6 +1042,18 @@ class SQLiteCaseRepository:
             "subject": row["subject"], "description": row["description"], "status": row["status"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         })
+
+    @staticmethod
+    def _decision(row: sqlite3.Row) -> CaseResolutionDecision:
+        try:
+            return CaseResolutionDecision.model_validate({
+                "id": row["decision_id"], "case_id": row["case_id"],
+                "action": row["action"], "reason": row["reason"],
+                "customer_message": row["customer_message"],
+                "admin_user_id": row["admin_user_id"], "decided_at": row["decided_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
 
     @staticmethod
     def _order(connection: sqlite3.Connection, row: sqlite3.Row) -> Order:
@@ -919,6 +1188,804 @@ class SQLiteCaseRepository:
             if updated.rowcount != 1:
                 raise NotFoundError("Case not found")
         return case
+
+    def resolution_history(self, case_id: UUID) -> tuple[CaseResolutionDecision, ...]:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM support_cases WHERE case_id = ?", (str(case_id),)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Case not found")
+            rows = connection.execute(
+                """SELECT * FROM case_resolution_decisions
+                   WHERE case_id = ? ORDER BY sequence""",
+                (str(case_id),),
+            ).fetchall()
+            return tuple(self._decision(row) for row in rows)
+
+    def record_resolution(self, current: SupportCase, updated: SupportCase,
+                          decision: CaseResolutionDecision) -> tuple[SupportCase, CaseResolutionDecision]:
+        """Persist one validated admin decision and its case status atomically."""
+        if (current.id != updated.id or current.id != decision.case_id
+                or current.customer_id != updated.customer_id
+                or current.order_id != updated.order_id
+                or current.subject != updated.subject
+                or current.description != updated.description
+                or not can_transition(current.status, updated.status)):
+            raise ConflictError("Case resolution does not match the current case")
+        if decision.action == ResolutionAction.REQUEST_MORE_EVIDENCE:
+            valid_outcome = (current.status in (CaseStatus.OPEN, CaseStatus.IN_REVIEW)
+                             and updated.status == CaseStatus.IN_REVIEW)
+        elif decision.action == ResolutionAction.ESCALATE:
+            valid_outcome = (current.status in (CaseStatus.OPEN, CaseStatus.IN_REVIEW)
+                             and updated.status == CaseStatus.ESCALATED)
+        else:
+            valid_outcome = (current.status == CaseStatus.IN_REVIEW
+                             and updated.status == CaseStatus.RESOLVED)
+        if not valid_outcome:
+            raise ConflictError("Invalid case resolution transition")
+
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM support_cases WHERE case_id = ?", (str(current.id),)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Case not found")
+            if self._case(row) != current:
+                raise ConflictError("Case resolution is stale")
+            latest = connection.execute(
+                """SELECT action, reason, customer_message FROM case_resolution_decisions
+                   WHERE case_id = ? ORDER BY sequence DESC LIMIT 1""",
+                (str(current.id),),
+            ).fetchone()
+            if latest is not None and (latest["action"], latest["reason"], latest["customer_message"]) == (
+                    decision.action.value, decision.reason, decision.customer_message):
+                raise ConflictError("Duplicate case decision")
+            status_update = connection.execute(
+                """UPDATE support_cases SET status = ?, updated_at = ?
+                   WHERE case_id = ? AND status = ? AND updated_at = ?""",
+                (updated.status.value, updated.updated_at.isoformat(), str(current.id),
+                 current.status.value, current.updated_at.isoformat()),
+            )
+            if status_update.rowcount != 1:
+                raise ConflictError("Case resolution is stale")
+            sequence = connection.execute(
+                """SELECT coalesce(max(sequence), 0) + 1
+                   FROM case_resolution_decisions WHERE case_id = ?""",
+                (str(current.id),),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO case_resolution_decisions
+                   (decision_id, case_id, sequence, action, reason, customer_message,
+                    admin_user_id, decided_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(decision.id), str(decision.case_id), sequence, decision.action.value,
+                 decision.reason, decision.customer_message, str(decision.admin_user_id),
+                 decision.decided_at.isoformat()),
+            )
+        return updated, decision
+
+
+class SQLiteInvestigationJobRepository:
+    """Durable, idempotent complaint-intake queue; it never dispatches work."""
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _job(row: sqlite3.Row) -> InvestigationJob:
+        try:
+            return InvestigationJob.model_validate({
+                "id": row["job_id"], "case_id": row["case_id"],
+                "customer_id": row["customer_id"], "owner_user_id": row["owner_user_id"],
+                "idempotency_key": row["idempotency_key"],
+                "request_fingerprint": row["request_fingerprint"],
+                "status": row["status"], "created_at": row["created_at"],
+                "updated_at": row["updated_at"], "claim_id": row["claim_id"],
+                "claimed_by": row["claimed_by"], "claimed_at": row["claimed_at"],
+                "lease_expires_at": row["lease_expires_at"],
+                "recovery_reason": row["recovery_reason"],
+                "workflow_id": row["workflow_id"], "bound_at": row["bound_at"],
+                "agent_request_json": row["agent_request_json"],
+                "agent_request_fingerprint": row["agent_request_fingerprint"],
+                "execution_attempt_id": row["execution_attempt_id"],
+                "execution_attempted_at": row["execution_attempted_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @staticmethod
+    def _claim_time(now: datetime | None) -> datetime:
+        timestamp = datetime.now(timezone.utc) if now is None else now
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("Claim timestamps must be timezone-aware")
+        return timestamp.astimezone(timezone.utc)
+
+    @staticmethod
+    def _execution(job: InvestigationJob) -> InvestigationExecutionIdentity:
+        # A job has exactly one durable execution identity. Claim leases never
+        # generate a new identity, which prevents accidental replay semantics.
+        return InvestigationExecutionIdentity(
+            job_id=job.id, execution_id=job.id, customer_id=job.customer_id,
+            owner_user_id=job.owner_user_id,
+        )
+
+    @staticmethod
+    def _canonical_request(job: InvestigationJob, case_row: sqlite3.Row) -> tuple[AgentRequest, str, str]:
+        """Build the one server-owned request descriptor for this intake job."""
+        if case_row["customer_id"] != str(job.customer_id):
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        request = AgentRequest(
+            case_id=job.case_id,
+            message=(f"Investigate support case {job.case_id}.\n"
+                     f"Subject: {case_row['subject']}\n"
+                     f"Description: {case_row['description']}"),
+        )
+        descriptor = json.dumps(
+            request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+        )
+        return request, descriptor, agent_request_fingerprint(request)
+
+    @staticmethod
+    def _stored_request(job: InvestigationJob, run: WorkflowRunMetadata) -> AgentRequest:
+        """Validate the immutable descriptor rather than regenerating it."""
+        if job.agent_request_json is None or job.agent_request_fingerprint is None:
+            raise ValueError("Legacy reservation has no execution descriptor")
+        try:
+            payload = json.loads(job.agent_request_json)
+            descriptor = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            request = AgentRequest.model_validate(payload)
+        except Exception:
+            raise ValueError("Invalid persisted execution descriptor") from None
+        if (descriptor != job.agent_request_json or request.case_id != job.case_id
+                or agent_request_fingerprint(request) != job.agent_request_fingerprint
+                or run.request_fingerprint != job.agent_request_fingerprint):
+            raise ValueError("Persisted execution descriptor does not match its reservation")
+        return request
+
+    @classmethod
+    def _require_bound_workflow_recovery(cls, connection: sqlite3.Connection, *,
+                                         job: InvestigationJob, observed_at: datetime) -> None:
+        """Keep a bound reservation non-runnable when its claim becomes stale."""
+        if job.workflow_id is None:
+            return
+        row = connection.execute(
+            "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(job.workflow_id),),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        run = SQLiteWorkflowMetadataRepository._run(row)
+        if (run.workflow_id != job.id or run.run_id != job.id or run.request_id != job.id
+                or run.case_id != job.case_id or run.owner_user_id != job.claimed_by):
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        if run.status == WorkflowMetadataStatus.RECOVERY_REQUIRED:
+            return
+        if run.status not in (
+            WorkflowMetadataStatus.RUNNING, WorkflowMetadataStatus.RESUMING,
+            WorkflowMetadataStatus.REVIEW_REQUIRED,
+        ):
+            return
+        updated_at = observed_at if observed_at > run.updated_at else run.updated_at + timedelta(microseconds=1)
+        updated = connection.execute(
+            """UPDATE workflow_runs SET status = ?, updated_at = ?
+               WHERE workflow_id = ? AND status = ?""",
+            (WorkflowMetadataStatus.RECOVERY_REQUIRED.value, updated_at.isoformat(),
+             str(run.workflow_id), run.status.value),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("Workflow status is stale")
+        recovered = WorkflowRunMetadata.model_validate({
+            **run.model_dump(), "status": WorkflowMetadataStatus.RECOVERY_REQUIRED,
+            "updated_at": updated_at,
+        })
+        SQLiteWorkflowMetadataRepository._append_run_event(
+            connection, run=recovered, kind="RECOVERY_REQUIRED", previous_status=run.status,
+        )
+
+    @classmethod
+    def _require_claim_recovery(cls, connection: sqlite3.Connection, *,
+                                job: InvestigationJob, observed_at: datetime) -> None:
+        cls._require_bound_workflow_recovery(connection, job=job, observed_at=observed_at)
+        updated = connection.execute(
+            """UPDATE investigation_jobs
+               SET status = ?, recovery_reason = ?, updated_at = ?
+               WHERE job_id = ? AND status = ?""",
+            (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+             InvestigationRecoveryReason.CLAIM_AMBIGUOUS.value, observed_at.isoformat(),
+             str(job.id), InvestigationJobStatus.CLAIMED.value),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("Investigation job claim is no longer active")
+
+    @staticmethod
+    def fingerprint(case: SupportCase) -> str:
+        payload = {
+            "order_id": str(case.order_id),
+            "subject": case.subject,
+            "description": case.description,
+        }
+        return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def submit(self, case: SupportCase, *, owner_user_id: UUID,
+               idempotency_key: UUID) -> tuple[SupportCase, InvestigationJob, bool]:
+        """Atomically create a case and pending job, or return the matching prior pair."""
+        case = SupportCase.model_validate(case.model_dump())
+        fingerprint = self.fingerprint(case)
+        with self._persistence.transaction() as connection:
+            existing_row = connection.execute(
+                """SELECT * FROM investigation_jobs
+                   WHERE customer_id = ? AND idempotency_key = ?""",
+                (str(case.customer_id), str(idempotency_key)),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._job(existing_row)
+                if existing.request_fingerprint != fingerprint:
+                    raise ConflictError("Idempotency key conflicts with an existing intake request")
+                case_row = connection.execute(
+                    "SELECT * FROM support_cases WHERE case_id = ?", (str(existing.case_id),),
+                ).fetchone()
+                if case_row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                return SQLiteCaseRepository._case(case_row), existing, False
+
+            SQLiteCaseRepository._require_customer(connection, case.customer_id)
+            order = SQLiteCaseRepository._require_order(connection, case.order_id)
+            if order.customer_id != case.customer_id:
+                raise ConflictError("Order does not belong to the selected customer")
+            connection.execute(
+                """INSERT INTO support_cases
+                   (case_id, customer_id, order_id, subject, description, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(case.id), str(case.customer_id), str(case.order_id), case.subject, case.description,
+                 case.status.value, case.created_at.isoformat(), case.updated_at.isoformat()),
+            )
+            job = InvestigationJob(
+                id=uuid4(), case_id=case.id, customer_id=case.customer_id,
+                owner_user_id=owner_user_id, idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint, status=InvestigationJobStatus.PENDING,
+                created_at=case.created_at, updated_at=case.created_at,
+            )
+            connection.execute(
+                """INSERT INTO investigation_jobs
+                   (job_id, case_id, customer_id, owner_user_id, idempotency_key,
+                    request_fingerprint, status, claim_id, claimed_by, claimed_at,
+                    lease_expires_at, recovery_reason, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(job.id), str(job.case_id), str(job.customer_id), str(job.owner_user_id),
+                 str(job.idempotency_key), job.request_fingerprint, job.status.value,
+                 None, None, None, None, None, job.created_at.isoformat(),
+                 job.updated_at.isoformat()),
+            )
+            return case, job, True
+
+    def get_by_case(self, case_id: UUID) -> InvestigationJob:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE case_id = ?", (str(case_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            return self._job(row)
+
+    def get(self, job_id: UUID) -> InvestigationJob:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            return self._job(row)
+
+    def claim(self, job_id: UUID, *, worker_id: UUID, lease_seconds: int = 60,
+              now: datetime | None = None) -> InvestigationJobClaim | None:
+        """Lease one known pending job without selecting or replaying another job.
+
+        The automatic dispatcher uses this targeted variant so a new complaint
+        can never cause an older pending job to run incidentally.  A job that
+        has already been claimed (including after a crash) is deliberately not
+        reclaimed here.
+        """
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("lease_seconds must be a positive integer")
+        claimed_at = self._claim_time(now)
+        lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.status is not InvestigationJobStatus.PENDING:
+                return None
+            claim_id = uuid4()
+            updated = connection.execute(
+                """UPDATE investigation_jobs
+                   SET status = ?, claim_id = ?, claimed_by = ?, claimed_at = ?,
+                       lease_expires_at = ?, recovery_reason = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = ?""",
+                (InvestigationJobStatus.CLAIMED.value, str(claim_id), str(worker_id),
+                 claimed_at.isoformat(), lease_expires_at.isoformat(), claimed_at.isoformat(),
+                 str(job_id), InvestigationJobStatus.PENDING.value),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed_row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if claimed_row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            claimed = self._job(claimed_row)
+            return InvestigationJobClaim(
+                job=claimed, claim_id=claim_id, execution=self._execution(claimed),
+            )
+
+    def claim_next(self, *, worker_id: UUID, lease_seconds: int = 60,
+                   now: datetime | None = None) -> InvestigationJobClaim | None:
+        """Atomically lease the oldest pending job without starting any work.
+
+        A stale claim is made visible as recovery-required before selection. It
+        is never returned to PENDING, so a restart cannot silently replay it.
+        """
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("lease_seconds must be a positive integer")
+        claimed_at = self._claim_time(now)
+        lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
+        with self._persistence.transaction() as connection:
+            expired_rows = connection.execute(
+                """SELECT * FROM investigation_jobs
+                   WHERE status = ? AND lease_expires_at <= ?""",
+                (InvestigationJobStatus.CLAIMED.value, claimed_at.isoformat()),
+            ).fetchall()
+            for expired_row in expired_rows:
+                expired_job = self._job(expired_row)
+                self._require_bound_workflow_recovery(
+                    connection, job=expired_job, observed_at=claimed_at,
+                )
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.LEASE_EXPIRED.value, claimed_at.isoformat(),
+                     str(expired_job.id), InvestigationJobStatus.CLAIMED.value),
+                )
+            row = connection.execute(
+                """SELECT * FROM investigation_jobs
+                   WHERE status = ?
+                   ORDER BY created_at, job_id
+                   LIMIT 1""",
+                (InvestigationJobStatus.PENDING.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = UUID(row["job_id"])
+            claim_id = uuid4()
+            updated = connection.execute(
+                """UPDATE investigation_jobs
+                   SET status = ?, claim_id = ?, claimed_by = ?, claimed_at = ?,
+                       lease_expires_at = ?, recovery_reason = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = ?""",
+                (InvestigationJobStatus.CLAIMED.value, str(claim_id), str(worker_id),
+                 claimed_at.isoformat(), lease_expires_at.isoformat(), claimed_at.isoformat(),
+                 str(job_id), InvestigationJobStatus.PENDING.value),
+            )
+            if updated.rowcount != 1:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            claimed_row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if claimed_row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            job = self._job(claimed_row)
+            return InvestigationJobClaim(job=job, claim_id=claim_id, execution=self._execution(job))
+
+    def require_recovery(self, job_id: UUID, *, worker_id: UUID, claim_id: UUID,
+                         now: datetime | None = None) -> InvestigationJob:
+        """Record a worker-reported ambiguous claim; it has no retry path here."""
+        timestamp = self._claim_time(now)
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if (job.status != InvestigationJobStatus.CLAIMED or job.claim_id != claim_id
+                    or job.claimed_by != worker_id):
+                raise ConflictError("Investigation job claim is no longer active")
+            # A durable attempt marker can outlive a process crash.  Explicit
+            # recovery must make its already-reserved workflow non-runnable as
+            # well; it must never be treated as an invitation to retry.
+            self._require_bound_workflow_recovery(
+                connection, job=job, observed_at=timestamp,
+            )
+            updated = connection.execute(
+                """UPDATE investigation_jobs
+                   SET status = ?, recovery_reason = ?, updated_at = ?
+                   WHERE job_id = ? AND status = ? AND claim_id = ? AND claimed_by = ?""",
+                (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                 InvestigationRecoveryReason.CLAIM_AMBIGUOUS.value, timestamp.isoformat(),
+                 str(job_id), InvestigationJobStatus.CLAIMED.value, str(claim_id), str(worker_id)),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("Investigation job claim is no longer active")
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            return self._job(row)
+
+    def bind_claim(self, job_id: UUID, *, worker_id: UUID, claim_id: UUID,
+                   provider: Literal["local_scripted", "bedrock"],
+                   now: datetime | None = None) -> WorkflowReservationResult:
+        """Bind one active claim to its one deterministic workflow reservation.
+
+        This creates no runtime, provider, checkpoint, or graph invocation. An
+        expired, mismatched, or colliding claim is deliberately left for manual
+        recovery rather than being rebound under a new execution identity.
+        """
+        observed_at = self._claim_time(now)
+        expired = False
+        collision = False
+        incompatible = False
+        result: WorkflowReservationResult | None = None
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.claim_id != claim_id or job.claimed_by != worker_id:
+                raise ConflictError("Investigation job claim is not owned by this worker")
+            if job.status != InvestigationJobStatus.CLAIMED:
+                raise ConflictError("Investigation job is not claimable for workflow binding")
+            if job.lease_expires_at is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            case_row = connection.execute(
+                """SELECT customer_id, subject, description FROM support_cases
+                   WHERE case_id = ? AND customer_id = ?""",
+                (str(job.case_id), str(job.customer_id)),
+            ).fetchone()
+            if case_row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            if job.lease_expires_at <= observed_at:
+                self._require_bound_workflow_recovery(
+                    connection, job=job, observed_at=observed_at,
+                )
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ? AND claim_id = ? AND claimed_by = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.LEASE_EXPIRED.value, observed_at.isoformat(),
+                     str(job.id), InvestigationJobStatus.CLAIMED.value,
+                     str(claim_id), str(worker_id)),
+                )
+                expired = True
+            elif job.workflow_id is not None:
+                if job.workflow_id != job.id:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                run_row = connection.execute(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(job.workflow_id),),
+                ).fetchone()
+                if run_row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                run = SQLiteWorkflowMetadataRepository._run(run_row)
+                if (run.run_id != job.id or run.request_id != job.id
+                        or run.case_id != job.case_id or run.owner_user_id != worker_id):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                try:
+                    self._stored_request(job, run)
+                except ValueError:
+                    self._require_claim_recovery(
+                        connection, job=job, observed_at=observed_at,
+                    )
+                    incompatible = True
+                else:
+                    if run.provider != provider:
+                        raise ConflictError("Investigation job reservation provider is immutable")
+                    result = WorkflowReservationResult(run=run, created=False)
+            else:
+                if connection.execute(
+                    "SELECT 1 FROM workflow_runs WHERE workflow_id = ? OR run_id = ?",
+                    (str(job.id), str(job.id)),
+                ).fetchone() is not None:
+                    connection.execute(
+                        """UPDATE investigation_jobs
+                           SET status = ?, recovery_reason = ?, updated_at = ?
+                           WHERE job_id = ? AND status = ? AND workflow_id IS NULL""",
+                        (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                         InvestigationRecoveryReason.CLAIM_AMBIGUOUS.value, observed_at.isoformat(),
+                         str(job.id), InvestigationJobStatus.CLAIMED.value),
+                    )
+                    collision = True
+                else:
+                    bound_at = observed_at
+                    if bound_at <= job.updated_at:
+                        bound_at = job.updated_at + timedelta(microseconds=1)
+                    _, descriptor, descriptor_fingerprint = self._canonical_request(job, case_row)
+                    reservation = WorkflowRunReservation(
+                        workflow_id=job.id, run_id=job.id, request_id=job.id,
+                        case_id=job.case_id, owner_user_id=worker_id,
+                        request_fingerprint=descriptor_fingerprint, provider=provider,
+                    )
+                    run = WorkflowRunMetadata(
+                        **reservation.model_dump(), status=WorkflowMetadataStatus.RUNNING,
+                        created_at=bound_at, updated_at=bound_at,
+                    )
+                    connection.execute(
+                        """INSERT INTO workflow_runs
+                           (workflow_id, run_id, case_id, owner_user_id, request_id,
+                            request_fingerprint, provider, status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (str(run.workflow_id), str(run.run_id), str(run.case_id),
+                         str(run.owner_user_id), str(run.request_id), run.request_fingerprint,
+                         run.provider, run.status.value, run.created_at.isoformat(),
+                         run.updated_at.isoformat()),
+                    )
+                    SQLiteWorkflowMetadataRepository._append_run_event(
+                        connection, run=run, kind="CREATED", previous_status=None,
+                    )
+                    updated = connection.execute(
+                        """UPDATE investigation_jobs
+                           SET workflow_id = ?, bound_at = ?, agent_request_json = ?,
+                               agent_request_fingerprint = ?, updated_at = ?
+                           WHERE job_id = ? AND status = ? AND claim_id = ?
+                             AND claimed_by = ? AND workflow_id IS NULL""",
+                        (str(run.workflow_id), bound_at.isoformat(), descriptor,
+                         descriptor_fingerprint, bound_at.isoformat(),
+                         str(job.id), InvestigationJobStatus.CLAIMED.value,
+                         str(claim_id), str(worker_id)),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConflictError("Investigation job claim is no longer active")
+                    result = WorkflowReservationResult(run=run, created=True)
+        if expired:
+            raise ConflictError("Investigation job lease expired and requires recovery")
+        if collision:
+            raise ConflictError("Investigation job binding requires recovery")
+        if incompatible:
+            raise ConflictError("Investigation job reservation requires recovery")
+        if result is None:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        return result
+
+    def mark_execution_attempt(self, job_id: UUID, *, worker_id: UUID, claim_id: UUID,
+                               now: datetime | None = None) -> InvestigationExecutionAttempt:
+        """Durably authorize the first future execution attempt, before invocation.
+
+        No graph, provider, checkpoint, or background task is started here.
+        Once committed, this marker intentionally blocks every later attempt
+        until an explicit recovery workflow exists.
+        """
+        observed_at = self._claim_time(now)
+        expired = False
+        incompatible = False
+        attempt: InvestigationExecutionAttempt | None = None
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.claim_id != claim_id or job.claimed_by != worker_id:
+                raise ConflictError("Investigation job claim is not owned by this worker")
+            if job.status != InvestigationJobStatus.CLAIMED or job.workflow_id is None:
+                raise ConflictError("Investigation job is not ready for execution")
+            if job.execution_attempt_id is not None:
+                raise ConflictError("Investigation job already has an execution attempt")
+            if job.lease_expires_at is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            if job.lease_expires_at <= observed_at:
+                self._require_bound_workflow_recovery(
+                    connection, job=job, observed_at=observed_at,
+                )
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.LEASE_EXPIRED.value, observed_at.isoformat(),
+                     str(job.id), InvestigationJobStatus.CLAIMED.value),
+                )
+                expired = True
+            else:
+                run_row = connection.execute(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(job.workflow_id),),
+                ).fetchone()
+                if run_row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                run = SQLiteWorkflowMetadataRepository._run(run_row)
+                if (run.workflow_id != job.id or run.run_id != job.id or run.request_id != job.id
+                        or run.case_id != job.case_id or run.owner_user_id != worker_id):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                try:
+                    self._stored_request(job, run)
+                except ValueError:
+                    self._require_claim_recovery(
+                        connection, job=job, observed_at=observed_at,
+                    )
+                    incompatible = True
+                else:
+                    attempted_at = observed_at
+                    if attempted_at <= job.updated_at:
+                        attempted_at = job.updated_at + timedelta(microseconds=1)
+                    attempt_id = uuid4()
+                    updated = connection.execute(
+                        """UPDATE investigation_jobs
+                           SET execution_attempt_id = ?, execution_attempted_at = ?, updated_at = ?
+                           WHERE job_id = ? AND status = ? AND claim_id = ?
+                             AND claimed_by = ? AND execution_attempt_id IS NULL""",
+                        (str(attempt_id), attempted_at.isoformat(), attempted_at.isoformat(),
+                         str(job.id), InvestigationJobStatus.CLAIMED.value,
+                         str(claim_id), str(worker_id)),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConflictError("Investigation job execution attempt is no longer available")
+                    attempt = InvestigationExecutionAttempt(
+                        job_id=job.id, workflow_id=job.workflow_id, attempt_id=attempt_id,
+                        attempted_at=attempted_at, agent_request_json=job.agent_request_json or "",
+                        agent_request_fingerprint=job.agent_request_fingerprint or "",
+                    )
+        if expired:
+            raise ConflictError("Investigation job lease expired and requires recovery")
+        if incompatible:
+            raise ConflictError("Investigation job reservation requires recovery")
+        if attempt is None:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        return attempt
+
+    @contextmanager
+    def execution_context(self, job_id: UUID, *, worker_id: UUID, claim_id: UUID,
+                          attempt_id: UUID, now: datetime | None = None) -> Iterator[InvestigationExecutionContext]:
+        """Enter the sole server-side tool scope for one durable attempt.
+
+        It accepts only opaque persisted identifiers.  Customer, case, order,
+        workflow, worker, and request data are re-read from SQLite and never
+        taken from a caller payload.  It starts no graph or provider.
+        """
+        observed_at = self._claim_time(now)
+        expired = False
+        incompatible = False
+        context: InvestigationExecutionContext | None = None
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.claim_id != claim_id or job.claimed_by != worker_id:
+                raise ConflictError("Investigation job claim is not owned by this worker")
+            if (job.status != InvestigationJobStatus.CLAIMED or job.workflow_id is None
+                    or job.execution_attempt_id != attempt_id):
+                raise ConflictError("Investigation job has no matching execution attempt")
+            if job.lease_expires_at is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            if job.lease_expires_at <= observed_at:
+                self._require_bound_workflow_recovery(
+                    connection, job=job, observed_at=observed_at,
+                )
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.LEASE_EXPIRED.value, observed_at.isoformat(),
+                     str(job.id), InvestigationJobStatus.CLAIMED.value),
+                )
+                expired = True
+            else:
+                run_row = connection.execute(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(job.workflow_id),),
+                ).fetchone()
+                case_row = connection.execute(
+                    """SELECT c.case_id, c.customer_id, c.order_id, o.customer_id AS order_customer_id
+                       FROM support_cases c JOIN orders o ON o.order_id = c.order_id
+                       WHERE c.case_id = ?""",
+                    (str(job.case_id),),
+                ).fetchone()
+                if run_row is None or case_row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                run = SQLiteWorkflowMetadataRepository._run(run_row)
+                if (run.workflow_id != job.id or run.run_id != job.id or run.request_id != job.id
+                        or run.case_id != job.case_id or run.owner_user_id != worker_id
+                        or case_row["customer_id"] != str(job.customer_id)
+                        or case_row["order_customer_id"] != str(job.customer_id)):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                try:
+                    self._stored_request(job, run)
+                except ValueError:
+                    self._require_claim_recovery(
+                        connection, job=job, observed_at=observed_at,
+                    )
+                    incompatible = True
+                else:
+                    context = InvestigationExecutionContext(
+                        job_id=job.id, execution_id=job.id,
+                        execution_attempt_id=job.execution_attempt_id,
+                        workflow_id=job.workflow_id, worker_id=job.claimed_by,
+                        customer_id=job.customer_id, case_id=job.case_id,
+                        order_id=UUID(case_row["order_id"]),
+                        agent_request_json=job.agent_request_json or "",
+                        agent_request_fingerprint=job.agent_request_fingerprint or "",
+                    )
+        if expired:
+            raise ConflictError("Investigation job lease expired and requires recovery")
+        if incompatible:
+            raise ConflictError("Investigation job reservation requires recovery")
+        if context is None:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        with trusted_investigation_execution(context):
+            yield context
+
+    def execution_request(self, job_id: UUID, *, worker_id: UUID, claim_id: UUID,
+                          now: datetime | None = None) -> AgentRequest:
+        """Return the exact bound descriptor for a future trusted executor.
+
+        This is a validation/read gate only. It deliberately does not create a
+        workflow, call a provider, or record an execution attempt.
+        """
+        observed_at = self._claim_time(now)
+        expired = False
+        incompatible = False
+        request: AgentRequest | None = None
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.claim_id != claim_id or job.claimed_by != worker_id:
+                raise ConflictError("Investigation job claim is not owned by this worker")
+            if job.status != InvestigationJobStatus.CLAIMED or job.workflow_id is None:
+                raise ConflictError("Investigation job is not ready for execution")
+            if job.execution_attempt_id is not None:
+                raise ConflictError("Investigation job already has an execution attempt")
+            if job.lease_expires_at is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            if job.lease_expires_at <= observed_at:
+                self._require_bound_workflow_recovery(
+                    connection, job=job, observed_at=observed_at,
+                )
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.LEASE_EXPIRED.value, observed_at.isoformat(),
+                     str(job.id), InvestigationJobStatus.CLAIMED.value),
+                )
+                expired = True
+            else:
+                run_row = connection.execute(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = ?", (str(job.workflow_id),),
+                ).fetchone()
+                if run_row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                run = SQLiteWorkflowMetadataRepository._run(run_row)
+                if (run.workflow_id != job.id or run.run_id != job.id or run.request_id != job.id
+                        or run.case_id != job.case_id or run.owner_user_id != worker_id):
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                try:
+                    request = self._stored_request(job, run)
+                except ValueError:
+                    self._require_claim_recovery(
+                        connection, job=job, observed_at=observed_at,
+                    )
+                    incompatible = True
+        if expired:
+            raise ConflictError("Investigation job lease expired and requires recovery")
+        if incompatible:
+            raise ConflictError("Investigation job reservation requires recovery")
+        if request is None:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+        return request
 
 
 class SQLiteRefundEvidenceRepository:
@@ -1369,12 +2436,12 @@ class SQLiteProposalRepository:
                         "Workflow-bound proposal must be reviewed through its active workflow"
                     )
                 anchor = connection.execute(
-                    """SELECT case_id, status, updated_at
+                    """SELECT case_id, owner_user_id, status, updated_at
                        FROM workflow_runs WHERE workflow_id = ?""",
                     (str(binding.workflow_id),),
                 ).fetchone()
                 if (anchor is None or anchor["case_id"] != str(binding.case_id)
-                        or anchor["status"] != "REVIEW_REQUIRED"):
+                        or anchor["status"] not in ("REVIEW_REQUIRED", "RESUMING")):
                     raise ConflictError("Workflow review binding is stale or invalid")
                 audit_workflow_id = binding.workflow_id
                 audit_review_id = binding.review_id
@@ -1418,11 +2485,21 @@ class SQLiteProposalRepository:
             })
             anchor_update = connection.execute(
                 """UPDATE workflow_runs SET status = 'REVIEWED', updated_at = ?
-                   WHERE workflow_id = ? AND case_id = ? AND status = 'REVIEW_REQUIRED'""",
+                   WHERE workflow_id = ? AND case_id = ?
+                     AND status IN ('REVIEW_REQUIRED', 'RESUMING')""",
                 (now.isoformat(), str(audit_workflow_id), str(proposal.case_id)),
             )
             if anchor_update.rowcount != 1:
                 raise ConflictError("Workflow review binding is stale or invalid")
+            if binding_row is not None and anchor["owner_user_id"] != self._ANCHOR_OWNER:
+                updated_run = connection.execute(
+                    "SELECT * FROM workflow_runs WHERE workflow_id = ?",
+                    (str(audit_workflow_id),),
+                ).fetchone()
+                SQLiteWorkflowMetadataRepository._append_run_event(
+                    connection, run=SQLiteWorkflowMetadataRepository._run(updated_run),
+                    kind="STATUS_CHANGED", previous_status=WorkflowMetadataStatus(anchor["status"]),
+                )
             self._append_audit(
                 connection, workflow_id=audit_workflow_id, kind="HUMAN_REVIEW",
                 proposal=reviewed, review_id=audit_review_id, created_at=now,
@@ -1593,6 +2670,40 @@ class SQLiteWorkflowMetadataRepository:
             if row is None:
                 raise NotFoundError("Workflow request not found")
             return self._run(row)
+
+    def active_runs(self) -> tuple[WorkflowRunMetadata, ...]:
+        """Return only unfinalized runs for trusted startup recovery."""
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                """SELECT * FROM workflow_runs
+                   WHERE status IN ('RUNNING', 'RESUMING', 'REVIEW_REQUIRED')
+                   ORDER BY created_at, workflow_id""",
+            ).fetchall()
+            return tuple(self._run(row) for row in rows)
+
+    def visible_runs_for_case(self, case_id: UUID, owner_user_id: UUID | None,
+                              offset: int, limit: int) -> tuple[WorkflowRunMetadata, ...]:
+        """Return a bounded audit projection without hydrating or replaying workflows."""
+        if isinstance(offset, bool) or isinstance(limit, bool) or offset < 0 or limit < 1:
+            raise ValueError("Invalid workflow run page")
+        clauses = [
+            "case_id = ?",
+            "status IN ('RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED', 'FAILED')",
+        ]
+        parameters = [str(case_id)]
+        if owner_user_id is not None:
+            clauses.append("owner_user_id = ?")
+            parameters.append(str(owner_user_id))
+        parameters.extend((limit, offset))
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM workflow_runs
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at, workflow_id
+                    LIMIT ? OFFSET ?""",
+                parameters,
+            ).fetchall()
+            return tuple(self._run(row) for row in rows)
 
     def transition(self, workflow_id: UUID, *, owner_user_id: UUID, case_id: UUID,
                    expected_status: WorkflowMetadataStatus,

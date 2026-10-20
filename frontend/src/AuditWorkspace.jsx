@@ -19,7 +19,7 @@ function runStatusTone(status) {
 function failure(error) {
   if ([401, 403].includes(error.status)) return 'Audit access was denied. Confirm an authorized reviewer or administrator identity.';
   if (error.code === 'AUDIT_PENDING_USE_EVENTS') return 'Audit metadata is pending while this run executes or resumes. Refresh after it pauses or finishes.';
-  if (error.status === 404) return 'This resource is no longer available. Runs are held in memory and may be lost after a server restart. Refresh the case list and confirm your identity again.';
+  if (error.status === 404) return 'This resource is no longer available. Refresh the case list and confirm your identity again.';
   if (error.code === 'INVALID_AUDIT_RESPONSE' || [409, 422].includes(error.status)) return 'The selection or audit response could not be verified. Refresh the case list. If the server restarted, confirm your identity again.';
   if (error.status === 503) return 'Audit data or the service is unavailable. Refresh when the service is available.';
   return 'Audit data could not be loaded or verified. Check the local API and refresh to try again.';
@@ -126,7 +126,7 @@ function RunPage({ api, instanceId, caseId, offset, onDenied, previous, next, fo
       <ReadStatus state={state} loading="Loading case runs\u2026" />
       {state.data && <>
         {state.data.items.length === 0
-          ? <p className="run-notice" role="status">No runs are available on this page for this case in the current server process.</p>
+          ? <p className="run-notice" role="status">No runs are available on this page for this case.</p>
           : <label htmlFor="audit-run">
               Run
               <select id="audit-run" value={selected?.run_id ?? ''} onChange={(event) => {
@@ -253,8 +253,8 @@ export default function AuditWorkspace({ api, identity }) {
   return (
     <div className="audit-workspace">
       <p className="run-notice">
-        Read-only workflow audit metadata from the current server process.
-        History is held in memory and is not a durable or complete compliance log.
+        Read-only workflow audit metadata. When SQLite-backed LangGraph persistence is configured, runs remain available after restart;
+        in-memory and Strands runs remain process-local. This is not a complete compliance log.
         A recorded approval does not mean a business action was executed.
       </p>
       {(!api || !identity) ? (

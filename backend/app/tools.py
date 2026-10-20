@@ -12,6 +12,7 @@ from .proposals import ProposalCreate, ProposalService, ResolutionProposal
 from .schemas import RequestModel
 from .service import CaseService, ConflictError, NotFoundError
 from .knowledge import KnowledgeError, KnowledgeQuery, KnowledgeRetriever, LocalKnowledgeRetriever, RetrievalResult, retrieve_safely
+from .resolution_drafts import ResolutionDraft, build_resolution_draft
 from .security import Authorization, SecurityError, current_identity
 from .guardrails import GuardrailError, check_payload
 from .observability import observed
@@ -94,6 +95,8 @@ class LocalTools:
 
     def __init__(self, cases: CaseService, operations: BusinessOperations,
                  proposals: ProposalService, knowledge: KnowledgeRetriever | None = None) -> None:
+        self._cases = cases
+        self._operations = operations
         self._authorization = Authorization(cases, proposals)
         retriever = knowledge if knowledge is not None else LocalKnowledgeRetriever()
         self._bindings = {
@@ -138,6 +141,42 @@ class LocalTools:
                 "Read the proposal record and current review status; never change it.",
             ),
         }
+
+    def build_resolution_draft(self, case_id: UUID, message: str) -> ResolutionDraft:
+        """Build a grounded application draft after normal case authorization."""
+        case = self._authorization.case(case_id)
+        order = self._cases.get_order(case.order_id)
+        policy = self._operations.get_policy("standard-return")
+        return build_resolution_draft(
+            case, order,
+            trusted_delivery_evidence=self._operations.has_trusted_delivery_evidence(case.id),
+            policy_id=policy.id, policy_version=policy.version, message=message,
+        )
+
+    def retrieve_grounded_policy(self, request: KnowledgeQuery) -> RetrievalResult:
+        """Retrieve server-selected policy guidance through the normal trust boundary.
+
+        This is intentionally not an LLM-dispatchable tool call.  It retains the
+        same authentication, authorization, validation and injection checks as
+        ``search_knowledge`` while preventing model or customer text from
+        choosing the automatic query.
+        """
+        try:
+            request = KnowledgeQuery.model_validate(request)
+            current_identity()
+            self._authorization.tool("search_knowledge", request)
+            check_payload(request.model_dump(mode="json"))
+            binding = self._bindings["search_knowledge"]
+            value = binding.handler(request)
+            data = binding.output_model.model_validate(
+                value.model_dump() if isinstance(value, BaseModel) else value,
+            )
+            check_payload(data.model_dump(mode="json"))
+            return data
+        except (SecurityError, GuardrailError, KnowledgeError):
+            raise
+        except Exception:
+            raise KnowledgeError("Knowledge retrieval is unavailable") from None
 
     def describe(self) -> list[ToolDescription]:
         """Return fresh schema descriptions, without exposing service handles."""

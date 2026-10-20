@@ -45,8 +45,9 @@ test('case and run lists reject mismatches, duplicate IDs and invalid offsets', 
   const valid = { scope: 'case_runs_in_this_process', items: [run()], next_offset: null };
   assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'local_scripted' }] }).auditRuns(binding)).items.length, 1);
   assert.equal((await client({ ...valid, items: [{ ...run(), provider: 'bedrock' }] }).auditRuns(binding)).items.length, 1);
+  assert.equal((await client({ ...valid, scope: 'case_runs_with_durable_metadata' }).auditRuns(binding)).items.length, 1);
   for (const change of [{ instance_id: id(9) }, { case_id: id(9) }, { run_id: 'bad' },
-    { workflow_id: 'PRIVATE' }, { status: 'PRIVATE' }, { provider: 'groq' }, { provider: 'gemini' },
+    { workflow_id: 'PRIVATE' }, { status: 'PRIVATE' }, { provider: 'unsupported' }, { provider: 'gemini' },
     { actions_executed: true }, { updated_at: 'PRIVATE' }]) {
     await assert.rejects(client({ ...valid, items: [{ ...run(), ...change }] }).auditRuns(binding), { code: 'INVALID_AUDIT_RESPONSE' });
   }
@@ -56,6 +57,7 @@ test('case and run lists reject mismatches, duplicate IDs and invalid offsets', 
 });
 
 test('audit rejects unsafe vocabulary, invalid fields, wrong run and broken cursors', async () => {
+  assert.equal((await client({ ...page(), scope: 'durable_workflow_audit' }).runAudit(binding)).events.length, 1);
   for (const change of [{ kind: 'PRIVATE' }, { tool: 'PRIVATE' }, { error: 'PRIVATE' }, { proposal_status: 'PRIVATE' },
     { proposal_id: 'PRIVATE' }, { reviewer_user_id: 'PRIVATE' }, { timestamp: 'PRIVATE' },
     { sequence: 0 }, { sequence: 2 }, { error: undefined }]) {
@@ -70,6 +72,8 @@ test('audit rejects unsafe vocabulary, invalid fields, wrong run and broken curs
 test('empty responses stay empty and audit pagination preserves backend sequence', async () => {
   assert.deepEqual(await client([]).auditCases(), []);
   assert.deepEqual(await client({ scope: 'case_runs_in_this_process', items: [], next_offset: null }).auditRuns(binding),
+    { items: [], next_offset: null });
+  assert.deepEqual(await client({ scope: 'case_runs_with_durable_metadata', items: [], next_offset: null }).auditRuns(binding),
     { items: [], next_offset: null });
   assert.deepEqual(await client(page([])).runAudit(binding), { events: [], next_after: 0, has_more: false });
   const events = Array.from({ length: 50 }, (_, index) => event(index + 1));

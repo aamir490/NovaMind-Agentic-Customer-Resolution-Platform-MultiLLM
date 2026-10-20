@@ -1,6 +1,7 @@
 """Focused M5B SQLite schema and transaction tests; no service wiring."""
 
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -15,6 +16,29 @@ class SQLitePersistenceTests(unittest.TestCase):
 
     def store(self):
         return SQLitePersistence(self.path, initialize=True)
+
+    def create_database_through(self, version):
+        """Build a real historical database without using the current migrator."""
+        self.path.touch()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("BEGIN IMMEDIATE")
+            for migration in MIGRATIONS:
+                if migration.version > version:
+                    break
+                for statement in migration.statements:
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (migration.version, "2026-01-01T00:00:00Z"),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def create_v6_database(self):
+        self.create_database_through(6)
 
     def insert_case(self, store):
         with store.transaction() as connection:
@@ -41,6 +65,68 @@ class SQLitePersistenceTests(unittest.TestCase):
         reopened = SQLitePersistence(self.path)
         with reopened.transaction() as connection:
             versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
+        self.assertEqual(versions, [migration.version for migration in MIGRATIONS])
+
+    def test_v6_database_upgrades_case_constraint_without_losing_references(self):
+        self.create_v6_database()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("INSERT INTO customers VALUES (?, ?)", ("customer-1", "Customer"))
+            connection.execute(
+                "INSERT INTO orders VALUES (?, ?, ?)",
+                ("order-1", "customer-1", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                "INSERT INTO order_items VALUES (?, ?, ?, ?)",
+                ("order-1", "LAP-1", "Laptop", 1),
+            )
+            connection.execute(
+                "INSERT INTO support_cases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("case-1", "customer-1", "order-1", "Issue", "Description", "in_review",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                """INSERT INTO resolution_proposals
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("proposal-1", "case-1", "replacement", "Replacement proposal", None,
+                 "PENDING_REVIEW", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+                 None, None, None),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = SQLitePersistence(self.path)
+        with store.transaction() as migrated:
+            versions = [row[0] for row in migrated.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )]
+            migrated.execute(
+                "UPDATE support_cases SET status = 'resolved', updated_at = ? WHERE case_id = ?",
+                ("2026-01-02T00:00:00Z", "case-1"),
+            )
+            self.assertEqual(migrated.execute(
+                "SELECT status FROM support_cases WHERE case_id = ?", ("case-1",)
+            ).fetchone()[0], "resolved")
+            self.assertEqual(migrated.execute(
+                "SELECT case_id FROM resolution_proposals WHERE proposal_id = ?", ("proposal-1",)
+            ).fetchone()[0], "case-1")
+            self.assertIsNone(migrated.execute("PRAGMA foreign_key_check").fetchone())
+        self.assertEqual(versions, [migration.version for migration in MIGRATIONS])
+
+    def test_v7_database_upgrades_to_add_decision_history_schema(self):
+        self.create_database_through(7)
+
+        store = SQLitePersistence(self.path)
+        with store.transaction() as migrated:
+            versions = [row[0] for row in migrated.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )]
+            tables = {row[0] for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )}
+            self.assertIn("case_resolution_decisions", tables)
         self.assertEqual(versions, [migration.version for migration in MIGRATIONS])
 
     def test_foreign_key_and_unique_constraints_reject_invalid_evidence(self):

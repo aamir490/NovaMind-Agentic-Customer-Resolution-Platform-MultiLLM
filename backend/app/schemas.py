@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .domain import CaseStatus, Description, Name, OrderItem, Subject
+from .domain import CaseStatus, CustomerMessage, DecisionReason, Description, Name, OrderItem, ResolutionAction, Subject
 
 
 class RequestModel(BaseModel):
@@ -31,6 +31,14 @@ class CaseStatusUpdate(RequestModel):
     status: CaseStatus
 
 
+class CaseResolutionCreate(RequestModel):
+    """Admin-only case outcome. Actor identity always comes from the access token."""
+    action: ResolutionAction
+    reason: DecisionReason
+    customer_message: CustomerMessage
+    evidence_reviewed: bool = False
+
+
 class CustomerCaseCreate(RequestModel):
     """
     Customer-safe case creation schema.
@@ -41,3 +49,8 @@ class CustomerCaseCreate(RequestModel):
     order_id: UUID
     subject: Subject
     description: Description
+
+
+class InvestigationJobBind(RequestModel):
+    """Staff supplies only the opaque lease token; identity comes from auth."""
+    claim_id: UUID

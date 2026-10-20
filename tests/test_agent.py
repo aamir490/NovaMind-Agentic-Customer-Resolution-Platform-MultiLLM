@@ -96,8 +96,16 @@ class AgentTests(unittest.TestCase):
                      MEMORY_INSTRUCTIONS, SAFETY_INSTRUCTIONS, "Eligibility is not authorization",
                      "At most one proposal may be created per run", "only for the supplied case"):
             self.assertIn(text, instructions)
+        expected_descriptions = self.tools.describe()
+        investigation_plan = getattr(getattr(self, "state", None), "investigation_plan", None)
+        if investigation_plan is not None:
+            expected_descriptions = [
+                item
+                for item in expected_descriptions
+                if item.name in investigation_plan.allowed_tools
+            ]
         self.assertEqual(json.loads(instructions.split("Tools: ", 1)[1]),
-                         [item.model_dump(mode="json") for item in self.tools.describe()])
+                         [item.model_dump(mode="json") for item in expected_descriptions])
         self.assertEqual(self.provider.schemas, [AgentDecision.model_json_schema()] * 2)
 
     def test_decision_schema_remains_strict_without_normalizing_tags(self):

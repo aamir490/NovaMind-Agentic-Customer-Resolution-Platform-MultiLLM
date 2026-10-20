@@ -5,7 +5,7 @@ from threading import RLock
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from .domain import Customer, Order, SupportCase, CaseStatus, can_transition
+from .domain import CaseResolutionDecision, Customer, Order, ResolutionAction, SupportCase, CaseStatus, can_transition
 from .schemas import CustomerCreate, OrderCreate, CaseCreate
 
 
@@ -30,6 +30,9 @@ class CaseRepository(Protocol):
     def list_orders(self, customer_id: UUID | None = None) -> list[Order]: ...
     def list_cases(self, customer_id: UUID | None = None) -> list[SupportCase]: ...
     def update_case(self, case: SupportCase) -> SupportCase: ...
+    def resolution_history(self, case_id: UUID) -> tuple[CaseResolutionDecision, ...]: ...
+    def record_resolution(self, current: SupportCase, updated: SupportCase,
+                          decision: CaseResolutionDecision) -> tuple[SupportCase, CaseResolutionDecision]: ...
 
 
 class CaseService:
@@ -39,6 +42,7 @@ class CaseService:
         self._customers: dict[UUID, Customer] = {}
         self._orders: dict[UUID, Order] = {}
         self._cases: dict[UUID, SupportCase] = {}
+        self._resolution_history: dict[UUID, tuple[CaseResolutionDecision, ...]] = {}
         self._repository = repository
         self._lock = RLock()
 
@@ -146,6 +150,12 @@ class CaseService:
                     if customer_id is None or case.customer_id == customer_id]
 
     def update_status(self, case_id: UUID, status: CaseStatus) -> SupportCase:
+        """Apply an ordinary workflow transition; final outcomes use resolve_case only."""
+        if status == CaseStatus.RESOLVED:
+            raise ConflictError("Resolved status requires an admin resolution decision")
+        return self._transition_status(case_id, status)
+
+    def _transition_status(self, case_id: UUID, status: CaseStatus) -> SupportCase:
         with self._lock:
             case = self.get_case(case_id)
             if not can_transition(case.status, status):
@@ -160,3 +170,54 @@ class CaseService:
                 return self._repository.update_case(updated)
             self._cases[case_id] = updated
             return updated
+
+    def resolution_history(self, case_id: UUID) -> tuple[CaseResolutionDecision, ...]:
+        """Return a copy-safe, append-only decision history for an existing case."""
+        with self._lock:
+            self.get_case(case_id)
+            if self._repository is not None:
+                return self._repository.resolution_history(case_id)
+            return self._resolution_history.get(case_id, ())
+
+    def resolve_case(self, case_id: UUID, *, action: ResolutionAction, reason: str,
+                     customer_message: str, admin_user_id: UUID,
+                     evidence_reviewed: bool) -> tuple[SupportCase, CaseResolutionDecision]:
+        """Record a human-admin resolution without executing any business action."""
+        with self._lock:
+            case = self.get_case(case_id)
+            previous = self._resolution_history.get(case_id, ()) if self._repository is None else ()
+            if previous and (previous[-1].action, previous[-1].reason, previous[-1].customer_message) == (
+                    action, reason, customer_message):
+                raise ConflictError("Duplicate case decision")
+            if action == ResolutionAction.REQUEST_MORE_EVIDENCE:
+                if case.status not in (CaseStatus.OPEN, CaseStatus.IN_REVIEW):
+                    raise ConflictError("Case is not available for an evidence request")
+                target_status = CaseStatus.IN_REVIEW
+            elif action == ResolutionAction.ESCALATE:
+                if case.status not in (CaseStatus.OPEN, CaseStatus.IN_REVIEW):
+                    raise ConflictError("Case is not available for escalation")
+                target_status = CaseStatus.ESCALATED
+            else:
+                if case.status != CaseStatus.IN_REVIEW:
+                    raise ConflictError("Case must be in review before a final decision")
+                if action == ResolutionAction.APPROVE_REPLACEMENT and evidence_reviewed is not True:
+                    raise ConflictError("Replacement approval requires confirmed evidence review")
+                target_status = CaseStatus.RESOLVED
+            now = datetime.now(timezone.utc)
+            updated = SupportCase(**{
+                **case.model_dump(), "status": target_status,
+                # A recorded decision is a state change even when it keeps the
+                # case in review.  This makes concurrent duplicate submissions
+                # stale at the repository's compare-and-swap boundary.
+                "updated_at": now,
+            })
+            decision = CaseResolutionDecision(
+                id=uuid4(), case_id=case_id, action=action, reason=reason,
+                customer_message=customer_message, admin_user_id=admin_user_id,
+                decided_at=now,
+            )
+            if self._repository is not None:
+                return self._repository.record_resolution(case, updated, decision)
+            self._cases[case_id] = updated
+            self._resolution_history[case_id] = (*self._resolution_history.get(case_id, ()), decision)
+            return updated, decision

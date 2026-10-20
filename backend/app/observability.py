@@ -94,7 +94,7 @@ def _metadata(fields):
             safe[key] = value if isinstance(value, str) and value in TOOLS else "unknown"
         elif key == "status" and isinstance(value, str) and value in STATUSES:
             safe[key] = str(value)
-        elif key == "provider" and value in {"groq", "bedrock", "fake", "other"}:
+        elif key == "provider" and value in {"bedrock", "fake", "other"}:
             safe[key] = value
         elif key == "invalid_response_stage" and isinstance(value, str) and value in {
                 "provider_envelope", "json_guardrail", "output_schema"}:

@@ -17,6 +17,7 @@ const loadingMessages = {
   context:    'Loading case, customer, and order details\u2026',
   item:       'Loading inventory and applicable policy\u2026',
   assessment: 'Checking eligibility with the backend\u2026',
+  resolution: 'Recording the admin case decision\u2026',
 };
 
 // Status badge CSS modifier — maps backend status strings to design-system tones.
@@ -59,7 +60,129 @@ function LoadingDot() {
   return <span className="case-loading-dot" aria-hidden="true" />;
 }
 
-export default function CaseReview({ api = defaultApi }) {
+const resolutionLabels = {
+  APPROVE_REPLACEMENT: 'Approve replacement',
+  DECLINE_REPLACEMENT: 'Decline replacement',
+  REQUEST_MORE_EVIDENCE: 'Request more evidence',
+  ESCALATE: 'Escalate for specialist review',
+};
+
+const draftAction = {
+  REQUEST_EVIDENCE: 'REQUEST_MORE_EVIDENCE',
+  ESCALATE: 'ESCALATE',
+};
+
+function AdminCaseResolution({ api, supportCase, resolution, draft, onComplete }) {
+  const [action, setAction] = useState('REQUEST_MORE_EVIDENCE');
+  const [reason, setReason] = useState('');
+  const [customerMessage, setCustomerMessage] = useState('');
+  const [evidenceReviewed, setEvidenceReviewed] = useState(false);
+  const [state, setState] = useState({ phase: 'idle', message: '' });
+  const canRequestEvidence = ['open', 'in_review'].includes(supportCase.status);
+  const canEscalate = ['open', 'in_review'].includes(supportCase.status);
+  const canFinalize = supportCase.status === 'in_review';
+  const options = [
+    ...(canRequestEvidence ? ['REQUEST_MORE_EVIDENCE'] : []),
+    ...(canEscalate ? ['ESCALATE'] : []),
+    ...(canFinalize ? ['APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT'] : []),
+  ];
+
+  useEffect(() => {
+    if (!options.includes(action)) setAction(options[0] ?? 'REQUEST_MORE_EVIDENCE');
+  }, [action, options.join('|')]);
+
+  useEffect(() => {
+    const recommended = draft ? draftAction[draft.recommendedDecision] : null;
+    if (!draft || !recommended || !options.includes(recommended) || resolution?.latest) return;
+    setAction(recommended);
+    setReason(draft.decisionReason);
+    setCustomerMessage(draft.customerFacingResponse);
+    setEvidenceReviewed(false);
+    setState({ phase: 'idle', message: '' });
+  }, [draft?.recommendedDecision, draft?.decisionReason, draft?.customerFacingResponse,
+    resolution?.latest?.decidedAt, options.join('|')]);
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!options.includes(action) || state.phase === 'submitting') return;
+    setState({ phase: 'submitting', message: '' });
+    try {
+      const next = await api.resolveCase(supportCase.id, { action, reason, customerMessage, evidenceReviewed });
+      setState({ phase: 'idle', message: '' });
+      setReason(''); setCustomerMessage(''); setEvidenceReviewed(false);
+      onComplete(next);
+    } catch (error) {
+      setState({ phase: 'error', message: error.message || 'The decision could not be recorded.' });
+    }
+  }
+
+  return <section className="case-panel admin-resolution" aria-labelledby="admin-resolution-title">
+    <div className="case-panel-heading">
+      <div>
+        <p className="eyebrow">Admin case resolution</p>
+        <h3 id="admin-resolution-title">Record a customer outcome</h3>
+      </div>
+      <span className="badge">Admin only</span>
+    </div>
+    <p className="case-caption">
+      Bedrock and workflow proposals are advisory. This records a human decision only; it never creates a shipment,
+      reserves inventory, issues a refund, or performs another business action.
+    </p>
+    {draft && <section className="admin-resolution-draft" aria-labelledby="ai-draft-title">
+      <p className="eyebrow">Grounded AI draft</p>
+      <h4 id="ai-draft-title">Review, edit, and confirm</h4>
+      <dl className="case-facts">
+        <Detail title="Issue type">{label(draft.issueType)}</Detail>
+        <Detail title="Recommended decision">{resolutionLabels[draftAction[draft.recommendedDecision]]}</Detail>
+        <Detail title="Verified facts"><ul>{draft.verifiedFacts.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>
+        <Detail title="Missing evidence"><ul>{draft.missingEvidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></Detail>
+      </dl>
+      <p className="case-caption">The editable decision reason and customer response below were prefilled from this validated draft.</p>
+    </section>}
+    {resolution?.latest && <div className="admin-resolution-latest">
+      <strong>Latest: {resolutionLabels[resolution.latest.action]}</strong>
+      <span>{new Date(resolution.latest.decidedAt).toLocaleString()}</span>
+    </div>}
+    {options.length === 0 ? <p className="run-notice" role="status">
+      This case is {label(supportCase.status)} and cannot receive another resolution decision.
+    </p> : <form className="admin-resolution-form" onSubmit={submit}>
+      <label>Decision
+        <select value={action} onChange={(event) => { setAction(event.target.value); setState({ phase: 'idle', message: '' }); }} disabled={state.phase === 'submitting'}>
+          {options.map((option) => <option key={option} value={option}>{resolutionLabels[option]}</option>)}
+        </select>
+      </label>
+      <label>Decision reason
+        <textarea required minLength="1" maxLength="2000" value={reason} onChange={(event) => setReason(event.target.value)}
+          disabled={state.phase === 'submitting'} placeholder="Record the verified facts and policy basis for this decision." />
+      </label>
+      <label>Customer-facing response
+        <textarea required minLength="1" maxLength="2000" value={customerMessage} onChange={(event) => setCustomerMessage(event.target.value)}
+          disabled={state.phase === 'submitting'} placeholder="Explain the outcome and any next steps for the customer." />
+      </label>
+      {action === 'APPROVE_REPLACEMENT' && <label className="admin-resolution-check">
+        <input type="checkbox" checked={evidenceReviewed} onChange={(event) => setEvidenceReviewed(event.target.checked)}
+          disabled={state.phase === 'submitting'} required />
+        I confirmed the supporting evidence. This is a case decision only, not replacement execution.
+      </label>}
+      {['APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT'].includes(action) && !canFinalize && <p className="run-notice">Final replacement decisions require the case to be in review.</p>}
+      {state.phase === 'error' && <p className="run-error" role="alert">{state.message}</p>}
+      <button type="submit" disabled={state.phase === 'submitting' || !options.includes(action)}>
+        {state.phase === 'submitting' ? 'Recording decision…' : resolutionLabels[action]}
+      </button>
+    </form>}
+    {resolution?.history?.length > 0 && <details className="admin-resolution-history">
+      <summary>Decision audit history ({resolution.history.length})</summary>
+      <ol>
+        {resolution.history.map((entry) => <li key={`${entry.decidedAt}-${entry.adminUserId}`}>
+          <strong>{resolutionLabels[entry.action]}</strong><span>{entry.reason}</span>
+          <small>Recorded {new Date(entry.decidedAt).toLocaleString()} by {entry.adminUserId}</small>
+        </li>)}
+      </ol>
+    </details>}
+  </section>;
+}
+
+export default function CaseReview({ api = defaultApi, identity }) {
   const [cases, setCases]     = useState(null);
   const [selected, setSelected] = useState('');
   const [context, setContext] = useState(null);
@@ -149,7 +272,15 @@ export default function CaseReview({ api = defaultApi }) {
             className="case-selector-form"
             onSubmit={(event) => {
               event.preventDefault(); clearReview();
-              run('context', () => api.context(selected), setContext);
+              run('context', async () => {
+                const details = await api.context(selected);
+                if (identity?.role !== 'ADMIN' || typeof api.caseResolution !== 'function') return details;
+                const [resolution, resolutionDraft] = await Promise.all([
+                  api.caseResolution(selected),
+                  typeof api.caseResolutionDraft === 'function' ? api.caseResolutionDraft(selected) : null,
+                ]);
+                return { ...details, resolution, resolutionDraft };
+              }, setContext);
             }}
           >
             <fieldset disabled={busy}>
@@ -176,7 +307,9 @@ export default function CaseReview({ api = defaultApi }) {
         )}
 
         <p className="review-description">
-          Read-only review workspace. No case updates, stock reservations, refunds, or approvals are performed here.
+          {identity?.role === 'ADMIN'
+            ? 'Review evidence and record a customer outcome. Case decisions never execute stock, refunds, or replacements.'
+            : 'Read-only review workspace. No case updates, stock reservations, refunds, or approvals are performed here.'}
         </p>
       </div>
 
@@ -249,6 +382,14 @@ export default function CaseReview({ api = defaultApi }) {
               </Detail>
             </dl>
           </section>
+
+          {identity?.role === 'ADMIN' && context.resolution && typeof api.resolveCase === 'function' && (
+            <AdminCaseResolution api={api} supportCase={context.supportCase} resolution={context.resolution}
+              draft={context.resolutionDraft}
+              onComplete={(resolution) => setContext((current) => current && ({
+                ...current, supportCase: resolution.case, resolution,
+              }))} />
+          )}
 
           {/* Context + policy grid */}
           <div className="case-details-grid">

@@ -110,8 +110,12 @@ class GuardrailTests(unittest.TestCase):
             tools = LocalTools(self.cases, self.app.state.business_operations, self.proposals, LocalKnowledgeRetriever(path))
             for mode in ("loop", "graph", "hitl"):
                 result, provider, _ = self.execute(mode, [baseline.call("search_knowledge", query="refund")], tools=tools)
-                self.assertEqual(result.error, "UNSAFE_CONTENT")
-                self.assertEqual(len(provider.requests), 1)
+                # Automatic graph grounding rejects unsafe corpus text before
+                # model invocation and intentionally hides the rejection reason
+                # behind the same fail-closed retrieval error as other corrupt
+                # reference data.
+                self.assertEqual(result.error, "UNSAFE_CONTENT" if mode == "loop" else "KNOWLEDGE_UNAVAILABLE")
+                self.assertEqual(len(provider.requests), 1 if mode == "loop" else 0)
                 self.assertNotIn(ATTACK, result.model_dump_json())
 
     def test_model_injection_rationale_rejected_before_proposal_all_paths(self):

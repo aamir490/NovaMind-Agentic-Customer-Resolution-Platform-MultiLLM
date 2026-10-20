@@ -165,6 +165,10 @@ test('list loading, subject/status/date, detail fetch, all detail fields, and Ba
   const api = createApi(async (url, options) => {
     calls.push([url, options.method]);
     return { ok: true, json: async () => url === '/api/cases' ? [supportCase()]
+      : url.endsWith('/resolution') ? { case: supportCase({ status: 'in_review' }), latest: {
+        action: 'REQUEST_MORE_EVIDENCE',
+        customer_message: 'Please upload a clear photo of the damaged item.', decided_at: '2026-10-06T12:00:00Z',
+      } }
       : supportCase({ status: 'in_review' }) };
   });
   const page = view(api);
@@ -185,12 +189,18 @@ test('list loading, subject/status/date, detail fetch, all detail fields, and Ba
   }
   for (const value of [id(1), id(2), 'Wrong item', 'Please help with my order.', 'in_review',
     '2026-10-04T10:00:00Z', '2026-10-05T12:00:00Z']) assert.ok(detail.includes(value));
+  assert.match(detail, /Latest case decision/);
+  assert.match(detail, /More evidence requested/);
+  assert.match(detail, /Please upload a clear photo of the damaged item/);
+  assert.doesNotMatch(detail, /We need a clear photo of the damage/);
+  assert.doesNotMatch(detail, /admin_user_id|00000000-0000-4000-8000-000000000013/);
   assert.doesNotMatch(detail, /<form|<input|<textarea|Approve|Reject|Run agent|Proposal/);
   button(page.render(), 'Back to My Support Requests').props.onClick();
   page.render();
   await tick();
   assert.match(renderToStaticMarkup(page.render()), /View details/);
-  assert.deepEqual(calls, [['/api/cases', 'GET'], [`/api/cases/${id(1)}`, 'GET'], ['/api/cases', 'GET']]);
+  assert.deepEqual(calls, [['/api/cases', 'GET'], [`/api/cases/${id(1)}`, 'GET'],
+    [`/api/cases/${id(1)}/resolution`, 'GET'], ['/api/cases', 'GET']]);
   page.unmount();
 });
 

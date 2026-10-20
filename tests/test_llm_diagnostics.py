@@ -237,7 +237,7 @@ class LLMDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     def test_telemetry_contract_rejects_unknown_stages_and_extra_payload_fields(self):
         self.generate(self.response(OUTPUT))
         event = self.observer.snapshot()["events"][-1]
-        for label in ("groq", "bedrock", "fake", "other", None):
+        for label in ("bedrock", "fake", "other", None):
             self.assertEqual(TelemetryEvent.model_validate({**event, "provider": label}).provider, label)
         for label in ("gemini", "PRIVATE"):
             with self.assertRaises(ValidationError):
