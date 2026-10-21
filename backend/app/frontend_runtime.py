@@ -9,7 +9,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .agent import AgentRequest
-from .graph_agent import GraphState
+from .graph_agent import GraphResolutionAgent, GraphState
 from .frontend_contracts import (
     AuditPage, AuditSummary, EventPage, PendingReviewPage, PendingReviewRun, RunEvent, RunPage, RunSnapshot,
 )
@@ -165,7 +165,7 @@ class FrontendRuntime:
                 "conversation_id": restored.agent.request.conversation_id,
                 "review": review,
                 "reviewed_status": restored.reviewed_status,
-                "resolution_draft": restored.agent.resolution_draft,
+                "resolution_draft": GraphResolutionAgent.resolution_draft_for_state(restored.agent),
                 "error": safe_error(restored.error),
             })
             self._runs[metadata.run_id] = holder
@@ -220,7 +220,7 @@ class FrontendRuntime:
         with self._lock:
             run.snapshot = run.snapshot.model_copy(update={"workflow_id": state.workflow_id,
                 "conversation_id": state.agent.request.conversation_id, "review": state.review,
-                "resolution_draft": state.agent.resolution_draft})
+                "resolution_draft": GraphResolutionAgent.resolution_draft_for_state(state.agent)})
             self._publish(run, "NODE", phase, node=node)
             if node not in ("load_case", "execute_tool"):
                 return
@@ -421,14 +421,18 @@ class FrontendRuntime:
                     }})
                     values = checkpoint.checkpoint.get("channel_values", {}) if checkpoint else {}
                     agent = GraphState.model_validate(values.get("agent"))
-                    if (agent.resolution_draft is not None
-                            and (newest is None or record.updated_at >= newest.updated_at)):
+                    draft = GraphResolutionAgent.admin_resolution_draft_for_state(agent)
+                    if (draft is not None and (newest is None
+                            or record.updated_at >= newest.updated_at
+                            # The append-only durable checkpoint is canonical
+                            # for a live snapshot of this same workflow.
+                            or newest.workflow_id == record.workflow_id)):
                         newest = RunSnapshot(
                             instance_id=self.instance_id, run_id=record.run_id,
                             case_id=case_id, workflow_id=record.workflow_id,
                             provider=record.provider, status=record.status.value,
                             created_at=record.created_at, updated_at=record.updated_at,
-                            resolution_draft=agent.resolution_draft,
+                            resolution_draft=draft,
                         )
                 except Exception:
                     # A malformed historical checkpoint must not result in a

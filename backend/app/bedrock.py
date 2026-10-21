@@ -44,9 +44,15 @@ def _decision_tool_schemas(response_schema: dict) -> dict[str, dict] | None:
     # JsonValue is recursive and renders as {} in Pydantic's schema. Keep the
     # provider projection shallow; the original union is validated locally.
     return {
-        _FINAL_FORMAT_TOOL: {"type": "object", "properties": {"decision": {
-            "type": "object", "properties": {"kind": {"type": "string", "enum": ["final"]}},
-            "required": ["kind"]}}, "required": ["decision"]},
+        _FINAL_FORMAT_TOOL: {"type": "object", "properties": {
+            "decision": {"type": "object", "properties": {
+                "kind": {"type": "string", "enum": ["final"]},
+            }, "required": ["kind"]},
+            # The full strict GroundedResponse schema remains in the system
+            # instruction and is enforced locally. Nova's provider projection
+            # must still admit this optional final-only payload.
+            "grounded_response": {"type": "object"},
+        }, "required": ["decision"]},
         _TOOL_FORMAT_TOOL: {"type": "object", "properties": {"decision": {
             "type": "object", "properties": {"kind": {"type": "string", "enum": ["tool"]},
                                           "name": {"type": "string"},

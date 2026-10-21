@@ -70,6 +70,9 @@ test('ADMIN explicitly reviews, edits, and sends guidance without changing case 
     missingEvidence: ['Result after testing another USB port.'],
     decisionReason: 'More diagnostic evidence is needed.',
     customerFacingResponse: 'Please test another USB port and tell us whether the issue continues.',
+    responseSource: 'BEDROCK_VALIDATED',
+    citations: [{ documentId: 'warranty-guidance', chunkId: 'a'.repeat(64),
+      title: 'Warranty guidance', version: 'v1' }],
   };
   const calls = [];
   let completed = null;
@@ -86,6 +89,9 @@ test('ADMIN explicitly reviews, edits, and sends guidance without changing case 
   let tree = render();
   let html = renderToStaticMarkup(tree);
   assert.match(html, /Grounded AI draft/);
+  assert.match(html, /Bedrock validated/);
+  assert.match(html, /More diagnostic evidence is needed/);
+  assert.match(html, /Warranty guidance/);
   assert.match(html, /Nothing is sent automatically/);
   assert.match(html, /Send guidance/);
   assert.equal(calls.length, 0);

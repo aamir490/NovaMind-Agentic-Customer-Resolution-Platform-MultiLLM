@@ -202,8 +202,14 @@ export function AdminCustomerGuidance({ api, supportCase, draft, latest, onCompl
     <dl className="case-facts">
       <Detail title="Issue type">{label(draft.issueType)}</Detail>
       <Detail title="Recommended decision">{resolutionLabels[draftAction[draft.recommendedDecision]]}</Detail>
+      <Detail title="Response source">{draft.responseSource === 'BEDROCK_VALIDATED'
+        ? 'Bedrock validated' : 'Deterministic fallback'}</Detail>
+      <Detail title="Decision reason">{draft.decisionReason}</Detail>
       <Detail title="Verified facts"><ul>{draft.verifiedFacts.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>
       <Detail title="Missing evidence"><ul>{draft.missingEvidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></Detail>
+      {draft.citations.length > 0 && <Detail title="Policy citations"><ul>{draft.citations.map((citation) => (
+        <li key={citation.chunkId}>{citation.title} ({citation.documentId}, {citation.version})</li>
+      ))}</ul></Detail>}
     </dl>
     {latest && <div className="admin-resolution-latest">
       <strong>Latest sent guidance</strong>

@@ -24,6 +24,23 @@ class RecommendedDecision(StrEnum):
     ESCALATE = "ESCALATE"
 
 
+class ResponseSource(StrEnum):
+    """Whether customer wording was accepted from Bedrock or rendered locally."""
+
+    BEDROCK_VALIDATED = "BEDROCK_VALIDATED"
+    DETERMINISTIC_FALLBACK = "DETERMINISTIC_FALLBACK"
+
+
+class ResolutionCitation(Record):
+    """A compact, application-owned projection of one retrieved policy passage."""
+
+    document_id: str = Field(pattern=r"^[a-z0-9-]{1,80}$")
+    chunk_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    title: str = Field(min_length=1, max_length=160)
+    version: str = Field(min_length=1, max_length=160)
+    source_uri: str = Field(pattern=r"^local-knowledge://[a-z0-9-]{1,80}$")
+
+
 class CustomerIntent(StrEnum):
     REPORT_ISSUE = "report_issue"
     TRACK_DELIVERY = "track_delivery"
@@ -58,6 +75,8 @@ class ResolutionDraft(Record):
     missing_evidence: tuple[str, ...] = Field(min_length=1, max_length=6)
     decision_reason: str = Field(min_length=1, max_length=1200)
     customer_facing_response: str = Field(min_length=1, max_length=1200)
+    response_source: ResponseSource = ResponseSource.DETERMINISTIC_FALLBACK
+    citations: tuple[ResolutionCitation, ...] = Field(default=(), max_length=5)
     actions_executed: Literal[False] = False
 
 

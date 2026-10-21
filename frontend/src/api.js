@@ -52,6 +52,7 @@ function myCase(supportCase) {
 const resolutionActions = ['APPROVE_REPLACEMENT', 'DECLINE_REPLACEMENT', 'REQUEST_MORE_EVIDENCE', 'ESCALATE'];
 const draftIssueTypes = ['damaged', 'wrong_item', 'missing_item', 'delayed_delivery', 'malfunction', 'return', 'refund_not_received'];
 const draftDecisions = ['REQUEST_EVIDENCE', 'ESCALATE'];
+const draftResponseSources = ['BEDROCK_VALIDATED', 'DETERMINISTIC_FALLBACK'];
 
 function customerResolution(payload, caseId) {
   const supportCase = myCase(payload?.case);
@@ -77,16 +78,26 @@ function customerCommunication(payload) {
 
 function adminResolutionDraft(payload) {
   if (payload === null) return null;
+  const citations = payload?.citations;
   requireResponse(payload && draftIssueTypes.includes(payload.issue_type)
     && draftDecisions.includes(payload.recommended_decision)
     && isTextList(payload.verified_facts) && payload.verified_facts.length >= 1 && payload.verified_facts.length <= 8
     && isTextList(payload.missing_evidence) && payload.missing_evidence.length >= 1 && payload.missing_evidence.length <= 6
     && isText(payload.decision_reason) && Array.from(payload.decision_reason).length <= 1200
     && isText(payload.customer_facing_response) && Array.from(payload.customer_facing_response).length <= 1200
+    && draftResponseSources.includes(payload.response_source)
+    && Array.isArray(citations) && citations.length <= 5
+    && citations.every((citation) => citation && isText(citation.document_id)
+      && isText(citation.chunk_id) && isText(citation.title) && isText(citation.version)
+      && isText(citation.source_uri))
     && payload.actions_executed === false, 'resolution draft');
   return { issueType: payload.issue_type, recommendedDecision: payload.recommended_decision,
     verifiedFacts: payload.verified_facts, missingEvidence: payload.missing_evidence,
-    decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response };
+    decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response,
+    responseSource: payload.response_source, citations: citations.map((citation) => ({
+      documentId: citation.document_id, chunkId: citation.chunk_id, title: citation.title,
+      version: citation.version,
+    })) };
 }
 
 const investigationModes = ['MANUAL', 'AUTO'];

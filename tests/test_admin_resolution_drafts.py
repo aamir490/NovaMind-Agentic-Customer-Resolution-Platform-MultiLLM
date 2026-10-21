@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import time
 import unittest
 from uuid import UUID, uuid4
@@ -13,6 +14,7 @@ from backend.app.llm import FakeLLMProvider, LLMResponse
 from backend.app.main import create_app
 from backend.app.schemas import CaseCreate, OrderCreate
 from backend.app.security import AuthenticatedIdentity, LocalAuthenticationProvider, LocalCredential, Role
+import test_agent as baseline
 
 
 ADMIN_ID = UUID("00000000-0000-4000-8000-000000000091")
@@ -35,9 +37,11 @@ class AdminResolutionDraftTests(unittest.TestCase):
         ))
         self.provider_calls = []
 
-    def app(self):
+    def app(self, response=None):
         def factory():
             self.provider_calls.append(True)
+            if response is not None:
+                return baseline.ScriptedProvider((response,))
             return FakeLLMProvider(LLMResponse(
                 text='{"decision":{"kind":"final"}}', finish_reason="stop",
             ))
@@ -90,6 +94,8 @@ class AdminResolutionDraftTests(unittest.TestCase):
             self.assertEqual(draft_response.status_code, 200, draft_response.text)
             draft = draft_response.json()
             self.assertEqual(draft["recommended_decision"], "REQUEST_EVIDENCE")
+            self.assertEqual(draft["response_source"], "DETERMINISTIC_FALLBACK")
+            self.assertTrue(draft["citations"])
             self.assertFalse(draft["actions_executed"])
 
             body = {"action": "REQUEST_MORE_EVIDENCE", "reason": draft["decision_reason"],
@@ -119,6 +125,51 @@ class AdminResolutionDraftTests(unittest.TestCase):
             self.assertEqual(restored.status_code, 200, restored.text)
             self.assertEqual(restored.json()["issue_type"], "damaged")
             self.assertEqual(restored.json()["recommended_decision"], "REQUEST_EVIDENCE")
+            self.assertEqual(restored.json()["response_source"], "DETERMINISTIC_FALLBACK")
+        self.assertEqual(len(self.provider_calls), calls_before_read)
+        restarted.state.frontend_runtime.close()
+
+    def test_validated_bedrock_wording_survives_hitl_checkpoint_and_admin_projection(self):
+        def grounded_final(request):
+            context = json.loads(request.messages[-1].content)
+            draft = context["grounded_resolution_draft"]
+            grounding = context["grounded_policy_evidence"]
+            return {"decision": {"kind": "final"}, "resolution_draft": draft, "grounded_response": {
+                "issue_type": draft["issue_type"],
+                "recommended_decision": draft["recommended_decision"],
+                "verified_facts": draft["verified_facts"],
+                "missing_evidence": draft["missing_evidence"],
+                "policy_passages": grounding["policy_passages"],
+                "decision_reason": "Verified records still require the requested evidence for support review.",
+                "customer_facing_response": (
+                    "Please send the requested evidence so support can review your report. "
+                    "No refund, replacement, return, or payment action has been executed."
+                ),
+            }}
+
+        first = self.app(grounded_final)
+        support_case = self.case(first, "Damaged laptop", "The product arrived damaged.")
+        with TestClient(first) as client:
+            self.start(client, support_case, "My laptop arrived damaged.")
+            draft = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                               headers=self.headers(ADMIN_TOKEN))
+            self.assertEqual(draft.status_code, 200, draft.text)
+            self.assertEqual(draft.json()["response_source"], "BEDROCK_VALIDATED")
+            self.assertEqual(draft.json()["decision_reason"],
+                             "Verified records still require the requested evidence for support review.")
+            self.assertIn("Please send the requested evidence", draft.json()["customer_facing_response"])
+            self.assertTrue(draft.json()["citations"])
+        first.state.frontend_runtime.close()
+
+        calls_before_read = len(self.provider_calls)
+        restarted = self.app()
+        with TestClient(restarted) as client:
+            restored = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                                  headers=self.headers(ADMIN_TOKEN))
+            self.assertEqual(restored.status_code, 200, restored.text)
+            self.assertEqual(restored.json()["response_source"], "BEDROCK_VALIDATED")
+            self.assertIn("Please send the requested evidence", restored.json()["customer_facing_response"])
+            self.assertTrue(restored.json()["citations"])
         self.assertEqual(len(self.provider_calls), calls_before_read)
         restarted.state.frontend_runtime.close()
 

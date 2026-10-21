@@ -12,7 +12,9 @@ from pydantic import Field
 
 from .domain import Record
 from .knowledge import KnowledgeQuery, RetrievalResult
-from .resolution_drafts import IssueType, RecommendedDecision, ResolutionDraft
+from .resolution_drafts import (
+    IssueType, RecommendedDecision, ResolutionCitation, ResolutionDraft, ResponseSource,
+)
 from .guardrails import GuardrailError, check_payload
 
 
@@ -97,6 +99,19 @@ def build_evidence_grounding(draft: ResolutionDraft, retrieval: RetrievalResult)
     )
 
 
+def attach_grounding_citations(draft: ResolutionDraft, grounding: EvidenceGrounding) -> ResolutionDraft:
+    """Expose only retriever-owned citation metadata alongside a safe draft."""
+    draft = ResolutionDraft.model_validate(draft)
+    grounding = EvidenceGrounding.model_validate(grounding)
+    return draft.model_copy(update={"citations": tuple(ResolutionCitation(
+        document_id=passage.document_id,
+        chunk_id=passage.chunk_id,
+        title=passage.title,
+        version=passage.version,
+        source_uri=passage.source_uri,
+    ) for passage in grounding.policy_passages)})
+
+
 def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding,
                             candidate: GroundedResponse | None) -> ResolutionDraft | None:
     """Accept prose only when every authoritative field is an exact echo.
@@ -129,6 +144,14 @@ def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding
         return draft.model_copy(update={
             "decision_reason": candidate.decision_reason,
             "customer_facing_response": candidate.customer_facing_response,
+            "response_source": ResponseSource.BEDROCK_VALIDATED,
+            "citations": tuple(ResolutionCitation(
+                document_id=passage.document_id,
+                chunk_id=passage.chunk_id,
+                title=passage.title,
+                version=passage.version,
+                source_uri=passage.source_uri,
+            ) for passage in grounding.policy_passages),
         })
     except (ValueError, GuardrailError):
         return None

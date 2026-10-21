@@ -18,7 +18,7 @@ from .guardrails import GuardrailError, check_payload
 from .observability import observed
 from .resolution_drafts import InvestigationPlan, ResolutionDraft, build_investigation_plan
 from .evidence_grounding import (
-    EvidenceGrounding, GroundedResponse, apply_grounded_response,
+    EvidenceGrounding, GroundedResponse, apply_grounded_response, attach_grounding_citations,
     build_evidence_grounding, policy_query_for,
 )
 
@@ -365,11 +365,37 @@ class GraphResolutionAgent:
         return self._update(state, "record_result", **changes)
 
     @staticmethod
+    def resolution_draft_for_state(state: GraphState) -> ResolutionDraft | None:
+        """Return the validated wording that is safe to project from a checkpoint."""
+        if state.final_result is not None and state.final_result.resolution_draft is not None:
+            return state.final_result.resolution_draft
+        if state.generated_resolution_draft is not None:
+            return state.generated_resolution_draft
+        if state.model_resolution_draft == state.resolution_draft:
+            return state.model_resolution_draft
+        return state.resolution_draft
+
+    @staticmethod
+    def admin_resolution_draft_for_state(state: GraphState) -> ResolutionDraft | None:
+        """Add retriever-owned citation metadata only at the admin read projection.
+
+        The fallback draft held by the graph remains identical to the existing
+        deterministic contract.  This keeps graph/Phase 8 parity intact while
+        allowing the staff-only API to show the policy sources that were
+        actually retrieved for the run.
+        """
+        draft = GraphResolutionAgent.resolution_draft_for_state(state)
+        if draft is None or state.knowledge_grounding is None:
+            return draft
+        return attach_grounding_citations(draft, state.knowledge_grounding)
+
+    @staticmethod
     def _result(state: GraphState, history: tuple[AuditEntry, ...], error: str | None = None) -> AgentResult:
         ids = tuple(key for key, value in state.pending.items() if value)
-        draft = (state.model_resolution_draft
-                 if state.model_resolution_draft == state.resolution_draft
-                 else (state.generated_resolution_draft or state.resolution_draft))
+        draft = (state.generated_resolution_draft
+                 or (state.model_resolution_draft
+                     if state.model_resolution_draft == state.resolution_draft
+                     else state.resolution_draft))
         message = "Informational results only. No refund, return, replacement, or inventory action was executed."
         if ids:
             message = ("Proposal(s) recorded as PENDING_REVIEW require separate human review: "
