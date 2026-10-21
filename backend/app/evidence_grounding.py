@@ -13,7 +13,8 @@ from pydantic import Field
 from .domain import Record
 from .knowledge import KnowledgeQuery, RetrievalResult
 from .resolution_drafts import (
-    IssueType, RecommendedDecision, ResolutionCitation, ResolutionDraft, ResponseSource,
+    IssueType, RecommendedDecision, RefundRecommendationOutcome, ResolutionCitation,
+    ResolutionDraft, ResponseSource,
 )
 from .guardrails import GuardrailError, check_payload
 
@@ -54,6 +55,8 @@ class GroundedResponse(Record):
     decision_reason: str = Field(min_length=1, max_length=1200)
     customer_facing_response: str = Field(min_length=1, max_length=1200)
     troubleshooting_steps: tuple[str, ...] = Field(default=(), max_length=5)
+    refund_outcome: RefundRecommendationOutcome | None = None
+    refund_sku: str | None = Field(default=None, pattern=r"^[A-Za-z0-9-]{1,80}$")
     actions_executed: Literal[False] = False
 
 
@@ -108,13 +111,17 @@ def attach_grounding_citations(draft: ResolutionDraft, grounding: EvidenceGround
     """Expose only retriever-owned citation metadata alongside a safe draft."""
     draft = ResolutionDraft.model_validate(draft)
     grounding = EvidenceGrounding.model_validate(grounding)
-    return draft.model_copy(update={"citations": tuple(ResolutionCitation(
+    citations = tuple(ResolutionCitation(
         document_id=passage.document_id,
         chunk_id=passage.chunk_id,
         title=passage.title,
         version=passage.version,
         source_uri=passage.source_uri,
-    ) for passage in grounding.policy_passages)})
+    ) for passage in grounding.policy_passages)
+    recommendation = draft.refund_recommendation
+    if recommendation is not None:
+        recommendation = recommendation.model_copy(update={"citations": citations})
+    return draft.model_copy(update={"citations": citations, "refund_recommendation": recommendation})
 
 
 def _approved_product_steps(grounding: EvidenceGrounding) -> tuple[str, ...]:
@@ -150,6 +157,13 @@ def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding
                 or candidate.verified_facts != draft.verified_facts
                 or candidate.missing_evidence != draft.missing_evidence
                 or candidate.policy_passages != grounding.policy_passages):
+            return None
+        recommendation = draft.refund_recommendation
+        if recommendation is None:
+            if candidate.refund_outcome is not None or candidate.refund_sku is not None:
+                return None
+        elif (candidate.refund_outcome != recommendation.outcome
+              or candidate.refund_sku != recommendation.sku):
             return None
         approved_steps = _approved_product_steps(grounding)
         if candidate.troubleshooting_steps:

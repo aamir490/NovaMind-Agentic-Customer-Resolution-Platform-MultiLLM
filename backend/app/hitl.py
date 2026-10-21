@@ -107,7 +107,10 @@ class HITLWorkflow:
         if (checkpointer is None) != (workflow_metadata is None):
             raise ValueError("Durable checkpoints require durable workflow metadata")
         self._config = config or AgentConfig()
-        self._baseline = GraphResolutionAgent(llm, tools, self._config, memory=memory)
+        self._baseline = GraphResolutionAgent(
+            llm, tools, self._config, memory=memory,
+            enable_refund_wording=provider_label == "bedrock",
+        )
         self._memory = memory
         self._on_transition = on_transition
         self._proposals = proposals

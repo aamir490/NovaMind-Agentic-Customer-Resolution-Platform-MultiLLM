@@ -198,6 +198,28 @@ test('admin draft projection is bounded and never accepts an executed action', a
   await assert.rejects(api.caseResolutionDraft(caseId), /invalid resolution draft/);
 });
 
+test('admin draft exposes only a validated refund recommendation', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1);
+  const citation = { document_id: 'return-policy', chunk_id: 'b'.repeat(64), title: 'Return policy',
+    version: 'v1', source_uri: 'local-knowledge://return-policy' };
+  const draft = { issue_type: 'return', recommended_decision: 'REQUEST_EVIDENCE',
+    verified_facts: ['case_id:1'], missing_evidence: ['trusted delivery evidence'],
+    decision_reason: 'More evidence is required.', customer_facing_response: 'Please provide evidence.',
+    troubleshooting_steps: [], response_source: 'DETERMINISTIC_FALLBACK', citations: [citation],
+    refund_recommendation: { outcome: 'NEED_MORE_EVIDENCE', sku: 'LAP-1', verified_evidence: [],
+      missing_evidence: ['trusted delivery evidence'], policy_id: 'standard-return', policy_version: 'demo-v1',
+      decision_reason: 'Trusted delivery evidence is unavailable.', citations: [citation],
+      response_source: 'DETERMINISTIC_FALLBACK', authorization_granted: false, actions_executed: false },
+    actions_executed: false };
+  const api = createApi(async () => ({ ok: true, json: async () => draft }));
+  const result = await api.caseResolutionDraft(caseId);
+  assert.equal(result.refundRecommendation.outcome, 'NEED_MORE_EVIDENCE');
+  assert.equal(result.refundRecommendation.sku, 'LAP-1');
+  draft.refund_recommendation.authorization_granted = true;
+  await assert.rejects(api.caseResolutionDraft(caseId), /invalid refund recommendation/);
+});
+
 test('customer guidance uses an idempotent admin POST and a closed latest projection', async () => {
   const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
   const caseId = id(1), idempotencyKey = id(2);

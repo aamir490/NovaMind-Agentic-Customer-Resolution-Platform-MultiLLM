@@ -16,7 +16,10 @@ from .conversations import (ConversationService, ConversationError,
 from .security import SecurityError
 from .guardrails import GuardrailError, check_payload
 from .observability import observed
-from .resolution_drafts import InvestigationPlan, ResolutionDraft, build_investigation_plan
+from .resolution_drafts import (
+    InvestigationPlan, ResolutionDraft, attach_refund_recommendation,
+    build_investigation_plan, build_refund_recommendation,
+)
 from .evidence_grounding import (
     EvidenceGrounding, GroundedResponse, apply_grounded_response, attach_grounding_citations,
     build_evidence_grounding, policy_query_for,
@@ -50,11 +53,15 @@ class GraphState(Contract):
 
 class GraphResolutionAgent:
     def __init__(self, llm: StructuredLLM, tools: LocalTools, config: AgentConfig | None = None,
-                 *, memory: ConversationService | None = None) -> None:
+                 *, memory: ConversationService | None = None,
+                 enable_refund_wording: bool = False) -> None:
         self._llm = llm
         self._tools = tools
         self._config = config or AgentConfig()
         self._memory = memory
+        # The local/scripted path deliberately retains its existing no-model
+        # refund routing.  Production Bedrock may supply prose, never rules.
+        self._enable_refund_wording = enable_refund_wording
         graph = StateGraph(GraphState)
         for name in ("load_case", "evaluate_refund", "reason", "execute_tool", "record_result", "finalize", "fail_safely"):
             graph.add_node(name, getattr(self, "_" + name))
@@ -222,7 +229,13 @@ class GraphResolutionAgent:
 
         selected = next((item for item in order_result.data.items if item.sku == state.request.refund_sku), None)
         if selected is None:
+            recommendation = build_refund_recommendation(
+                sku=str(state.request.refund_sku), purchased=False,
+            )
+            draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                     if state.resolution_draft is not None else None)
             return self._update(state, "evaluate_refund", history=tuple(history),
+                                resolution_draft=draft,
                                 refund_outcome="Refund request remains unresolved: selected SKU is not in the case-bound order.")
         assessment_call = ToolCall(kind="tool", name="assess_refund_eligibility",
                                    arguments={"case_id": str(state.request.case_id), "sku": selected.sku})
@@ -234,23 +247,57 @@ class GraphResolutionAgent:
         history.append(AuditEntry(step=state.steps, decision=assessment_call, result=assessment))
         if not assessment.ok:
             if assessment.error.code in ("CONFLICT", "NOT_FOUND"):
+                recommendation = build_refund_recommendation(sku=str(selected.sku))
+                draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                         if state.resolution_draft is not None else None)
+                draft = self._refund_wording(state, draft)
                 return self._create_refund_review(state, history, action="refund_investigation",
                     rationale=("Human investigation required: trusted delivery evidence or policy confirmation "
                                "is unavailable for the selected case-bound purchased item. "
-                               "This is not refund approval."))
+                               "This is not refund approval."), resolution_draft=draft)
             return self._update(state, "evaluate_refund", history=tuple(history), error=assessment.error.code)
         evidence = assessment.data
+        recommendation = build_refund_recommendation(sku=str(selected.sku), assessment=evidence)
+        draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                 if state.resolution_draft is not None else None)
+        draft = self._refund_wording(state, draft)
         if not evidence.refund_eligible or evidence.denial_reasons or evidence.evidence_id is None:
             reasons = ", ".join(sorted(set(evidence.denial_reasons))) or "refund_eligibility_not_established"
             return self._create_refund_review(state, history, action="refund_investigation",
                 rationale=("Human investigation required: trusted evidence does not confirm refund eligibility "
-                           f"({reasons}). This is not refund approval."))
+                           f"({reasons}). This is not refund approval."), resolution_draft=draft)
         return self._create_refund_review(state, history, action="refund",
             rationale="Server-side refund eligibility evidence requires human review.",
-            evidence_id=evidence.evidence_id)
+            evidence_id=evidence.evidence_id, resolution_draft=draft)
+
+    def _refund_wording(self, state: GraphState, draft: ResolutionDraft | None) -> ResolutionDraft | None:
+        """Optionally polish a completed Python assessment without delegating it.
+
+        This bounded single call is enabled only for the configured Bedrock
+        runtime.  It receives the same immutable grounding as normal graph
+        reasoning; malformed, unsupported, or unavailable output leaves the
+        deterministic assessment untouched.
+        """
+        if (not self._enable_refund_wording or draft is None
+                or state.knowledge_grounding is None or not state.messages):
+            return draft
+        try:
+            context = json.loads(state.messages[-1].content)
+            context["grounded_resolution_draft"] = draft.model_dump(mode="json")
+            answer = self._llm.generate(LLMRequest(
+                messages=(*state.messages[:-1], LLMMessage(role="user", content=json.dumps(context))),
+                max_output_tokens=self._config.max_output_tokens,
+            ), AgentDecision)
+            if not answer.ok:
+                return draft
+            return apply_grounded_response(draft, state.knowledge_grounding,
+                                           answer.data.grounded_response) or draft
+        except Exception:
+            return draft
 
     def _create_refund_review(self, state: GraphState, history: list[AuditEntry], *,
-                              action: str, rationale: str, evidence_id: UUID | None = None) -> dict:
+                              action: str, rationale: str, evidence_id: UUID | None = None,
+                              resolution_draft: ResolutionDraft | None = None) -> dict:
         arguments = {"case_id": str(state.request.case_id), "action": action, "rationale": rationale}
         if evidence_id is not None:
             arguments["eligibility_evidence_id"] = str(evidence_id)
@@ -268,7 +315,8 @@ class GraphResolutionAgent:
         if proposal.case_id != state.request.case_id or proposal.status.value != "PENDING_REVIEW":
             return self._update(state, "evaluate_refund", history=tuple(history), error="INVALID_PROPOSAL_STATUS")
         return self._update(state, "evaluate_refund", history=tuple(history), created=True,
-                            pending={**state.pending, proposal.id: True})
+                            pending={**state.pending, proposal.id: True},
+                            resolution_draft=resolution_draft or state.resolution_draft)
 
     @staticmethod
     def _after_reason(state: GraphState) -> str:

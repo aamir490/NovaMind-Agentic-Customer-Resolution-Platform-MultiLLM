@@ -156,6 +156,39 @@ function createGuidanceIdempotencyKey() {
   throw new Error('This browser cannot safely send customer guidance.');
 }
 
+export function AdminRefundRecommendation({ recommendation }) {
+  if (!recommendation) return null;
+  const labels = {
+    ELIGIBLE: 'Eligible for staff review',
+    NOT_ELIGIBLE: 'Not eligible',
+    NEED_MORE_EVIDENCE: 'More evidence required',
+  };
+  return <section className="case-panel admin-resolution" aria-labelledby="admin-refund-recommendation-title">
+    <div className="case-panel-heading"><div>
+      <p className="eyebrow">Python-owned assessment</p>
+      <h3 id="admin-refund-recommendation-title">Refund recommendation</h3>
+    </div><span className="badge">Admin only</span></div>
+    <p className="case-caption">
+      {labels[recommendation.outcome]}. This is advisory only: it does not approve, issue, or send a refund,
+      change case status, or send a customer message.
+    </p>
+    <dl className="case-facts">
+      <Detail title="Purchased SKU"><span className="case-mono">{recommendation.sku}</span></Detail>
+      <Detail title="Outcome">{labels[recommendation.outcome]}</Detail>
+      <Detail title="Policy">{recommendation.policyId} · {recommendation.policyVersion}</Detail>
+      <Detail title="Reason">{recommendation.decisionReason}</Detail>
+      <Detail title="Source">{recommendation.responseSource === 'BEDROCK_VALIDATED'
+        ? 'Bedrock wording validated against Python assessment' : 'Deterministic Python fallback'}</Detail>
+      {recommendation.verifiedEvidence.length > 0 && <Detail title="Verified evidence"><ul>{recommendation.verifiedEvidence.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>}
+      {recommendation.missingEvidence.length > 0 && <Detail title="Missing evidence"><ul>{recommendation.missingEvidence.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>}
+      {recommendation.citations.length > 0 && <Detail title="Verified policy citations"><ul>{recommendation.citations.map((citation) => (
+        <li key={citation.chunkId}>{citation.title} ({citation.documentId}, {citation.version})</li>
+      ))}</ul></Detail>}
+    </dl>
+    <p className="case-boundary-notice">Use the existing Reviews workflow for any pending proposal. A review decision remains separate from final case resolution and customer communication.</p>
+  </section>;
+}
+
 export function AdminCustomerGuidance({ api, supportCase, draft, latest, onComplete }) {
   const [message, setMessage] = useState('');
   const [state, setState] = useState({ phase: 'idle', message: '' });
@@ -551,6 +584,10 @@ export default function CaseReview({ api = defaultApi, identity }) {
               onComplete={(investigation) => setContext((current) => current && ({
                 ...current, investigation,
               }))} />
+          )}
+
+          {identity?.role === 'ADMIN' && typeof api.sendCustomerGuidance === 'function' && (
+            <AdminRefundRecommendation recommendation={context.resolutionDraft?.refundRecommendation} />
           )}
 
           {identity?.role === 'ADMIN' && typeof api.sendCustomerGuidance === 'function' && (

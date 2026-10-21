@@ -79,6 +79,7 @@ function customerCommunication(payload) {
 function adminResolutionDraft(payload) {
   if (payload === null) return null;
   const citations = payload?.citations;
+  const recommendation = payload?.refund_recommendation;
   requireResponse(payload && draftIssueTypes.includes(payload.issue_type)
     && draftDecisions.includes(payload.recommended_decision)
     && isTextList(payload.verified_facts) && payload.verified_facts.length >= 1 && payload.verified_facts.length <= 8
@@ -92,6 +93,17 @@ function adminResolutionDraft(payload) {
       && isText(citation.chunk_id) && isText(citation.title) && isText(citation.version)
       && isText(citation.source_uri))
     && payload.actions_executed === false, 'resolution draft');
+  requireResponse(recommendation === null || recommendation === undefined || (
+    ['ELIGIBLE', 'NOT_ELIGIBLE', 'NEED_MORE_EVIDENCE'].includes(recommendation.outcome)
+    && isText(recommendation.sku) && isTextList(recommendation.verified_evidence)
+    && isTextList(recommendation.missing_evidence) && isText(recommendation.policy_id)
+    && isText(recommendation.policy_version) && isText(recommendation.decision_reason)
+    && Array.isArray(recommendation.citations) && recommendation.citations.length <= 5
+    && recommendation.citations.every((citation) => citation && isText(citation.document_id)
+      && isText(citation.chunk_id) && isText(citation.title) && isText(citation.version))
+    && ['BEDROCK_VALIDATED', 'DETERMINISTIC_FALLBACK'].includes(recommendation.response_source)
+    && recommendation.authorization_granted === false && recommendation.actions_executed === false
+  ), 'refund recommendation');
   return { issueType: payload.issue_type, recommendedDecision: payload.recommended_decision,
     verifiedFacts: payload.verified_facts, missingEvidence: payload.missing_evidence,
     decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response,
@@ -99,7 +111,16 @@ function adminResolutionDraft(payload) {
     responseSource: payload.response_source, citations: citations.map((citation) => ({
       documentId: citation.document_id, chunkId: citation.chunk_id, title: citation.title,
       version: citation.version,
-    })) };
+    })), ...(!recommendation ? {} : { refundRecommendation: {
+      outcome: recommendation.outcome, sku: recommendation.sku,
+      verifiedEvidence: recommendation.verified_evidence,
+      missingEvidence: recommendation.missing_evidence,
+      policyId: recommendation.policy_id, policyVersion: recommendation.policy_version,
+      decisionReason: recommendation.decision_reason,
+      citations: recommendation.citations.map((citation) => ({ documentId: citation.document_id,
+        chunkId: citation.chunk_id, title: citation.title, version: citation.version })),
+      responseSource: recommendation.response_source,
+    } }) };
 }
 
 const investigationModes = ['MANUAL', 'AUTO'];

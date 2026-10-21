@@ -31,6 +31,14 @@ class ResponseSource(StrEnum):
     DETERMINISTIC_FALLBACK = "DETERMINISTIC_FALLBACK"
 
 
+class RefundRecommendationOutcome(StrEnum):
+    """A Python-owned assessment outcome; this is never payment authorization."""
+
+    ELIGIBLE = "ELIGIBLE"
+    NOT_ELIGIBLE = "NOT_ELIGIBLE"
+    NEED_MORE_EVIDENCE = "NEED_MORE_EVIDENCE"
+
+
 class ResolutionCitation(Record):
     """A compact, application-owned projection of one retrieved policy passage."""
 
@@ -39,6 +47,22 @@ class ResolutionCitation(Record):
     title: str = Field(min_length=1, max_length=160)
     version: str = Field(min_length=1, max_length=160)
     source_uri: str = Field(pattern=r"^local-knowledge://[a-z0-9-]{1,80}$")
+
+
+class RefundRecommendation(Record):
+    """Immutable refund assessment projected to staff from trusted inputs only."""
+
+    outcome: RefundRecommendationOutcome
+    sku: str = Field(pattern=r"^[A-Za-z0-9-]{1,80}$")
+    verified_evidence: tuple[str, ...] = Field(default=(), max_length=8)
+    missing_evidence: tuple[str, ...] = Field(default=(), max_length=6)
+    policy_id: str = Field(pattern=r"^[A-Za-z0-9-]{1,80}$")
+    policy_version: str = Field(pattern=r"^[A-Za-z0-9-]{1,160}$")
+    decision_reason: str = Field(min_length=1, max_length=1200)
+    citations: tuple[ResolutionCitation, ...] = Field(default=(), max_length=5)
+    response_source: ResponseSource = ResponseSource.DETERMINISTIC_FALLBACK
+    authorization_granted: Literal[False] = False
+    actions_executed: Literal[False] = False
 
 
 class CustomerIntent(StrEnum):
@@ -78,7 +102,65 @@ class ResolutionDraft(Record):
     troubleshooting_steps: tuple[str, ...] = Field(default=(), max_length=5)
     response_source: ResponseSource = ResponseSource.DETERMINISTIC_FALLBACK
     citations: tuple[ResolutionCitation, ...] = Field(default=(), max_length=5)
+    refund_recommendation: RefundRecommendation | None = None
     actions_executed: Literal[False] = False
+
+
+def build_refund_recommendation(*, sku: str, assessment=None,
+                                purchased: bool = True) -> RefundRecommendation:
+    """Map server-side assessment evidence to the only three staff-facing outcomes.
+
+    ``assessment`` is an existing trusted ``EligibilityResult``.  Customer or
+    model supplied values never reach this function.  Absent/ambiguous facts
+    are deliberately evidence requests rather than conditional eligibility.
+    """
+    if not purchased:
+        return RefundRecommendation(
+            outcome=RefundRecommendationOutcome.NOT_ELIGIBLE, sku=sku,
+            policy_id="standard-return", policy_version="demo-v1",
+            missing_evidence=("a purchased item matching the selected SKU",),
+            decision_reason="The selected SKU is not present in the case-bound order, so a refund recommendation cannot be supported.",
+        )
+    if assessment is None:
+        return RefundRecommendation(
+            outcome=RefundRecommendationOutcome.NEED_MORE_EVIDENCE, sku=sku,
+            policy_id="standard-return", policy_version="demo-v1",
+            missing_evidence=("trusted delivery and item-condition evidence for the selected purchased SKU",),
+            decision_reason="Trusted delivery evidence is unavailable, so refund eligibility cannot be established.",
+        )
+    evidence = (f"case_id:{assessment.case_id}", f"order_id:{assessment.order_id}",
+                f"purchased_sku:{assessment.sku}",
+                f"policy:{assessment.policy_id}@{assessment.policy_version}",
+                f"eligibility_evidence_id:{assessment.evidence_id}")
+    if assessment.refund_eligible and not assessment.denial_reasons and assessment.evidence_id is not None:
+        return RefundRecommendation(
+            outcome=RefundRecommendationOutcome.ELIGIBLE, sku=str(assessment.sku),
+            verified_evidence=evidence, policy_id=str(assessment.policy_id),
+            policy_version=str(assessment.policy_version),
+            decision_reason="Trusted case-bound delivery evidence satisfies the configured return-policy checks. Staff approval is still required and no refund has been issued.",
+        )
+    reasons = tuple(sorted(set(assessment.denial_reasons))) or ("refund_eligibility_not_established",)
+    return RefundRecommendation(
+        outcome=RefundRecommendationOutcome.NOT_ELIGIBLE, sku=str(assessment.sku),
+        verified_evidence=evidence, policy_id=str(assessment.policy_id),
+        policy_version=str(assessment.policy_version), missing_evidence=(),
+        decision_reason="Trusted evidence does not satisfy the configured return-policy checks: " + ", ".join(reasons) + ".",
+    )
+
+
+def attach_refund_recommendation(draft: ResolutionDraft,
+                                 recommendation: RefundRecommendation) -> ResolutionDraft:
+    """Attach the Python result without treating it as a case decision or message."""
+    draft = ResolutionDraft.model_validate(draft)
+    recommendation = RefundRecommendation.model_validate(recommendation)
+    facts = tuple(dict.fromkeys((*draft.verified_facts, *recommendation.verified_evidence)))[:8]
+    missing = recommendation.missing_evidence or draft.missing_evidence
+    return draft.model_copy(update={
+        "verified_facts": facts,
+        "missing_evidence": missing,
+        "decision_reason": recommendation.decision_reason,
+        "refund_recommendation": recommendation,
+    })
 
 
 def classify_issue_type(*, subject: str, description: str, message: str) -> IssueType:

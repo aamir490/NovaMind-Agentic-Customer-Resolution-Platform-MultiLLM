@@ -88,6 +88,8 @@ def agent_instructions(descriptions) -> str:
         "An optional grounded_response may provide professional decision_reason and customer_facing_response wording only. "
         "It must exactly copy the supplied issue_type, recommended_decision, verified_facts, missing_evidence, and "
         "policy_passages. It must say that no refund, replacement, return, or payment action has been executed. "
+        "If the supplied draft contains refund_recommendation, grounded_response.refund_outcome and refund_sku must "
+        "exactly copy its Python-owned outcome and SKU; never alter its evidence, policy, or eligibility conclusion. "
         "When supplied policy passages contain numbered product troubleshooting steps, copy only those exact steps into "
         "grounded_response.troubleshooting_steps and render them as the same numbered steps in customer_facing_response. "
         "Do not use other kind values, extra fields, Markdown, or prose outside the JSON object. "

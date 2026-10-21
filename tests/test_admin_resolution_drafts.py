@@ -243,6 +243,47 @@ class AdminResolutionDraftTests(unittest.TestCase):
             self.assertNotIn("actions_executed", recorded.json())
         app.state.frontend_runtime.close()
 
+    def test_refund_recommendation_survives_checkpoint_and_stays_admin_only(self):
+        first = self.app()
+        support_case = self.case(first, "Refund request", "Please refund my purchased laptop.")
+        with TestClient(first) as client:
+            identity = client.get("/api/identity", headers=self.headers(ADMIN_TOKEN)).json()
+            started = client.post("/api/runs", headers=self.headers(ADMIN_TOKEN), json={
+                "instance_id": identity["instance_id"], "request_id": str(uuid4()),
+                "case_id": str(support_case.id), "message": "Review the selected refund.",
+                "resolution_intent": "refund", "refund_sku": "LAP-1",
+            })
+            self.assertEqual(started.status_code, 202, started.text)
+            for _ in range(100):
+                snapshot = client.get(f"/api/runs/{started.json()['run_id']}",
+                                      headers=self.headers(ADMIN_TOKEN)).json()
+                if snapshot["status"] == "REVIEW_REQUIRED":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("refund review did not pause")
+            self.assertEqual(snapshot["review"]["action"], "refund_investigation")
+            denied = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                                headers=self.headers(CUSTOMER_TOKEN))
+            self.assertEqual(denied.status_code, 403)
+            draft = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                               headers=self.headers(ADMIN_TOKEN)).json()
+            recommendation = draft["refund_recommendation"]
+            self.assertEqual(recommendation["outcome"], "NEED_MORE_EVIDENCE")
+            self.assertEqual(recommendation["sku"], "LAP-1")
+            self.assertFalse(recommendation["authorization_granted"])
+            self.assertFalse(recommendation["actions_executed"])
+            self.assertTrue(recommendation["citations"])
+        first.state.frontend_runtime.close()
+
+        restarted = self.app()
+        with TestClient(restarted) as client:
+            restored = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                                  headers=self.headers(ADMIN_TOKEN))
+            self.assertEqual(restored.status_code, 200, restored.text)
+            self.assertEqual(restored.json()["refund_recommendation"]["outcome"], "NEED_MORE_EVIDENCE")
+        restarted.state.frontend_runtime.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
