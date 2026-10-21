@@ -96,6 +96,8 @@ def agent_instructions(descriptions) -> str:
         "return, refund not received). Shipping and payment evidence must be verified by application records; missing "
         "evidence requires a request for evidence or escalation, never an eligibility claim. "
         "Eligibility is not authorization. You cannot approve, reject, execute actions, or change inventory. "
+        "For malfunction reports, request only the supplied diagnostic details and provide bounded troubleshooting "
+        "guidance; never claim a diagnosis, warranty outcome, or remedy. "
         "A refund requires explicit resolution_intent=refund and an exact refund_sku. The graph verifies that SKU against "
         "the case-bound order and evaluates server-side evidence before any refund proposal. Never infer refund intent, "
         "choose an item, or invent eligibility evidence. "
@@ -151,10 +153,16 @@ class ResolutionAgent:
 
         def finish(steps: int, error: str | None = None) -> AgentResult:
             ids = tuple(key for key, value in pending.items() if value)
+            draft = (model_resolution_draft
+                     if model_resolution_draft == resolution_draft else resolution_draft)
             message = "Informational results only. No refund, return, replacement, or inventory action was executed."
             if ids:
                 message = ("Proposal(s) recorded as PENDING_REVIEW require separate human review: "
                            + ", ".join(map(str, ids)) + ". No action was executed.")
+            elif draft is not None:
+                # Keep parity with LangGraph: application-owned draft wording
+                # is safe to expose, but does not create a case decision.
+                message = draft.customer_facing_response
             if error:
                 message = "The review could not be completed. " + message
             if conversation_id is not None:
@@ -169,9 +177,7 @@ class ResolutionAgent:
                 status="FAILED" if error else "HUMAN_REVIEW_REQUIRED" if ids else "INFORMATIONAL",
                 customer_response=message, steps_used=steps, history=tuple(history),
                 pending_proposal_ids=ids,
-                resolution_draft=(model_resolution_draft
-                                  if model_resolution_draft == resolution_draft
-                                  else resolution_draft),
+                resolution_draft=draft,
                 investigation_plan=(model_investigation_plan
                                     if model_investigation_plan == investigation_plan
                                     else investigation_plan),

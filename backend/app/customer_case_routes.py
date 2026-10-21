@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request
 
-from .domain import CaseStatus, SupportCase
+from .domain import CaseStatus, InvestigationMode, SupportCase
 from .routes import Service
 from .schemas import CaseCreate, CustomerCaseCreate
 from .security import Authorization, Role, require_roles
@@ -71,7 +71,8 @@ def create_my_case(body: CustomerCaseCreate, request: Request, service: Service,
         # Dispatch only the just-created job: duplicate customer retries and
         # process restarts must never replay an attempt.
         dispatcher = request.app.state.investigation_dispatcher
-        if created and dispatcher is not None:
+        if (created and job.submission_mode is InvestigationMode.AUTO
+                and dispatcher is not None):
             dispatcher.submit(job.id)
         return persisted
     return service.create_case(case_input)

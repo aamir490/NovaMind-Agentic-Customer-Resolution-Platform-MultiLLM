@@ -369,6 +369,7 @@ class SQLiteInvestigationJobBindingTests(unittest.TestCase):
             connection.execute("DROP TABLE investigation_jobs")
             connection.execute("ALTER TABLE investigation_jobs_v12 RENAME TO investigation_jobs")
             connection.execute("CREATE UNIQUE INDEX investigation_jobs_workflow ON investigation_jobs(workflow_id) WHERE workflow_id IS NOT NULL")
+            connection.execute("DROP TABLE case_customer_communications")
             connection.execute("DELETE FROM schema_migrations WHERE version >= 13")
 
         reopened = SQLiteInvestigationJobRepository(SQLitePersistence(self.path))

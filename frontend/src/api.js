@@ -66,6 +66,15 @@ function customerResolution(payload, caseId) {
   } };
 }
 
+function customerCommunication(payload) {
+  if (payload === null) return null;
+  requireResponse(payload && isText(payload.message)
+    && Array.from(payload.message).length <= 2000
+    && isTimestamp(payload.sent_at), 'customer communication');
+  // Closed projection: discard any unexpected internal persistence or actor fields.
+  return { message: payload.message, sentAt: payload.sent_at };
+}
+
 function adminResolutionDraft(payload) {
   if (payload === null) return null;
   requireResponse(payload && draftIssueTypes.includes(payload.issue_type)
@@ -78,6 +87,57 @@ function adminResolutionDraft(payload) {
   return { issueType: payload.issue_type, recommendedDecision: payload.recommended_decision,
     verifiedFacts: payload.verified_facts, missingEvidence: payload.missing_evidence,
     decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response };
+}
+
+const investigationModes = ['MANUAL', 'AUTO'];
+const investigationStates = ['NOT_AVAILABLE', 'PENDING', 'RUNNING', 'REVIEW_REQUIRED',
+  'COMPLETED', 'FAILED', 'RECOVERY_REQUIRED'];
+const investigationJobStatuses = ['PENDING', 'CLAIMED', 'RECOVERY_REQUIRED'];
+const workflowStatuses = ['RUNNING', 'RESUMING', 'REVIEW_REQUIRED', 'REVIEWED', 'COMPLETED',
+  'FAILED', 'RECOVERY_REQUIRED'];
+
+function investigationControl(payload) {
+  const counts = payload?.counts;
+  const countNames = ['total', 'pending', 'running', 'review_required', 'completed', 'failed',
+    'recovery_required'];
+  requireResponse(payload && investigationModes.includes(payload.configured_mode)
+    && investigationModes.includes(payload.effective_mode)
+    && typeof payload.automatic_capability_available === 'boolean'
+    && Number.isSafeInteger(payload.version) && payload.version >= 1
+    && (payload.updated_by === null || isUuid(payload.updated_by))
+    && isTimestamp(payload.updated_at) && counts
+    && countNames.every((name) => isCount(counts[name]))
+    && counts.total === countNames.slice(1).reduce((sum, name) => sum + counts[name], 0),
+  'investigation control');
+  return { configuredMode: payload.configured_mode, effectiveMode: payload.effective_mode,
+    automaticCapabilityAvailable: payload.automatic_capability_available,
+    version: payload.version, updatedBy: payload.updated_by, updatedAt: payload.updated_at,
+    counts: { total: counts.total, pending: counts.pending, running: counts.running,
+      reviewRequired: counts.review_required, completed: counts.completed, failed: counts.failed,
+      recoveryRequired: counts.recovery_required } };
+}
+
+function caseInvestigation(payload, caseId) {
+  requireResponse(payload && payload.case_id === caseId && investigationStates.includes(payload.state)
+    && (payload.job_id === null || isUuid(payload.job_id))
+    && (payload.job_status === null || investigationJobStatuses.includes(payload.job_status))
+    && (payload.workflow_id === null || isUuid(payload.workflow_id))
+    && (payload.workflow_status === null || workflowStatuses.includes(payload.workflow_status))
+    && (payload.provider === null || ['local_scripted', 'bedrock'].includes(payload.provider))
+    && (payload.submission_mode === null || investigationModes.includes(payload.submission_mode))
+    && (payload.mode_version === null
+      || Number.isSafeInteger(payload.mode_version) && payload.mode_version >= 1)
+    && (payload.submitted_at === null || isTimestamp(payload.submitted_at))
+    && typeof payload.execution_started === 'boolean' && typeof payload.can_start === 'boolean'
+    && payload.actions_executed === false, 'case investigation');
+  requireResponse((payload.state === 'NOT_AVAILABLE') === (payload.job_id === null),
+    'case investigation binding');
+  return { caseId: payload.case_id, jobId: payload.job_id, state: payload.state,
+    jobStatus: payload.job_status, workflowId: payload.workflow_id,
+    workflowStatus: payload.workflow_status, provider: payload.provider,
+    submissionMode: payload.submission_mode, modeVersion: payload.mode_version,
+    submittedAt: payload.submitted_at, executionStarted: payload.execution_started,
+    canStart: payload.can_start, actionsExecuted: false };
 }
 
 function staffResolution(payload, caseId) {
@@ -193,13 +253,38 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
           || (identity.role === 'CUSTOMER'
             ? !isUuid(identity.customer_id)
             : identity.customer_id !== null)
+          || typeof payload.can_review !== 'boolean' || typeof payload.can_view_diagnostics !== 'boolean'
           || !isUuid(payload.instance_id) || !['unavailable', 'local_scripted', 'bedrock'].includes(payload.provider)
           || typeof payload.memory_available !== 'boolean') {
         throw new Error('Unexpected identity response.');
       }
       // Display only identity fields confirmed by the backend, never token contents.
       return { user_id: identity.user_id, role: identity.role, customer_id: identity.customer_id,
-        instance_id: payload.instance_id, provider: payload.provider, memory_available: payload.memory_available };
+        instance_id: payload.instance_id, provider: payload.provider, memory_available: payload.memory_available,
+        can_review: payload.can_review, can_view_diagnostics: payload.can_view_diagnostics };
+    },
+    async investigationControl(options) {
+      return investigationControl(await get('/admin/investigation-control', options));
+    },
+    async updateInvestigationControl({ mode, expectedVersion, idempotencyKey }) {
+      requireResponse(investigationModes.includes(mode), 'investigation mode');
+      requireResponse(Number.isSafeInteger(expectedVersion) && expectedVersion >= 1,
+        'investigation mode version');
+      requireResponse(isUuid(idempotencyKey), 'investigation mode idempotency key');
+      return investigationControl(await request('/admin/investigation-control', {
+        method: 'PATCH', body: { mode, expected_version: expectedVersion }, idempotencyKey,
+      }));
+    },
+    async caseInvestigation(caseId, options) {
+      requireResponse(isUuid(caseId), 'case id');
+      return caseInvestigation(await get(`/cases/${encodeURIComponent(caseId)}/investigation`, options), caseId);
+    },
+    async startCaseInvestigation(caseId, { idempotencyKey }) {
+      requireResponse(isUuid(caseId), 'case id');
+      requireResponse(isUuid(idempotencyKey), 'investigation start idempotency key');
+      return caseInvestigation(await request(`/cases/${encodeURIComponent(caseId)}/investigation`, {
+        method: 'POST', idempotencyKey,
+      }), caseId);
     },
     async pendingReviews(instanceId, options) {
       const page = await get('/reviews', options);
@@ -398,6 +483,24 @@ export function createApi(fetcher = globalThis.fetch, { token = '', onUnauthoriz
       return adminResolutionDraft(await get(`/cases/${encodeURIComponent(caseId)}/resolution-draft`, {
         signal: options?.signal,
       }));
+    },
+    async latestCustomerGuidance(caseId, options) {
+      requireResponse(isUuid(caseId), 'case id');
+      return customerCommunication(await get(
+        `/cases/${encodeURIComponent(caseId)}/customer-communications/latest`,
+        { signal: options?.signal },
+      ));
+    },
+    async sendCustomerGuidance(caseId, { message, idempotencyKey }) {
+      requireResponse(isUuid(caseId), 'case id');
+      requireResponse(isText(message) && Array.from(message).length <= 2000,
+        'customer communication');
+      requireResponse(isUuid(idempotencyKey), 'customer communication idempotency key');
+      return customerCommunication(await request(
+        `/cases/${encodeURIComponent(caseId)}/customer-communications`, {
+          method: 'POST', body: { message: message.trim() }, idempotencyKey,
+        },
+      ));
     },
     async resolveCase(caseId, { action, reason, customerMessage, evidenceReviewed }) {
       requireResponse(isUuid(caseId) && resolutionActions.includes(action), 'case resolution');

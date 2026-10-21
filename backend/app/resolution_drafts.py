@@ -75,7 +75,8 @@ def classify_issue_type(*, subject: str, description: str, message: str) -> Issu
     if re.search(
         r"\b(malfunction|defect|defective|not working|stopped working|broken|"
         r"not functioning(?: properly)?|(?:doesn't|does not|won't|will not) work|"
-        r"unresponsive|fails? to (?:work|start|operate)|"
+        r"(?:stops?|is not) responding|unresponsive|intermittent (?:connection|connectivity)|"
+        r"fails? to (?:work|start|operate)|"
         r"(?:storage|device|product|item)(?:\s+\w+){0,3}\s+(?:is\s+)?not detected|"
         r"(?:storage|device|product|item)(?:\s+\w+){0,3}\s+(?:cannot|can't) be detected)\b",
         text,
@@ -83,6 +84,18 @@ def classify_issue_type(*, subject: str, description: str, message: str) -> Issu
         return IssueType.MALFUNCTION
     if re.search(r"\b(damaged|damage|cracked|scratched|broken on arrival)\b", text):
         return IssueType.DAMAGED
+    if re.search(r"\b(return|send (?:it|this) back|changed my mind)\b", text):
+        return IssueType.RETURN
+    # There is no separate catch-all issue type.  Route ambiguous technical
+    # support wording through the non-fulfillment malfunction path; retain the
+    # legacy return fallback for nontechnical ambiguous requests so existing
+    # return/HITL workflows remain reachable.
+    if re.search(
+        r"\b(?:device|input|controller|hardware|software|technical\s+support|"
+        r"connection|connectivity)\b",
+        text,
+    ):
+        return IssueType.MALFUNCTION
     return IssueType.RETURN
 
 
@@ -111,6 +124,19 @@ def build_resolution_draft(case: SupportCase, order: Order, *,
         decision = RecommendedDecision.ESCALATE
         missing = ("trusted payment/refund settlement record",)
         reason = "Payment or refund settlement evidence is not available in the verified case records."
+    elif issue is IssueType.MALFUNCTION:
+        # Delivery evidence cannot establish a technical diagnosis.  Request
+        # only diagnostic details the customer can safely provide; do not infer
+        # a fault, warranty outcome, or remedy from the reported symptom.
+        decision = RecommendedDecision.REQUEST_EVIDENCE
+        missing = (
+            "reported symptom, when it occurs, and steps already tried",
+            "product and connection/setup details, including any visible error indicator",
+        )
+        reason = (
+            "The report describes a technical issue, but the verified records do not establish "
+            "a diagnosis. Diagnostic details are needed for support review."
+        )
     elif issue is IssueType.DELAYED_DELIVERY:
         decision = RecommendedDecision.ESCALATE
         missing = ("trusted shipment tracking status", "committed delivery date")
@@ -130,13 +156,21 @@ def build_resolution_draft(case: SupportCase, order: Order, *,
         missing = ("staff review of the case-specific supporting evidence",)
         reason = "A delivery record exists, but the issue still requires a staff decision under policy."
 
-    response = (
-        "We have recorded your request. "
-        + ("We need the listed evidence before eligibility can be assessed. "
-           if decision is RecommendedDecision.REQUEST_EVIDENCE
-           else "A staff member must review the available records and missing evidence. ")
-        + "No refund, replacement, return, or payment action has been executed."
-    )
+    if issue is IssueType.MALFUNCTION:
+        response = (
+            "We have recorded the technical issue. Please tell us when the symptom occurs, "
+            "the steps you have already tried, your product and connection/setup details, and "
+            "any visible error indicator. We will use those diagnostic details for support review. "
+            "No refund, replacement, return, or payment action has been executed."
+        )
+    else:
+        response = (
+            "We have recorded your request. "
+            + ("We need the listed evidence before eligibility can be assessed. "
+               if decision is RecommendedDecision.REQUEST_EVIDENCE
+               else "A staff member must review the available records and missing evidence. ")
+            + "No refund, replacement, return, or payment action has been executed."
+        )
     return ResolutionDraft(
         issue_type=issue, recommended_decision=decision, verified_facts=tuple(facts),
         missing_evidence=missing, decision_reason=reason,
@@ -185,12 +219,12 @@ def build_investigation_plan(draft: ResolutionDraft, *, request_text: str,
             "search_knowledge", "create_resolution_proposal", "get_proposal_status",
         )
     elif issue is IssueType.MALFUNCTION:
-        intent = CustomerIntent.REQUEST_REPLACEMENT if re.search(
-            r"\b(replace|replacement|exchange)\b", request_text, re.IGNORECASE,
-        ) else CustomerIntent.REPORT_ISSUE
+        # Technical support may provide troubleshooting, request evidence, or
+        # escalate.  It never authorizes a fulfillment/financial proposal.
+        intent = CustomerIntent.REPORT_ISSUE
         tools = (
             "get_customer", "get_case", "get_order", "get_inventory",
-            "search_knowledge", "create_resolution_proposal", "get_proposal_status",
+            "search_knowledge",
         )
     else:  # Defensive fallback if a future issue type is introduced without a plan.
         intent = CustomerIntent.REPORT_ISSUE

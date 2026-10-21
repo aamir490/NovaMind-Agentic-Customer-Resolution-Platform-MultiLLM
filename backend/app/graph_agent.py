@@ -367,21 +367,27 @@ class GraphResolutionAgent:
     @staticmethod
     def _result(state: GraphState, history: tuple[AuditEntry, ...], error: str | None = None) -> AgentResult:
         ids = tuple(key for key, value in state.pending.items() if value)
+        draft = (state.model_resolution_draft
+                 if state.model_resolution_draft == state.resolution_draft
+                 else (state.generated_resolution_draft or state.resolution_draft))
         message = "Informational results only. No refund, return, replacement, or inventory action was executed."
         if ids:
             message = ("Proposal(s) recorded as PENDING_REVIEW require separate human review: "
                        + ", ".join(map(str, ids)) + ". No action was executed.")
         elif state.refund_outcome:
             message = state.refund_outcome + " No action was executed."
+        elif draft is not None:
+            # The deterministic draft is customer-safe by construction.  A
+            # model's wording reaches this point only after grounding checks.
+            # AI recommendations do not mutate the case or staff communication.
+            message = draft.customer_facing_response
         if error:
             message = "The review could not be completed. " + message
         return AgentResult(status="FAILED" if error else "HUMAN_REVIEW_REQUIRED" if ids else "INFORMATIONAL",
                            conversation_id=state.request.conversation_id if state.memory_started else None,
                            customer_response=message, steps_used=state.steps, history=history,
                            pending_proposal_ids=ids,
-                           resolution_draft=(state.model_resolution_draft
-                                             if state.model_resolution_draft == state.resolution_draft
-                                             else (state.generated_resolution_draft or state.resolution_draft)),
+                           resolution_draft=draft,
                            investigation_plan=(state.model_investigation_plan
                                                if state.model_investigation_plan == state.investigation_plan
                                                else state.investigation_plan),

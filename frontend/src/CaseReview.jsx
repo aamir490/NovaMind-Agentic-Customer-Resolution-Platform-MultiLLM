@@ -60,6 +60,85 @@ function LoadingDot() {
   return <span className="case-loading-dot" aria-hidden="true" />;
 }
 
+const investigationStateLabels = {
+  NOT_AVAILABLE: 'No durable investigation job',
+  PENDING: 'Pending',
+  RUNNING: 'Running',
+  REVIEW_REQUIRED: 'Human review required',
+  COMPLETED: 'Completed',
+  FAILED: 'Failed',
+  RECOVERY_REQUIRED: 'Recovery required',
+};
+
+export function AdminInvestigation({ api, supportCase, investigation, onComplete }) {
+  const [state, setState] = useState({ phase: 'idle', message: '' });
+  const idempotencyKey = useRef(null);
+
+  useEffect(() => {
+    setState({ phase: 'idle', message: '' });
+    idempotencyKey.current = null;
+  }, [supportCase.id]);
+
+  async function start() {
+    if (!investigation.canStart || state.phase === 'submitting') return;
+    setState({ phase: 'submitting', message: '' });
+    try {
+      if (idempotencyKey.current === null) {
+        idempotencyKey.current = createGuidanceIdempotencyKey();
+      }
+      const updated = await api.startCaseInvestigation(supportCase.id, {
+        idempotencyKey: idempotencyKey.current,
+      });
+      setState({ phase: 'idle', message: 'Investigation start accepted.' });
+      onComplete(updated);
+    } catch (error) {
+      setState({ phase: 'error', message: error.message || 'The investigation could not be started.' });
+    }
+  }
+
+  async function refresh() {
+    if (state.phase === 'submitting') return;
+    setState({ phase: 'submitting', message: '' });
+    try {
+      const updated = await api.caseInvestigation(supportCase.id);
+      setState({ phase: 'idle', message: 'Investigation status refreshed.' });
+      onComplete(updated);
+    } catch (error) {
+      setState({ phase: 'error', message: error.message || 'Investigation status could not be refreshed.' });
+    }
+  }
+
+  return <section className="case-panel admin-investigation" aria-labelledby="admin-investigation-title">
+    <div className="case-panel-heading">
+      <div>
+        <p className="eyebrow">Agentic AI investigation</p>
+        <h3 id="admin-investigation-title">Investigation status</h3>
+      </div>
+      <span className={`case-status case-investigation--${investigation.state.toLowerCase()}`}>
+        {investigationStateLabels[investigation.state]}
+      </span>
+    </div>
+    <p className="case-caption">
+      Submitted in {investigation.submissionMode ?? 'legacy'} mode. AI output remains a recommendation;
+      no refund, return, replacement, status change, or customer message is executed automatically.
+    </p>
+    {investigation.workflowStatus && <p className="case-caption">
+      Workflow: <strong>{label(investigation.workflowStatus)}</strong>
+      {investigation.provider && <> · Provider: <strong>{label(investigation.provider)}</strong></>}
+    </p>}
+    <div className="case-toolbar-actions">
+      {investigation.canStart && <button type="button" onClick={start}
+        disabled={state.phase === 'submitting'}>
+        {state.phase === 'submitting' ? 'Starting…' : 'Investigate with AI'}
+      </button>}
+      <button type="button" className="button-secondary" onClick={refresh}
+        disabled={state.phase === 'submitting'}>Refresh status</button>
+    </div>
+    {state.message && <p className={state.phase === 'error' ? 'run-error' : 'case-notice'}
+      role={state.phase === 'error' ? 'alert' : 'status'}>{state.message}</p>}
+  </section>;
+}
+
 const resolutionLabels = {
   APPROVE_REPLACEMENT: 'Approve replacement',
   DECLINE_REPLACEMENT: 'Decline replacement',
@@ -71,6 +150,85 @@ const draftAction = {
   REQUEST_EVIDENCE: 'REQUEST_MORE_EVIDENCE',
   ESCALATE: 'ESCALATE',
 };
+
+function createGuidanceIdempotencyKey() {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  throw new Error('This browser cannot safely send customer guidance.');
+}
+
+export function AdminCustomerGuidance({ api, supportCase, draft, latest, onComplete }) {
+  const [message, setMessage] = useState('');
+  const [state, setState] = useState({ phase: 'idle', message: '' });
+  const idempotencyKey = useRef(null);
+
+  useEffect(() => {
+    setMessage(draft?.customerFacingResponse ?? '');
+    setState({ phase: 'idle', message: '' });
+    idempotencyKey.current = null;
+  }, [supportCase.id, draft?.customerFacingResponse]);
+
+  async function send(event) {
+    event.preventDefault();
+    if (!draft || state.phase === 'submitting' || state.phase === 'sent') return;
+    setState({ phase: 'submitting', message: '' });
+    try {
+      if (idempotencyKey.current === null) {
+        idempotencyKey.current = createGuidanceIdempotencyKey();
+      }
+      const communication = await api.sendCustomerGuidance(supportCase.id, {
+        message, idempotencyKey: idempotencyKey.current,
+      });
+      setState({ phase: 'sent', message: 'Guidance sent.' });
+      onComplete(communication);
+    } catch (error) {
+      setState({ phase: 'error', message: error.message || 'The guidance could not be sent.' });
+    }
+  }
+
+  if (!draft) return null;
+  const locked = state.phase === 'submitting' || state.phase === 'sent';
+  return <section className="case-panel admin-resolution" aria-labelledby="admin-guidance-title">
+    <div className="case-panel-heading">
+      <div>
+        <p className="eyebrow">Grounded AI draft</p>
+        <h3 id="admin-guidance-title">Review and send customer guidance</h3>
+      </div>
+      <span className="badge">Admin only</span>
+    </div>
+    <p className="case-caption">
+      Review and edit this draft before sending. Nothing is sent automatically, and sending guidance does not
+      change case status, approve a proposal, or perform a business action.
+    </p>
+    <dl className="case-facts">
+      <Detail title="Issue type">{label(draft.issueType)}</Detail>
+      <Detail title="Recommended decision">{resolutionLabels[draftAction[draft.recommendedDecision]]}</Detail>
+      <Detail title="Verified facts"><ul>{draft.verifiedFacts.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>
+      <Detail title="Missing evidence"><ul>{draft.missingEvidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></Detail>
+    </dl>
+    {latest && <div className="admin-resolution-latest">
+      <strong>Latest sent guidance</strong>
+      <span>{new Date(latest.sentAt).toLocaleString()}</span>
+      <span>{latest.message}</span>
+    </div>}
+    <form className="admin-resolution-form" onSubmit={send}>
+      <label>Customer-facing guidance
+        <textarea required minLength="1" maxLength="2000" value={message}
+          onChange={(event) => {
+            idempotencyKey.current = null;
+            setMessage(event.target.value);
+            setState({ phase: 'idle', message: '' });
+          }} disabled={locked}
+          placeholder="Provide safe troubleshooting guidance and any evidence needed next." />
+      </label>
+      {state.phase === 'error' && <p className="run-error" role="alert">{state.message}</p>}
+      {state.phase === 'sent' && <p className="run-notice" role="status">{state.message}</p>}
+      <button type="submit" disabled={locked || !message.trim()}>
+        {state.phase === 'submitting' ? 'Sending guidance…'
+          : state.phase === 'sent' ? 'Guidance sent' : 'Send guidance'}
+      </button>
+    </form>
+  </section>;
+}
 
 function AdminCaseResolution({ api, supportCase, resolution, draft, onComplete }) {
   const [action, setAction] = useState('REQUEST_MORE_EVIDENCE');
@@ -128,17 +286,6 @@ function AdminCaseResolution({ api, supportCase, resolution, draft, onComplete }
       Bedrock and workflow proposals are advisory. This records a human decision only; it never creates a shipment,
       reserves inventory, issues a refund, or performs another business action.
     </p>
-    {draft && <section className="admin-resolution-draft" aria-labelledby="ai-draft-title">
-      <p className="eyebrow">Grounded AI draft</p>
-      <h4 id="ai-draft-title">Review, edit, and confirm</h4>
-      <dl className="case-facts">
-        <Detail title="Issue type">{label(draft.issueType)}</Detail>
-        <Detail title="Recommended decision">{resolutionLabels[draftAction[draft.recommendedDecision]]}</Detail>
-        <Detail title="Verified facts"><ul>{draft.verifiedFacts.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>
-        <Detail title="Missing evidence"><ul>{draft.missingEvidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></Detail>
-      </dl>
-      <p className="case-caption">The editable decision reason and customer response below were prefilled from this validated draft.</p>
-    </section>}
     {resolution?.latest && <div className="admin-resolution-latest">
       <strong>Latest: {resolutionLabels[resolution.latest.action]}</strong>
       <span>{new Date(resolution.latest.decidedAt).toLocaleString()}</span>
@@ -274,12 +421,17 @@ export default function CaseReview({ api = defaultApi, identity }) {
               event.preventDefault(); clearReview();
               run('context', async () => {
                 const details = await api.context(selected);
-                if (identity?.role !== 'ADMIN' || typeof api.caseResolution !== 'function') return details;
-                const [resolution, resolutionDraft] = await Promise.all([
+                const investigation = typeof api.caseInvestigation === 'function'
+                  ? await api.caseInvestigation(selected) : null;
+                if (identity?.role !== 'ADMIN' || typeof api.caseResolution !== 'function') {
+                  return { ...details, investigation };
+                }
+                const [resolution, resolutionDraft, latestGuidance] = await Promise.all([
                   api.caseResolution(selected),
                   typeof api.caseResolutionDraft === 'function' ? api.caseResolutionDraft(selected) : null,
+                  typeof api.latestCustomerGuidance === 'function' ? api.latestCustomerGuidance(selected) : null,
                 ]);
-                return { ...details, resolution, resolutionDraft };
+                return { ...details, investigation, resolution, resolutionDraft, latestGuidance };
               }, setContext);
             }}
           >
@@ -382,6 +534,23 @@ export default function CaseReview({ api = defaultApi, identity }) {
               </Detail>
             </dl>
           </section>
+
+          {identity?.role === 'ADMIN' && context.investigation
+              && typeof api.startCaseInvestigation === 'function' && (
+            <AdminInvestigation api={api} supportCase={context.supportCase}
+              investigation={context.investigation}
+              onComplete={(investigation) => setContext((current) => current && ({
+                ...current, investigation,
+              }))} />
+          )}
+
+          {identity?.role === 'ADMIN' && typeof api.sendCustomerGuidance === 'function' && (
+            <AdminCustomerGuidance api={api} supportCase={context.supportCase}
+              draft={context.resolutionDraft} latest={context.latestGuidance}
+              onComplete={(latestGuidance) => setContext((current) => current && ({
+                ...current, latestGuidance,
+              }))} />
+          )}
 
           {identity?.role === 'ADMIN' && context.resolution && typeof api.resolveCase === 'function' && (
             <AdminCaseResolution api={api} supportCase={context.supportCase} resolution={context.resolution}

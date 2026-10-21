@@ -11,10 +11,11 @@ from typing import ContextManager, Iterator, Literal, Protocol
 from uuid import UUID, uuid4
 
 from .domain import (
-    CaseResolutionDecision, CaseStatus, Customer, Order, OrderItem,
+    CaseCustomerCommunication, CaseResolutionDecision, CaseStatus, Customer, Order, OrderItem,
     InvestigationExecutionIdentity, InvestigationJob, InvestigationJobClaim,
     InvestigationExecutionAttempt, InvestigationExecutionContext, InvestigationJobStatus,
-    InvestigationRecoveryReason,
+    InvestigationRecoveryReason, InvestigationControl, InvestigationMode,
+    InvestigationModeAuditEvent,
     ResolutionAction, SupportCase, can_transition,
 )
 from .agent import AgentRequest, agent_request_fingerprint
@@ -912,6 +913,104 @@ MIGRATIONS = (
              SELECT RAISE(ABORT, 'case resolution decisions are immutable');
            END""",
     )),
+    Migration(17, (
+        """CREATE TABLE case_customer_communications (
+            communication_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT NOT NULL REFERENCES support_cases(case_id),
+            sequence INTEGER NOT NULL CHECK(sequence >= 1),
+            message TEXT NOT NULL CHECK(length(trim(message)) BETWEEN 1 AND 2000),
+            admin_user_id TEXT NOT NULL CHECK(length(admin_user_id) = 36),
+            idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) = 36),
+            request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+            sent_at TEXT NOT NULL,
+            UNIQUE(case_id, sequence),
+            UNIQUE(admin_user_id, idempotency_key)
+        )""",
+        """CREATE INDEX case_customer_communications_case
+           ON case_customer_communications(case_id, sequence)""",
+        """CREATE TRIGGER validate_case_customer_communication_insert
+           BEFORE INSERT ON case_customer_communications BEGIN
+             SELECT CASE WHEN NEW.sequence <> coalesce((
+               SELECT max(sequence) + 1 FROM case_customer_communications
+               WHERE case_id = NEW.case_id
+             ), 1)
+             THEN RAISE(ABORT, 'invalid customer communication sequence') END;
+           END""",
+        """CREATE TRIGGER immutable_case_customer_communications_update
+           BEFORE UPDATE ON case_customer_communications BEGIN
+             SELECT RAISE(ABORT, 'customer communications are immutable');
+           END""",
+        """CREATE TRIGGER immutable_case_customer_communications_delete
+           BEFORE DELETE ON case_customer_communications BEGIN
+             SELECT RAISE(ABORT, 'customer communications are immutable');
+           END""",
+    )),
+    Migration(18, (
+        """CREATE TABLE IF NOT EXISTS investigation_control (
+            singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+            mode TEXT NOT NULL CHECK(mode IN ('MANUAL', 'AUTO')),
+            version INTEGER NOT NULL CHECK(version >= 1),
+            updated_by TEXT CHECK(updated_by IS NULL OR length(updated_by) = 36),
+            updated_at TEXT NOT NULL
+        )""",
+        """INSERT OR IGNORE INTO investigation_control
+           (singleton, mode, version, updated_by, updated_at)
+           VALUES (1, 'MANUAL', 1, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+        """CREATE TABLE IF NOT EXISTS investigation_mode_audit (
+            sequence INTEGER PRIMARY KEY NOT NULL CHECK(sequence >= 1),
+            previous_mode TEXT CHECK(previous_mode IS NULL OR previous_mode IN ('MANUAL', 'AUTO')),
+            mode TEXT NOT NULL CHECK(mode IN ('MANUAL', 'AUTO')),
+            version INTEGER NOT NULL CHECK(version >= 1),
+            admin_user_id TEXT CHECK(admin_user_id IS NULL OR length(admin_user_id) = 36),
+            idempotency_key TEXT CHECK(idempotency_key IS NULL OR length(idempotency_key) = 36),
+            request_fingerprint TEXT CHECK(request_fingerprint IS NULL OR length(request_fingerprint) = 64),
+            changed_at TEXT NOT NULL,
+            UNIQUE(admin_user_id, idempotency_key)
+        )""",
+        """INSERT OR IGNORE INTO investigation_mode_audit
+           (sequence, previous_mode, mode, version, admin_user_id, idempotency_key,
+            request_fingerprint, changed_at)
+           SELECT 1, NULL, mode, version, NULL, NULL, NULL, updated_at
+             FROM investigation_control WHERE singleton = 1""",
+        """CREATE TRIGGER IF NOT EXISTS immutable_investigation_mode_audit_update
+           BEFORE UPDATE ON investigation_mode_audit BEGIN
+             SELECT RAISE(ABORT, 'investigation mode audit is immutable');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS immutable_investigation_mode_audit_delete
+           BEFORE DELETE ON investigation_mode_audit BEGIN
+             SELECT RAISE(ABORT, 'investigation mode audit is immutable');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS immutable_investigation_control_delete
+           BEFORE DELETE ON investigation_control BEGIN
+             SELECT RAISE(ABORT, 'investigation control cannot be deleted');
+           END""",
+        """CREATE TABLE IF NOT EXISTS investigation_start_requests (
+            admin_user_id TEXT NOT NULL CHECK(length(admin_user_id) = 36),
+            idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) = 36),
+            job_id TEXT UNIQUE NOT NULL REFERENCES investigation_jobs(job_id),
+            request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint) = 64),
+            requested_at TEXT NOT NULL,
+            PRIMARY KEY(admin_user_id, idempotency_key)
+        )""",
+        """CREATE TRIGGER IF NOT EXISTS immutable_investigation_start_requests_update
+           BEFORE UPDATE ON investigation_start_requests BEGIN
+             SELECT RAISE(ABORT, 'investigation start requests are immutable');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS immutable_investigation_start_requests_delete
+           BEFORE DELETE ON investigation_start_requests BEGIN
+             SELECT RAISE(ABORT, 'investigation start requests are immutable');
+           END""",
+        """ALTER TABLE investigation_jobs ADD COLUMN submission_mode TEXT NOT NULL
+           DEFAULT 'MANUAL' CHECK(submission_mode IN ('MANUAL', 'AUTO'))""",
+        """ALTER TABLE investigation_jobs ADD COLUMN mode_version INTEGER NOT NULL
+           DEFAULT 1 CHECK(mode_version >= 1)""",
+        """CREATE TRIGGER immutable_investigation_job_mode_snapshot_update
+           BEFORE UPDATE OF submission_mode, mode_version ON investigation_jobs BEGIN
+             SELECT RAISE(ABORT, 'investigation job mode snapshot is immutable');
+           END""",
+        """CREATE INDEX IF NOT EXISTS investigation_jobs_submission_mode
+           ON investigation_jobs(submission_mode, status, created_at, job_id)""",
+    )),
 )
 
 
@@ -1051,6 +1150,17 @@ class SQLiteCaseRepository:
                 "action": row["action"], "reason": row["reason"],
                 "customer_message": row["customer_message"],
                 "admin_user_id": row["admin_user_id"], "decided_at": row["decided_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @staticmethod
+    def _customer_communication(row: sqlite3.Row) -> CaseCustomerCommunication:
+        try:
+            return CaseCustomerCommunication.model_validate({
+                "id": row["communication_id"], "case_id": row["case_id"],
+                "message": row["message"], "admin_user_id": row["admin_user_id"],
+                "sent_at": row["sent_at"],
             })
         except Exception:
             raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
@@ -1265,6 +1375,207 @@ class SQLiteCaseRepository:
             )
         return updated, decision
 
+    def customer_communication_history(self, case_id: UUID) -> tuple[CaseCustomerCommunication, ...]:
+        with self._persistence.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM support_cases WHERE case_id = ?", (str(case_id),)
+            ).fetchone() is None:
+                raise NotFoundError("Case not found")
+            rows = connection.execute(
+                """SELECT * FROM case_customer_communications
+                   WHERE case_id = ? ORDER BY sequence""",
+                (str(case_id),),
+            ).fetchall()
+            return tuple(self._customer_communication(row) for row in rows)
+
+    def record_customer_communication(
+        self, communication: CaseCustomerCommunication, *, idempotency_key: UUID,
+        request_fingerprint: str,
+    ) -> tuple[CaseCustomerCommunication, bool]:
+        """Append an immutable audit record; a matching retry returns the original row."""
+        with self._persistence.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM support_cases WHERE case_id = ?", (str(communication.case_id),)
+            ).fetchone() is None:
+                raise NotFoundError("Case not found")
+            existing = connection.execute(
+                """SELECT * FROM case_customer_communications
+                   WHERE admin_user_id = ? AND idempotency_key = ?""",
+                (str(communication.admin_user_id), str(idempotency_key)),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise ConflictError(
+                        "Idempotency key conflicts with an existing customer communication"
+                    )
+                return self._customer_communication(existing), False
+            sequence = connection.execute(
+                """SELECT coalesce(max(sequence), 0) + 1
+                   FROM case_customer_communications WHERE case_id = ?""",
+                (str(communication.case_id),),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO case_customer_communications
+                   (communication_id, case_id, sequence, message, admin_user_id,
+                    idempotency_key, request_fingerprint, sent_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(communication.id), str(communication.case_id), sequence,
+                 communication.message, str(communication.admin_user_id),
+                 str(idempotency_key), request_fingerprint,
+                 communication.sent_at.isoformat()),
+            )
+        return communication, True
+
+
+class SQLiteInvestigationControlRepository:
+    """Singleton mode control plus immutable administrative audit history."""
+
+    def __init__(self, persistence: SQLitePersistence) -> None:
+        self._persistence = persistence
+
+    @staticmethod
+    def _control(row: sqlite3.Row) -> InvestigationControl:
+        try:
+            return InvestigationControl.model_validate({
+                "mode": row["mode"], "version": row["version"],
+                "updated_by": row["updated_by"], "updated_at": row["updated_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    @staticmethod
+    def _event(row: sqlite3.Row) -> InvestigationModeAuditEvent:
+        try:
+            return InvestigationModeAuditEvent.model_validate({
+                "sequence": row["sequence"], "previous_mode": row["previous_mode"],
+                "mode": row["mode"], "version": row["version"],
+                "admin_user_id": row["admin_user_id"],
+                "idempotency_key": row["idempotency_key"],
+                "changed_at": row["changed_at"],
+            })
+        except Exception:
+            raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
+
+    def get(self) -> InvestigationControl:
+        with self._persistence.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM investigation_control WHERE singleton = 1",
+            ).fetchone()
+            if row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            return self._control(row)
+
+    def set_mode(self, mode: InvestigationMode, *, expected_version: int,
+                 admin_user_id: UUID, idempotency_key: UUID,
+                 now: datetime | None = None) -> InvestigationControl:
+        """Apply one optimistic, idempotent mode change without dispatching work."""
+        mode = InvestigationMode(mode)
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            raise ValueError("expected_version must be a positive integer")
+        timestamp = datetime.now(timezone.utc) if now is None else now
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("Mode change timestamps must be timezone-aware")
+        timestamp = timestamp.astimezone(timezone.utc)
+        request_fingerprint = sha256(json.dumps({
+            "expected_version": expected_version, "mode": mode.value,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+        with self._persistence.transaction() as connection:
+            existing = connection.execute(
+                """SELECT * FROM investigation_mode_audit
+                   WHERE admin_user_id = ? AND idempotency_key = ?""",
+                (str(admin_user_id), str(idempotency_key)),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_fingerprint"] != request_fingerprint:
+                    raise ConflictError("Idempotency key conflicts with an investigation mode request")
+                event = self._event(existing)
+                return InvestigationControl(
+                    mode=event.mode, version=event.version, updated_by=event.admin_user_id,
+                    updated_at=event.changed_at,
+                )
+
+            row = connection.execute(
+                "SELECT * FROM investigation_control WHERE singleton = 1",
+            ).fetchone()
+            if row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            current = self._control(row)
+            if current.version != expected_version:
+                raise ConflictError("Investigation mode version is stale")
+            if current.mode is mode:
+                raise ConflictError("Investigation mode is already selected")
+            changed_at = timestamp if timestamp > current.updated_at else current.updated_at + timedelta(microseconds=1)
+            next_version = current.version + 1
+            updated = connection.execute(
+                """UPDATE investigation_control
+                   SET mode = ?, version = ?, updated_by = ?, updated_at = ?
+                   WHERE singleton = 1 AND version = ?""",
+                (mode.value, next_version, str(admin_user_id), changed_at.isoformat(),
+                 current.version),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("Investigation mode version is stale")
+            sequence = connection.execute(
+                "SELECT coalesce(max(sequence), 0) + 1 FROM investigation_mode_audit",
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO investigation_mode_audit
+                   (sequence, previous_mode, mode, version, admin_user_id, idempotency_key,
+                    request_fingerprint, changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sequence, current.mode.value, mode.value, next_version, str(admin_user_id),
+                 str(idempotency_key), request_fingerprint, changed_at.isoformat()),
+            )
+            return InvestigationControl(
+                mode=mode, version=next_version, updated_by=admin_user_id,
+                updated_at=changed_at,
+            )
+
+    def audit(self, *, after: int = 0, limit: int = 100) -> tuple[InvestigationModeAuditEvent, ...]:
+        if (isinstance(after, bool) or isinstance(limit, bool) or after < 0
+                or limit < 1 or limit > 101):
+            raise ValueError("Invalid investigation mode audit page")
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                """SELECT * FROM investigation_mode_audit
+                   WHERE sequence > ? ORDER BY sequence LIMIT ?""",
+                (after, limit),
+            ).fetchall()
+            return tuple(self._event(row) for row in rows)
+
+    def status_counts(self) -> dict[str, int]:
+        counts = {name: 0 for name in (
+            "pending", "running", "review_required", "completed", "failed",
+            "recovery_required",
+        )}
+        with self._persistence.transaction() as connection:
+            rows = connection.execute(
+                """SELECT j.status AS job_status, w.status AS workflow_status, count(*) AS total
+                   FROM investigation_jobs j
+                   LEFT JOIN workflow_runs w ON w.workflow_id = j.workflow_id
+                   GROUP BY j.status, w.status""",
+            ).fetchall()
+        for row in rows:
+            total = row["total"]
+            if row["job_status"] == InvestigationJobStatus.PENDING.value:
+                counts["pending"] += total
+            elif (row["job_status"] == InvestigationJobStatus.RECOVERY_REQUIRED.value
+                  or row["workflow_status"] == WorkflowMetadataStatus.RECOVERY_REQUIRED.value):
+                counts["recovery_required"] += total
+            elif row["workflow_status"] == WorkflowMetadataStatus.REVIEW_REQUIRED.value:
+                counts["review_required"] += total
+            elif row["workflow_status"] in (
+                WorkflowMetadataStatus.COMPLETED.value, WorkflowMetadataStatus.REVIEWED.value,
+            ):
+                counts["completed"] += total
+            elif row["workflow_status"] == WorkflowMetadataStatus.FAILED.value:
+                counts["failed"] += total
+            else:
+                counts["running"] += total
+        counts["total"] = sum(counts.values())
+        return counts
+
 
 class SQLiteInvestigationJobRepository:
     """Durable, idempotent complaint-intake queue; it never dispatches work."""
@@ -1290,6 +1601,8 @@ class SQLiteInvestigationJobRepository:
                 "agent_request_fingerprint": row["agent_request_fingerprint"],
                 "execution_attempt_id": row["execution_attempt_id"],
                 "execution_attempted_at": row["execution_attempted_at"],
+                "submission_mode": row["submission_mode"],
+                "mode_version": row["mode_version"],
             })
         except Exception:
             raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR") from None
@@ -1432,6 +1745,12 @@ class SQLiteInvestigationJobRepository:
             order = SQLiteCaseRepository._require_order(connection, case.order_id)
             if order.customer_id != case.customer_id:
                 raise ConflictError("Order does not belong to the selected customer")
+            control_row = connection.execute(
+                "SELECT * FROM investigation_control WHERE singleton = 1",
+            ).fetchone()
+            if control_row is None:
+                raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+            control = SQLiteInvestigationControlRepository._control(control_row)
             connection.execute(
                 """INSERT INTO support_cases
                    (case_id, customer_id, order_id, subject, description, status, created_at, updated_at)
@@ -1444,19 +1763,71 @@ class SQLiteInvestigationJobRepository:
                 owner_user_id=owner_user_id, idempotency_key=idempotency_key,
                 request_fingerprint=fingerprint, status=InvestigationJobStatus.PENDING,
                 created_at=case.created_at, updated_at=case.created_at,
+                submission_mode=control.mode, mode_version=control.version,
             )
             connection.execute(
                 """INSERT INTO investigation_jobs
                    (job_id, case_id, customer_id, owner_user_id, idempotency_key,
                     request_fingerprint, status, claim_id, claimed_by, claimed_at,
-                    lease_expires_at, recovery_reason, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    lease_expires_at, recovery_reason, created_at, updated_at,
+                    submission_mode, mode_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(job.id), str(job.case_id), str(job.customer_id), str(job.owner_user_id),
                  str(job.idempotency_key), job.request_fingerprint, job.status.value,
                  None, None, None, None, None, job.created_at.isoformat(),
-                 job.updated_at.isoformat()),
+                 job.updated_at.isoformat(), job.submission_mode.value, job.mode_version),
             )
             return case, job, True
+
+    def register_manual_start(self, job_id: UUID, *, admin_user_id: UUID,
+                              idempotency_key: UUID,
+                              now: datetime | None = None) -> tuple[InvestigationJob, bool]:
+        """Persist one ADMIN start request; claiming remains the execution gate."""
+        timestamp = self._claim_time(now)
+        fingerprint = sha256(json.dumps(
+            {"job_id": str(job_id)}, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        with self._persistence.transaction() as connection:
+            existing = connection.execute(
+                """SELECT * FROM investigation_start_requests
+                   WHERE admin_user_id = ? AND idempotency_key = ?""",
+                (str(admin_user_id), str(idempotency_key)),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_fingerprint"] != fingerprint or existing["job_id"] != str(job_id):
+                    raise ConflictError("Idempotency key conflicts with an investigation start request")
+                row = connection.execute(
+                    "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+                ).fetchone()
+                if row is None:
+                    raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")
+                return self._job(row), False
+
+            row = connection.execute(
+                "SELECT * FROM investigation_jobs WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Investigation job not found")
+            job = self._job(row)
+            if job.status is not InvestigationJobStatus.PENDING:
+                raise ConflictError("Investigation has already started")
+            if connection.execute(
+                "SELECT 1 FROM workflow_runs WHERE case_id = ? LIMIT 1", (str(job.case_id),),
+            ).fetchone() is not None:
+                raise ConflictError("Case already has a workflow investigation")
+            prior = connection.execute(
+                "SELECT 1 FROM investigation_start_requests WHERE job_id = ?", (str(job_id),),
+            ).fetchone()
+            if prior is not None:
+                raise ConflictError("Investigation start has already been requested")
+            connection.execute(
+                """INSERT INTO investigation_start_requests
+                   (admin_user_id, idempotency_key, job_id, request_fingerprint, requested_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (str(admin_user_id), str(idempotency_key), str(job_id), fingerprint,
+                 timestamp.isoformat()),
+            )
+            return job, True
 
     def get_by_case(self, case_id: UUID) -> InvestigationJob:
         with self._persistence.transaction() as connection:
@@ -1665,6 +2036,21 @@ class SQLiteInvestigationJobRepository:
                      str(claim_id), str(worker_id)),
                 )
                 expired = True
+            elif connection.execute(
+                """SELECT 1 FROM workflow_runs
+                   WHERE case_id = ? AND workflow_id <> ? LIMIT 1""",
+                (str(job.case_id), str(job.id)),
+            ).fetchone() is not None:
+                connection.execute(
+                    """UPDATE investigation_jobs
+                       SET status = ?, recovery_reason = ?, updated_at = ?
+                       WHERE job_id = ? AND status = ? AND claim_id = ? AND claimed_by = ?""",
+                    (InvestigationJobStatus.RECOVERY_REQUIRED.value,
+                     InvestigationRecoveryReason.CLAIM_AMBIGUOUS.value, observed_at.isoformat(),
+                     str(job.id), InvestigationJobStatus.CLAIMED.value,
+                     str(claim_id), str(worker_id)),
+                )
+                collision = True
             elif job.workflow_id is not None:
                 if job.workflow_id != job.id:
                     raise PersistenceError("PERSISTENCE_INTEGRITY_ERROR")

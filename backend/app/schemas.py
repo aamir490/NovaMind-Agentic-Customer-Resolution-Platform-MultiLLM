@@ -39,6 +39,11 @@ class CaseResolutionCreate(RequestModel):
     evidence_reviewed: bool = False
 
 
+class CustomerCommunicationCreate(RequestModel):
+    """Admin-approved text only; case, actor, timestamp, and audit data are server-owned."""
+    message: CustomerMessage
+
+
 class CustomerCaseCreate(RequestModel):
     """
     Customer-safe case creation schema.

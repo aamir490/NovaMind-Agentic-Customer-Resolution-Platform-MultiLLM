@@ -58,7 +58,9 @@ class SQLitePersistenceTests(unittest.TestCase):
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(versions, [migration.version for migration in MIGRATIONS])
         self.assertTrue({"customers", "delivery_facts", "eligibility_evidence", "resolution_proposals",
-                         "workflow_review_bindings", "workflow_audit_events", "workflow_runs"} <= tables)
+                         "workflow_review_bindings", "workflow_audit_events", "workflow_runs",
+                         "case_customer_communications", "investigation_control",
+                         "investigation_mode_audit", "investigation_start_requests"} <= tables)
 
     def test_migrations_are_repeatable_without_schema_changes(self):
         self.store()
@@ -128,6 +130,49 @@ class SQLitePersistenceTests(unittest.TestCase):
             )}
             self.assertIn("case_resolution_decisions", tables)
         self.assertEqual(versions, [migration.version for migration in MIGRATIONS])
+
+    def test_v16_database_adds_customer_communications_without_rebuilding_cases(self):
+        self.create_database_through(16)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("INSERT INTO customers VALUES (?, ?)", ("customer-1", "Customer"))
+            connection.execute(
+                "INSERT INTO orders VALUES (?, ?, ?)",
+                ("order-1", "customer-1", "2026-01-01T00:00:00Z"),
+            )
+            connection.execute(
+                "INSERT INTO support_cases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("case-1", "customer-1", "order-1", "Issue", "Description", "open",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = SQLitePersistence(self.path)
+        with store.transaction() as migrated:
+            tables = {row[0] for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )}
+            self.assertIn("case_customer_communications", tables)
+            self.assertEqual(migrated.execute(
+                "SELECT status FROM support_cases WHERE case_id = 'case-1'"
+            ).fetchone()[0], "open")
+
+    def test_v17_database_adds_default_manual_investigation_control(self):
+        self.create_database_through(17)
+        store = SQLitePersistence(self.path)
+        with store.transaction() as migrated:
+            control = migrated.execute(
+                "SELECT mode, version, updated_by FROM investigation_control WHERE singleton = 1",
+            ).fetchone()
+            audit = migrated.execute(
+                "SELECT previous_mode, mode, version, admin_user_id FROM investigation_mode_audit",
+            ).fetchall()
+            columns = {row[1] for row in migrated.execute("PRAGMA table_info(investigation_jobs)")}
+        self.assertEqual(tuple(control), ("MANUAL", 1, None))
+        self.assertEqual([tuple(row) for row in audit], [(None, "MANUAL", 1, None)])
+        self.assertTrue({"submission_mode", "mode_version"} <= columns)
 
     def test_foreign_key_and_unique_constraints_reject_invalid_evidence(self):
         store = self.store()

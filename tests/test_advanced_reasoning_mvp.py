@@ -145,6 +145,8 @@ class AdvancedReasoningTests(unittest.TestCase):
             ("Device issue", "The storage device does not work after reconnecting it.", "Please investigate."),
             ("Device issue", "My product is unresponsive and fails to start.", "Please investigate."),
             ("Device issue", "The device cannot be detected by my computer.", "Please investigate."),
+            ("Input issue", "NovaControl Input 1 stops responding during normal use.", "Please investigate."),
+            ("Input issue", "NovaControl Input 1 has an intermittent connection.", "Please investigate."),
         )
         for subject, description, message in (exact_failed_complaint, *paraphrases):
             with self.subTest(description=description):
@@ -157,6 +159,38 @@ class AdvancedReasoningTests(unittest.TestCase):
                 self.assertEqual(state.investigation_plan.issue_type, IssueType.MALFUNCTION)
                 self.assertNotIn("get_policy", names)
                 self.assertNotIn("assess_eligibility", names)
+                self.assertNotIn("create_resolution_proposal", names)
+
+    def test_unknown_support_text_uses_the_safe_technical_path_not_return(self):
+        result = self.run_agent(
+            self.support_case("NovaControl Input 1", "Please help with this unexpected input-device issue."),
+            "I need technical support.",
+        )
+        self.assertEqual(result.investigation_plan.issue_type, IssueType.MALFUNCTION)
+        self.assertEqual(result.investigation_plan.customer_intent, CustomerIntent.REPORT_ISSUE)
+        self.assertEqual(result.resolution_draft.recommended_decision, "REQUEST_EVIDENCE")
+        self.assertNotIn("create_resolution_proposal", result.investigation_plan.allowed_tools)
+        self.assertEqual(result.pending_proposal_ids, ())
+        self.assertFalse(result.actions_executed)
+
+    def test_technical_plan_rejects_financial_and_fulfillment_proposals_before_dispatch(self):
+        for action in ("refund", "return", "replacement"):
+            with self.subTest(action=action):
+                support_case = self.support_case(
+                    "NovaControl Input 1 stops responding",
+                    "The controller has an intermittent connection.",
+                )
+                provider = self.RecordingProvider((
+                    {"decision": {"kind": "tool", "name": "create_resolution_proposal", "arguments": {
+                        "case_id": str(support_case.id), "action": action, "rationale": "Model requested action.",
+                    }}},
+                ))
+                with patch.object(self.app.state.local_tools, "invoke", wraps=self.app.state.local_tools.invoke) as invoke:
+                    result = self.run_agent(support_case, "Please investigate the technical issue.", provider)
+                self.assertEqual(result.error, "UNKNOWN_TOOL")
+                self.assertEqual([call.args[0] for call in invoke.call_args_list], ["get_case"])
+                self.assertEqual(self.app.state.proposal_service.list_for_case(support_case.id), [])
+                self.assertFalse(result.actions_executed)
 
     def test_genuine_return_still_uses_the_return_plan(self):
         provider = self.RecordingProvider([{"decision": {"kind": "final"}}])
@@ -176,8 +210,8 @@ class AdvancedReasoningTests(unittest.TestCase):
         for supplied_case_id in ("hybrid", str(uuid4()), "not-a-uuid"):
             with self.subTest(supplied_case_id=supplied_case_id):
                 support_case = self.support_case(
-                    "Replacement Request – NovaSound Audio 10 Not Working",
-                    "The audio device is not functioning properly and does not work after reconnecting it.",
+                    "Wrong item – NovaSound Audio 10",
+                    "I received a different item than the one I ordered.",
                 )
                 hybrid_case_id = str(support_case.id)[:14] + str(self.order.id)[14:]
                 model_case_id = hybrid_case_id if supplied_case_id == "hybrid" else supplied_case_id
@@ -189,11 +223,11 @@ class AdvancedReasoningTests(unittest.TestCase):
                         "order_id": str(self.order.id),
                     }}},
                     {"decision": {"kind": "tool", "name": "search_knowledge", "arguments": {
-                        "query": "malfunction replacement policy", "top_k": 3,
+                        "query": "wrong item replacement policy", "top_k": 3,
                     }}},
                     {"decision": {"kind": "tool", "name": "create_resolution_proposal", "arguments": {
                         "case_id": model_case_id, "action": "replacement",
-                        "rationale": "The reported malfunction requires staff review before any remedy.",
+                        "rationale": "The wrong-item report requires staff review before any remedy.",
                     }}},
                 ))
                 workflow = HITLWorkflow(
@@ -205,7 +239,7 @@ class AdvancedReasoningTests(unittest.TestCase):
                 with patch.object(self.app.state.local_tools, "invoke", wraps=self.app.state.local_tools.invoke) as invoke:
                     with authenticated(self.auth, self.token):
                         result = workflow.start(AgentRequest(
-                            case_id=support_case.id, message="Please investigate the audio malfunction.",
+                            case_id=support_case.id, message="Please investigate the wrong item.",
                         ))
                         audit = workflow.audit(result.workflow_id)
                 proposal = self.app.state.proposal_service.get(result.review.proposal_id)

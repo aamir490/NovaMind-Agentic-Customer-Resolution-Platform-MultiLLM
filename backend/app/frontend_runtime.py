@@ -18,7 +18,7 @@ from .langgraph_checkpoints import SQLiteCheckpointSaver
 from .knowledge import RetrievalResult
 from .llm import ProviderFailure, StructuredLLM
 from .observability import ERRORS, TOOLS
-from .persistence import SQLiteWorkflowMetadataRepository
+from .persistence import SQLiteInvestigationJobRepository, SQLiteWorkflowMetadataRepository
 from .proposals import ProposalStatus, ResolutionProposal
 from .security import Authorization, Role, SecurityError, current_identity, require_roles
 from .service import NotFoundError
@@ -65,6 +65,7 @@ class FrontendRuntime:
                  agent_engine="langgraph", strands_model_factory=None,
                  checkpointer: SQLiteCheckpointSaver | None = None,
                  workflow_metadata: SQLiteWorkflowMetadataRepository | None = None,
+                 investigation_jobs: SQLiteInvestigationJobRepository | None = None,
                  max_runs=128, max_active=2, event_capacity=128):
         if not (1 <= max_runs <= 1024 and 1 <= max_active <= 8 and 1 <= event_capacity <= 1024):
             raise ValueError("Invalid local runtime bounds")
@@ -86,6 +87,7 @@ class FrontendRuntime:
         self.memory = memory
         self._checkpointer = checkpointer
         self._workflow_metadata = workflow_metadata
+        self._investigation_jobs = investigation_jobs
         self._cases, self._tools, self._proposals = cases, tools, proposals
         self._max_runs, self._max_active, self._event_capacity = max_runs, max_active, event_capacity
         self._runs, self._requests = {}, {}
@@ -249,6 +251,16 @@ class FrontendRuntime:
         identity = current_identity()
         Authorization(self._cases).case(body.case_id)
         self.check_instance(body.instance_id)
+        if self._investigation_jobs is not None:
+            try:
+                self._investigation_jobs.get_by_case(body.case_id)
+            except NotFoundError:
+                pass
+            else:
+                # Customer-intake cases must use the durable job claim path.
+                # A new request_id here must never create a second workflow or
+                # an additional billable provider call for the same case.
+                raise FrontendError(409, "CASE_INVESTIGATION_ALREADY_EXISTS")
         request = AgentRequest.model_validate(body.model_dump(exclude={"instance_id", "request_id"}))
         fingerprint = HITLWorkflow._fingerprint(request)
         key = (identity.user_id, body.request_id)

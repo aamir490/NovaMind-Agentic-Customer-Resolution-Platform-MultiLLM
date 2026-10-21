@@ -67,6 +67,7 @@ test('identity and run snapshots accept Bedrock and scripted labels but reject r
   const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
   const instance_id = id(1), case_id = id(2), run_id = id(3);
   const identity = { identity: { user_id: id(4), role: 'ADMIN', customer_id: null },
+    can_review: true, can_view_diagnostics: true,
     instance_id, provider: 'bedrock', memory_available: false };
   const snapshot = { instance_id, case_id, run_id, provider: 'bedrock', status: 'RUNNING',
     workflow_id: null, conversation_id: null, trace_id: null, reviewed_status: null,
@@ -83,6 +84,61 @@ test('identity and run snapshots accept Bedrock and scripted labels but reject r
   await assert.rejects(api.identity(), /Unexpected identity response/);
   snapshot.provider = 'unsupported';
   await assert.rejects(api.startRun({ instance_id, request_id: id(5), case_id, message: 'Review' }), /invalid run snapshot/);
+});
+
+test('investigation control and manual start use closed contracts and idempotency headers', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1), key = id(2);
+  const control = { configured_mode: 'MANUAL', effective_mode: 'MANUAL',
+    automatic_capability_available: true, version: 1, updated_by: null,
+    updated_at: '2026-10-21T10:00:00Z', counts: { total: 1, pending: 1, running: 0,
+      review_required: 0, completed: 0, failed: 0, recovery_required: 0 } };
+  const status = { case_id: caseId, job_id: id(3), state: 'PENDING', job_status: 'PENDING',
+    workflow_id: null, workflow_status: null, provider: null, submission_mode: 'MANUAL',
+    mode_version: 1, submitted_at: '2026-10-21T10:01:00Z', execution_started: false,
+    can_start: true, actions_executed: false };
+  const calls = [];
+  const api = createApi(async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, json: async () => url.includes('/cases/') ? status : control };
+  });
+  assert.deepEqual((await api.investigationControl()).counts, {
+    total: 1, pending: 1, running: 0, reviewRequired: 0, completed: 0, failed: 0,
+    recoveryRequired: 0,
+  });
+  await api.updateInvestigationControl({ mode: 'AUTO', expectedVersion: 1, idempotencyKey: key });
+  assert.deepEqual(await api.caseInvestigation(caseId), {
+    caseId, jobId: id(3), state: 'PENDING', jobStatus: 'PENDING', workflowId: null,
+    workflowStatus: null, provider: null, submissionMode: 'MANUAL', modeVersion: 1,
+    submittedAt: '2026-10-21T10:01:00Z', executionStarted: false, canStart: true,
+    actionsExecuted: false,
+  });
+  await api.startCaseInvestigation(caseId, { idempotencyKey: key });
+  assert.equal(calls[1].url, '/api/admin/investigation-control');
+  assert.equal(calls[1].options.method, 'PATCH');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], key);
+  assert.deepEqual(JSON.parse(calls[1].options.body), { mode: 'AUTO', expected_version: 1 });
+  assert.equal(calls[3].url, `/api/cases/${caseId}/investigation`);
+  assert.equal(calls[3].options.method, 'POST');
+  assert.equal(calls[3].options.headers['Idempotency-Key'], key);
+  assert.equal(calls[3].options.body, undefined);
+});
+
+test('investigation API rejects malformed status and mode responses', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1);
+  const invalidControl = { configured_mode: 'AUTO', effective_mode: 'AUTO',
+    automatic_capability_available: true, version: 2, updated_by: id(2),
+    updated_at: '2026-10-21T10:00:00Z', counts: { total: 1, pending: 1, running: 1,
+      review_required: 0, completed: 0, failed: 0, recovery_required: 0 } };
+  await assert.rejects(createApi(async () => ({ ok: true, json: async () => invalidControl }))
+    .investigationControl(), /invalid investigation control/);
+  const invalidStatus = { case_id: caseId, job_id: null, state: 'RUNNING', job_status: null,
+    workflow_id: null, workflow_status: null, provider: null, submission_mode: null,
+    mode_version: null, submitted_at: null, execution_started: false, can_start: false,
+    actions_executed: false };
+  await assert.rejects(createApi(async () => ({ ok: true, json: async () => invalidStatus }))
+    .caseInvestigation(caseId), /invalid case investigation binding/);
 });
 
 test('admin resolution sends an explicit human decision without actor or AI execution fields', async () => {
@@ -132,4 +188,47 @@ test('admin draft projection is bounded and never accepts an executed action', a
   assert.equal(calls[0].options.method, 'GET');
   draft.actions_executed = true;
   await assert.rejects(api.caseResolutionDraft(caseId), /invalid resolution draft/);
+});
+
+test('customer guidance uses an idempotent admin POST and a closed latest projection', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1), idempotencyKey = id(2);
+  const raw = { message: 'Try a known-good cable and tell us whether the indicator remains lit.',
+    sent_at: '2026-10-21T10:00:00Z', admin_user_id: id(3), request_fingerprint: 'PRIVATE' };
+  const calls = [];
+  const api = createApi(async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, json: async () => raw };
+  });
+
+  assert.deepEqual(await api.latestCustomerGuidance(caseId), {
+    message: raw.message, sentAt: raw.sent_at,
+  });
+  assert.deepEqual(await api.sendCustomerGuidance(caseId, {
+    message: `  ${raw.message}  `, idempotencyKey,
+  }), { message: raw.message, sentAt: raw.sent_at });
+  assert.deepEqual(calls.map(({ url }) => url), [
+    `/api/cases/${caseId}/customer-communications/latest`,
+    `/api/cases/${caseId}/customer-communications`,
+  ]);
+  assert.equal(calls[1].options.method, 'POST');
+  assert.equal(calls[1].options.headers['Idempotency-Key'], idempotencyKey);
+  assert.deepEqual(JSON.parse(calls[1].options.body), { message: raw.message });
+});
+
+test('customer guidance rejects malformed responses, messages, and retry keys', async () => {
+  const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const caseId = id(1), key = id(2);
+  for (const body of [{}, { message: '', sent_at: '2026-10-21T10:00:00Z' },
+    { message: 'Guidance', sent_at: 'invalid' }]) {
+    await assert.rejects(createApi(async () => ({ ok: true, json: async () => body }))
+      .latestCustomerGuidance(caseId), /invalid customer communication/);
+  }
+  let calls = 0;
+  const api = createApi(async () => { calls++; });
+  await assert.rejects(api.sendCustomerGuidance(caseId, { message: ' ', idempotencyKey: key }),
+    /customer communication/);
+  await assert.rejects(api.sendCustomerGuidance(caseId, { message: 'Guidance', idempotencyKey: 'bad' }),
+    /idempotency key/);
+  assert.equal(calls, 0);
 });

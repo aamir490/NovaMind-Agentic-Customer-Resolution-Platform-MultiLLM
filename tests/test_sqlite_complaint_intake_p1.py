@@ -140,6 +140,7 @@ class SQLiteComplaintIntakeTests(unittest.TestCase):
         # Recreate a version-9 database in this temporary test file, then let
         # SQLitePersistence apply the new additive migration to existing data.
         with SQLitePersistence(self.path).transaction() as connection:
+            connection.execute("DROP TABLE case_customer_communications")
             connection.execute("DROP TABLE investigation_jobs")
             connection.execute("DELETE FROM schema_migrations WHERE version >= 10")
         reopened = SQLiteCaseRepository(SQLitePersistence(self.path))

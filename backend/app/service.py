@@ -1,11 +1,16 @@
 """Local application service with process-local storage and atomic mutations."""
 
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from threading import RLock
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from .domain import CaseResolutionDecision, Customer, Order, ResolutionAction, SupportCase, CaseStatus, can_transition
+from .domain import (
+    CaseCustomerCommunication, CaseResolutionDecision, Customer, Order,
+    ResolutionAction, SupportCase, CaseStatus, can_transition,
+)
 from .schemas import CustomerCreate, OrderCreate, CaseCreate
 
 
@@ -33,6 +38,11 @@ class CaseRepository(Protocol):
     def resolution_history(self, case_id: UUID) -> tuple[CaseResolutionDecision, ...]: ...
     def record_resolution(self, current: SupportCase, updated: SupportCase,
                           decision: CaseResolutionDecision) -> tuple[SupportCase, CaseResolutionDecision]: ...
+    def customer_communication_history(self, case_id: UUID) -> tuple[CaseCustomerCommunication, ...]: ...
+    def record_customer_communication(
+        self, communication: CaseCustomerCommunication, *, idempotency_key: UUID,
+        request_fingerprint: str,
+    ) -> tuple[CaseCustomerCommunication, bool]: ...
 
 
 class CaseService:
@@ -43,6 +53,10 @@ class CaseService:
         self._orders: dict[UUID, Order] = {}
         self._cases: dict[UUID, SupportCase] = {}
         self._resolution_history: dict[UUID, tuple[CaseResolutionDecision, ...]] = {}
+        self._customer_communications: dict[UUID, tuple[CaseCustomerCommunication, ...]] = {}
+        self._customer_communication_requests: dict[
+            tuple[UUID, UUID], tuple[str, CaseCustomerCommunication]
+        ] = {}
         self._repository = repository
         self._lock = RLock()
 
@@ -178,6 +192,55 @@ class CaseService:
             if self._repository is not None:
                 return self._repository.resolution_history(case_id)
             return self._resolution_history.get(case_id, ())
+
+    def customer_communication_history(self, case_id: UUID) -> tuple[CaseCustomerCommunication, ...]:
+        """Return immutable, ordered communication audit records for an existing case."""
+        with self._lock:
+            self.get_case(case_id)
+            if self._repository is not None:
+                return self._repository.customer_communication_history(case_id)
+            return self._customer_communications.get(case_id, ())
+
+    def latest_customer_communication(self, case_id: UUID) -> CaseCustomerCommunication | None:
+        history = self.customer_communication_history(case_id)
+        return history[-1] if history else None
+
+    @staticmethod
+    def _customer_communication_fingerprint(case_id: UUID, message: str) -> str:
+        payload = json.dumps(
+            {"case_id": str(case_id), "message": message},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+    def send_customer_communication(
+        self, case_id: UUID, *, message: str, admin_user_id: UUID,
+        idempotency_key: UUID,
+    ) -> tuple[CaseCustomerCommunication, bool]:
+        """Append one admin-approved message without changing case state or taking an action."""
+        with self._lock:
+            self.get_case(case_id)
+            communication = CaseCustomerCommunication(
+                id=uuid4(), case_id=case_id, message=message,
+                admin_user_id=admin_user_id, sent_at=datetime.now(timezone.utc),
+            )
+            fingerprint = self._customer_communication_fingerprint(case_id, communication.message)
+            if self._repository is not None:
+                return self._repository.record_customer_communication(
+                    communication, idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+            request_key = (admin_user_id, idempotency_key)
+            existing = self._customer_communication_requests.get(request_key)
+            if existing is not None:
+                if existing[0] != fingerprint:
+                    raise ConflictError("Idempotency key conflicts with an existing customer communication")
+                return existing[1], False
+            self._customer_communications[case_id] = (
+                *self._customer_communications.get(case_id, ()), communication,
+            )
+            self._customer_communication_requests[request_key] = (fingerprint, communication)
+            return communication, True
 
     def resolve_case(self, case_id: UUID, *, action: ResolutionAction, reason: str,
                      customer_message: str, admin_user_id: UUID,

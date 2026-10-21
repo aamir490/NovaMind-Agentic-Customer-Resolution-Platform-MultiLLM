@@ -66,6 +66,30 @@ class InvestigationJobStatus(StrEnum):
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
 
+class InvestigationMode(StrEnum):
+    MANUAL = "MANUAL"
+    AUTO = "AUTO"
+
+
+class InvestigationControl(Record):
+    """Durable operator-selected intake mode; execution capability remains server-owned."""
+    mode: InvestigationMode
+    version: int = Field(strict=True, ge=1)
+    updated_by: UUID | None = None
+    updated_at: datetime
+
+
+class InvestigationModeAuditEvent(Record):
+    """Immutable administrative mode-change audit record."""
+    sequence: int = Field(strict=True, ge=1)
+    previous_mode: InvestigationMode | None = None
+    mode: InvestigationMode
+    version: int = Field(strict=True, ge=1)
+    admin_user_id: UUID | None = None
+    idempotency_key: UUID | None = None
+    changed_at: datetime
+
+
 class InvestigationRecoveryReason(StrEnum):
     LEASE_EXPIRED = "LEASE_EXPIRED"
     CLAIM_AMBIGUOUS = "CLAIM_AMBIGUOUS"
@@ -93,6 +117,8 @@ class InvestigationJob(Record):
     agent_request_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     execution_attempt_id: UUID | None = None
     execution_attempted_at: datetime | None = None
+    submission_mode: InvestigationMode = InvestigationMode.MANUAL
+    mode_version: int = Field(default=1, strict=True, ge=1)
 
     @model_validator(mode="after")
     def validate_claim_state(self) -> "InvestigationJob":
@@ -193,6 +219,21 @@ class CustomerResolutionDecision(Record):
     action: ResolutionAction
     customer_message: CustomerMessage
     decided_at: datetime
+
+
+class CaseCustomerCommunication(Record):
+    """Immutable admin-approved customer communication and internal audit record."""
+    id: UUID
+    case_id: UUID
+    message: CustomerMessage
+    admin_user_id: UUID
+    sent_at: datetime
+
+
+class CustomerCommunication(Record):
+    """Customer-safe projection; actor and persistence metadata stay internal."""
+    message: CustomerMessage
+    sent_at: datetime
 
 
 class CaseResolutionHistory(Record):
