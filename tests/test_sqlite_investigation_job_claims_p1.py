@@ -186,6 +186,7 @@ class SQLiteInvestigationJobClaimTests(unittest.TestCase):
             )
             connection.execute("DROP TABLE investigation_jobs")
             connection.execute("ALTER TABLE investigation_jobs_v10 RENAME TO investigation_jobs")
+            connection.execute("DROP TABLE case_customer_communications")
             connection.execute("DELETE FROM schema_migrations WHERE version >= 11")
 
         reopened = SQLiteInvestigationJobRepository(SQLitePersistence(self.path))

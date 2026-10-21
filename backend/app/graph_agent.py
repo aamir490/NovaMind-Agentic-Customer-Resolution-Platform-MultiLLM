@@ -16,9 +16,12 @@ from .conversations import (ConversationService, ConversationError,
 from .security import SecurityError
 from .guardrails import GuardrailError, check_payload
 from .observability import observed
-from .resolution_drafts import InvestigationPlan, ResolutionDraft, build_investigation_plan
+from .resolution_drafts import (
+    InvestigationPlan, ResolutionDraft, attach_refund_recommendation,
+    build_investigation_plan, build_refund_recommendation,
+)
 from .evidence_grounding import (
-    EvidenceGrounding, GroundedResponse, apply_grounded_response,
+    EvidenceGrounding, GroundedResponse, apply_grounded_response, attach_grounding_citations,
     build_evidence_grounding, policy_query_for,
 )
 
@@ -50,11 +53,15 @@ class GraphState(Contract):
 
 class GraphResolutionAgent:
     def __init__(self, llm: StructuredLLM, tools: LocalTools, config: AgentConfig | None = None,
-                 *, memory: ConversationService | None = None) -> None:
+                 *, memory: ConversationService | None = None,
+                 enable_refund_wording: bool = False) -> None:
         self._llm = llm
         self._tools = tools
         self._config = config or AgentConfig()
         self._memory = memory
+        # The local/scripted path deliberately retains its existing no-model
+        # refund routing.  Production Bedrock may supply prose, never rules.
+        self._enable_refund_wording = enable_refund_wording
         graph = StateGraph(GraphState)
         for name in ("load_case", "evaluate_refund", "reason", "execute_tool", "record_result", "finalize", "fail_safely"):
             graph.add_node(name, getattr(self, "_" + name))
@@ -144,9 +151,12 @@ class GraphResolutionAgent:
             check_payload(state.request.model_dump(mode="json"))
             if resolution_draft is None:
                 raise ValueError("Resolution draft is unavailable")
+            product_skus = self._tools.case_order_skus(state.request.case_id)
             knowledge_grounding = build_evidence_grounding(
                 resolution_draft,
-                self._tools.retrieve_grounded_policy(policy_query_for(resolution_draft.issue_type)),
+                self._tools.retrieve_grounded_policy(
+                    policy_query_for(resolution_draft.issue_type, product_skus)),
+                product_skus=product_skus,
             )
         except SecurityError as failure:
             return self._update(state, "load_case", history=(event,), error=failure.code,
@@ -219,7 +229,13 @@ class GraphResolutionAgent:
 
         selected = next((item for item in order_result.data.items if item.sku == state.request.refund_sku), None)
         if selected is None:
+            recommendation = build_refund_recommendation(
+                sku=str(state.request.refund_sku), purchased=False,
+            )
+            draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                     if state.resolution_draft is not None else None)
             return self._update(state, "evaluate_refund", history=tuple(history),
+                                resolution_draft=draft,
                                 refund_outcome="Refund request remains unresolved: selected SKU is not in the case-bound order.")
         assessment_call = ToolCall(kind="tool", name="assess_refund_eligibility",
                                    arguments={"case_id": str(state.request.case_id), "sku": selected.sku})
@@ -231,23 +247,57 @@ class GraphResolutionAgent:
         history.append(AuditEntry(step=state.steps, decision=assessment_call, result=assessment))
         if not assessment.ok:
             if assessment.error.code in ("CONFLICT", "NOT_FOUND"):
+                recommendation = build_refund_recommendation(sku=str(selected.sku))
+                draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                         if state.resolution_draft is not None else None)
+                draft = self._refund_wording(state, draft)
                 return self._create_refund_review(state, history, action="refund_investigation",
                     rationale=("Human investigation required: trusted delivery evidence or policy confirmation "
                                "is unavailable for the selected case-bound purchased item. "
-                               "This is not refund approval."))
+                               "This is not refund approval."), resolution_draft=draft)
             return self._update(state, "evaluate_refund", history=tuple(history), error=assessment.error.code)
         evidence = assessment.data
+        recommendation = build_refund_recommendation(sku=str(selected.sku), assessment=evidence)
+        draft = (attach_refund_recommendation(state.resolution_draft, recommendation)
+                 if state.resolution_draft is not None else None)
+        draft = self._refund_wording(state, draft)
         if not evidence.refund_eligible or evidence.denial_reasons or evidence.evidence_id is None:
             reasons = ", ".join(sorted(set(evidence.denial_reasons))) or "refund_eligibility_not_established"
             return self._create_refund_review(state, history, action="refund_investigation",
                 rationale=("Human investigation required: trusted evidence does not confirm refund eligibility "
-                           f"({reasons}). This is not refund approval."))
+                           f"({reasons}). This is not refund approval."), resolution_draft=draft)
         return self._create_refund_review(state, history, action="refund",
             rationale="Server-side refund eligibility evidence requires human review.",
-            evidence_id=evidence.evidence_id)
+            evidence_id=evidence.evidence_id, resolution_draft=draft)
+
+    def _refund_wording(self, state: GraphState, draft: ResolutionDraft | None) -> ResolutionDraft | None:
+        """Optionally polish a completed Python assessment without delegating it.
+
+        This bounded single call is enabled only for the configured Bedrock
+        runtime.  It receives the same immutable grounding as normal graph
+        reasoning; malformed, unsupported, or unavailable output leaves the
+        deterministic assessment untouched.
+        """
+        if (not self._enable_refund_wording or draft is None
+                or state.knowledge_grounding is None or not state.messages):
+            return draft
+        try:
+            context = json.loads(state.messages[-1].content)
+            context["grounded_resolution_draft"] = draft.model_dump(mode="json")
+            answer = self._llm.generate(LLMRequest(
+                messages=(*state.messages[:-1], LLMMessage(role="user", content=json.dumps(context))),
+                max_output_tokens=self._config.max_output_tokens,
+            ), AgentDecision)
+            if not answer.ok:
+                return draft
+            return apply_grounded_response(draft, state.knowledge_grounding,
+                                           answer.data.grounded_response) or draft
+        except Exception:
+            return draft
 
     def _create_refund_review(self, state: GraphState, history: list[AuditEntry], *,
-                              action: str, rationale: str, evidence_id: UUID | None = None) -> dict:
+                              action: str, rationale: str, evidence_id: UUID | None = None,
+                              resolution_draft: ResolutionDraft | None = None) -> dict:
         arguments = {"case_id": str(state.request.case_id), "action": action, "rationale": rationale}
         if evidence_id is not None:
             arguments["eligibility_evidence_id"] = str(evidence_id)
@@ -265,7 +315,8 @@ class GraphResolutionAgent:
         if proposal.case_id != state.request.case_id or proposal.status.value != "PENDING_REVIEW":
             return self._update(state, "evaluate_refund", history=tuple(history), error="INVALID_PROPOSAL_STATUS")
         return self._update(state, "evaluate_refund", history=tuple(history), created=True,
-                            pending={**state.pending, proposal.id: True})
+                            pending={**state.pending, proposal.id: True},
+                            resolution_draft=resolution_draft or state.resolution_draft)
 
     @staticmethod
     def _after_reason(state: GraphState) -> str:
@@ -365,23 +416,55 @@ class GraphResolutionAgent:
         return self._update(state, "record_result", **changes)
 
     @staticmethod
+    def resolution_draft_for_state(state: GraphState) -> ResolutionDraft | None:
+        """Return the validated wording that is safe to project from a checkpoint."""
+        if state.final_result is not None and state.final_result.resolution_draft is not None:
+            return state.final_result.resolution_draft
+        if state.generated_resolution_draft is not None:
+            return state.generated_resolution_draft
+        if state.model_resolution_draft == state.resolution_draft:
+            return state.model_resolution_draft
+        return state.resolution_draft
+
+    @staticmethod
+    def admin_resolution_draft_for_state(state: GraphState) -> ResolutionDraft | None:
+        """Add retriever-owned citation metadata only at the admin read projection.
+
+        The fallback draft held by the graph remains identical to the existing
+        deterministic contract.  This keeps graph/Phase 8 parity intact while
+        allowing the staff-only API to show the policy sources that were
+        actually retrieved for the run.
+        """
+        draft = GraphResolutionAgent.resolution_draft_for_state(state)
+        if draft is None or state.knowledge_grounding is None:
+            return draft
+        return attach_grounding_citations(draft, state.knowledge_grounding)
+
+    @staticmethod
     def _result(state: GraphState, history: tuple[AuditEntry, ...], error: str | None = None) -> AgentResult:
         ids = tuple(key for key, value in state.pending.items() if value)
+        draft = (state.generated_resolution_draft
+                 or (state.model_resolution_draft
+                     if state.model_resolution_draft == state.resolution_draft
+                     else state.resolution_draft))
         message = "Informational results only. No refund, return, replacement, or inventory action was executed."
         if ids:
             message = ("Proposal(s) recorded as PENDING_REVIEW require separate human review: "
                        + ", ".join(map(str, ids)) + ". No action was executed.")
         elif state.refund_outcome:
             message = state.refund_outcome + " No action was executed."
+        elif draft is not None:
+            # The deterministic draft is customer-safe by construction.  A
+            # model's wording reaches this point only after grounding checks.
+            # AI recommendations do not mutate the case or staff communication.
+            message = draft.customer_facing_response
         if error:
             message = "The review could not be completed. " + message
         return AgentResult(status="FAILED" if error else "HUMAN_REVIEW_REQUIRED" if ids else "INFORMATIONAL",
                            conversation_id=state.request.conversation_id if state.memory_started else None,
                            customer_response=message, steps_used=state.steps, history=history,
                            pending_proposal_ids=ids,
-                           resolution_draft=(state.model_resolution_draft
-                                             if state.model_resolution_draft == state.resolution_draft
-                                             else (state.generated_resolution_draft or state.resolution_draft)),
+                           resolution_draft=draft,
                            investigation_plan=(state.model_investigation_plan
                                                if state.model_investigation_plan == state.investigation_plan
                                                else state.investigation_plan),

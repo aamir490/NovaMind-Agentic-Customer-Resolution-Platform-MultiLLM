@@ -178,6 +178,12 @@ class LocalTools:
         except Exception:
             raise KnowledgeError("Knowledge retrieval is unavailable") from None
 
+    def case_order_skus(self, case_id: UUID) -> tuple[str, ...]:
+        """Return case-bound order SKUs for server-selected product retrieval."""
+        support_case = self._authorization.case(case_id)
+        order = self._cases.get_order(support_case.order_id)
+        return tuple(sorted({item.sku for item in order.items}))
+
     def describe(self) -> list[ToolDescription]:
         """Return fresh schema descriptions, without exposing service handles."""
         return [ToolDescription(

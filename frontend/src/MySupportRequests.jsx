@@ -11,6 +11,81 @@ const resolutionLabels = {
   ESCALATE: 'Escalated for specialist review',
 };
 
+function inlineNumberedBlocks(line) {
+  const matches = [...line.matchAll(/(^|[ \t]+)(\d{1,2})[.)][ \t]+/g)];
+  if (matches.length < 2 || Number(matches[0][2]) !== 1
+      || matches.some((match, index) => Number(match[2]) !== index + 1)) return null;
+  const items = matches.map((match, index) => ({
+    number: Number(match[2]),
+    text: line.slice(match.index + match[0].length,
+      index + 1 < matches.length ? matches[index + 1].index : line.length).trim(),
+  }));
+  if (items.some((item) => !item.text)) return null;
+  const prefix = line.slice(0, matches[0].index).trim();
+  return [...(prefix ? [{ type: 'paragraph', text: prefix }] : []),
+    { type: 'ordered', items }];
+}
+
+export function supportMessageBlocks(message) {
+  const blocks = [];
+  let paragraph = [];
+  let list = null;
+
+  function flushParagraph() {
+    if (paragraph.length) blocks.push({ type: 'paragraph', text: paragraph.join('\n') });
+    paragraph = [];
+  }
+  function flushList() {
+    if (list) blocks.push(list);
+    list = null;
+  }
+
+  for (const line of message.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')) {
+    if (!line.trim()) {
+      flushParagraph(); flushList();
+      continue;
+    }
+    const numbered = line.match(/^\s*(\d{1,3})[.)]\s+(.+)$/);
+    const bulleted = line.match(/^\s*[-*•]\s+(.+)$/);
+    if (numbered) {
+      flushParagraph();
+      if (list?.type !== 'ordered') { flushList(); list = { type: 'ordered', items: [] }; }
+      list.items.push({ number: Number(numbered[1]), text: numbered[2] });
+      continue;
+    }
+    if (bulleted) {
+      flushParagraph();
+      if (list?.type !== 'unordered') { flushList(); list = { type: 'unordered', items: [] }; }
+      list.items.push({ text: bulleted[1] });
+      continue;
+    }
+    flushList();
+    const inline = inlineNumberedBlocks(line);
+    if (inline) {
+      flushParagraph();
+      blocks.push(...inline);
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flushParagraph(); flushList();
+  return blocks;
+}
+
+export function SupportMessage({ message }) {
+  return <div className="support-update-content">
+    {supportMessageBlocks(message).map((block, index) => {
+      if (block.type === 'ordered') return <ol key={index}>
+        {block.items.map((item, itemIndex) => <li key={itemIndex} value={item.number}>{item.text}</li>)}
+      </ol>;
+      if (block.type === 'unordered') return <ul key={index}>
+        {block.items.map((item, itemIndex) => <li key={itemIndex}>{item.text}</li>)}
+      </ul>;
+      return <p key={index}>{block.text}</p>;
+    })}
+  </div>;
+}
+
 // A new selection mounts a fresh read, clearing old data and cancelling its request.
 export default function MySupportRequests({ api }) {
   const [caseId, setCaseId] = useState(null);
@@ -29,10 +104,13 @@ function SupportRequestRead({ api, caseId, onSelect }) {
         let data;
         if (caseId) {
           const supportCase = await api.getMyCase(caseId, { signal: controller.signal });
-          const resolution = typeof api.getMyCaseResolution === 'function'
-            ? await api.getMyCaseResolution(caseId, { signal: controller.signal })
-            : null;
-          data = resolution ? { ...supportCase, resolution } : supportCase;
+          const [resolution, latestSupportUpdate] = await Promise.all([
+            typeof api.getMyCaseResolution === 'function'
+              ? api.getMyCaseResolution(caseId, { signal: controller.signal }) : null,
+            typeof api.latestCustomerGuidance === 'function'
+              ? api.latestCustomerGuidance(caseId, { signal: controller.signal }) : null,
+          ]);
+          data = { ...supportCase, resolution, latestSupportUpdate };
         } else {
           data = await api.listMyCases({ signal: controller.signal });
         }
@@ -80,6 +158,14 @@ function SupportRequestRead({ api, caseId, onSelect }) {
             <div><dt>Created</dt><dd>{date(state.data.created_at)}</dd></div>
             <div><dt>Updated</dt><dd>{date(state.data.updated_at)}</dd></div>
           </dl>
+          {state.data.latestSupportUpdate && <section className="customer-resolution"
+            aria-labelledby="customer-support-update-heading">
+            <h3 id="customer-support-update-heading">Latest Support Update</h3>
+            <dl className="case-facts">
+              <div><dt>Message</dt><dd><SupportMessage message={state.data.latestSupportUpdate.message} /></dd></div>
+              <div><dt>Sent</dt><dd>{date(state.data.latestSupportUpdate.sentAt)}</dd></div>
+            </dl>
+          </section>}
           {state.data.resolution?.latest && <section className="customer-resolution" aria-labelledby="customer-resolution-heading">
             <h3 id="customer-resolution-heading">Latest case decision</h3>
             <dl className="case-facts">

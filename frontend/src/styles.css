@@ -3117,6 +3117,11 @@ code { color: var(--accent); font-size: 0.9em; overflow-wrap: anywhere; }
 .admin-resolution-history small { color: var(--text-muted); overflow-wrap: anywhere; }
 .customer-resolution { margin-top: var(--space-5); padding-top: var(--space-5); border-top: 1px solid var(--border); }
 .customer-resolution h3 { margin: 0 0 var(--space-4); font-size: 16px; }
+.support-update-content { display: grid; gap: var(--space-3); line-height: 1.7; overflow-wrap: anywhere; }
+.support-update-content p { margin: 0; white-space: pre-wrap; }
+.support-update-content ol,
+.support-update-content ul { display: grid; gap: var(--space-2); margin: 0; padding-left: var(--space-5); }
+.support-update-content li { padding-left: var(--space-1); }
 
 /* Loading notice */
 .customer-notice {
@@ -3494,6 +3499,40 @@ code { color: var(--accent); font-size: 0.9em; overflow-wrap: anywhere; }
 .db-system-pill--error { border-color: var(--color-error-border);   background: var(--color-error-surface);   color: var(--color-error); }
 .db-system-pill--muted { color: var(--text-muted); }
 
+.db-investigation-control {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+}
+.db-investigation-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.db-investigation-mode p { margin: 0; }
+.db-investigation-mode strong { font-size: 20px; color: var(--text-primary); }
+.db-mode-switch { display: inline-flex; align-items: center; gap: 10px; font-weight: 650; }
+.db-mode-switch input { width: 42px; height: 22px; accent-color: var(--accent); }
+.db-investigation-counts { display: flex; flex-wrap: wrap; gap: 8px; }
+.db-investigation-counts span {
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.db-investigation-counts strong { color: var(--text-primary); }
+
+.admin-investigation { display: grid; gap: 12px; }
+.case-investigation--completed { color: var(--color-success); }
+.case-investigation--failed,
+.case-investigation--recovery_required { color: var(--color-error); }
+.case-investigation--review_required { color: var(--color-warning); }
+
 /* ── Ops metrics grid ────────────────────────────────────────────────── */
 .db-metrics-grid {
   display: grid;
@@ -3719,6 +3758,7 @@ code { color: var(--accent); font-size: 0.9em; overflow-wrap: anywhere; }
   .db-metrics-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); }
 }
 @media (max-width: 767px) {
+  .db-investigation-mode { align-items: flex-start; flex-direction: column; }
   .db-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .db-stat-value { font-size: 22px; }
   .db-metric-big { font-size: 22px; }

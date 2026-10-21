@@ -83,7 +83,7 @@ test('customer reads support cancellation and session disposal', async () => {
 // Retained hooks and effect cleanup, following the existing intake-navigation
 // harness. Exercises real JSX and callbacks without adding a DOM dependency.
 // It does not model browser events or React concurrent scheduling.
-let server, hooks, CustomerPortal, MySupportRequests, App;
+let server, hooks, CustomerPortal, MySupportRequests, SupportMessage, App;
 before(async () => {
   const { createServer } = await import(pathToFileURL(require.resolve('vite')).href);
   const { default: react } = await import(pathToFileURL(require.resolve('@vitejs/plugin-react')).href);
@@ -131,8 +131,41 @@ before(async () => {
     }, react()] });
   hooks = await server.ssrLoadModule('virtual:support-hooks');
   ({ default: CustomerPortal } = await server.ssrLoadModule('/src/CustomerPortal.jsx'));
-  ({ default: MySupportRequests } = await server.ssrLoadModule('/src/MySupportRequests.jsx'));
+  ({ default: MySupportRequests, SupportMessage } = await server.ssrLoadModule('/src/MySupportRequests.jsx'));
   ({ App } = await server.ssrLoadModule('/src/main.jsx'));
+});
+
+test('support updates render single-line numbered guidance as safe ordered content', () => {
+  const message = 'Try these steps: 1. Disconnect the controller. 2. Try another USB port. 3. Report the indicator state.';
+  const html = renderToStaticMarkup(SupportMessage({ message }));
+  assert.match(html, /<p>Try these steps:<\/p>/);
+  assert.match(html, /<ol>/);
+  for (const item of ['Disconnect the controller.', 'Try another USB port.', 'Report the indicator state.']) {
+    assert.ok(html.includes(item));
+  }
+  assert.ok(html.indexOf('Disconnect the controller.') < html.indexOf('Try another USB port.'));
+  assert.ok(html.indexOf('Try another USB port.') < html.indexOf('Report the indicator state.'));
+  assert.doesNotMatch(html, /dangerouslySetInnerHTML/);
+});
+
+test('support updates render multiline paragraphs and lists while escaping markup', () => {
+  const message = `Start with these checks.
+
+1. Restart the controller.
+2) Test a known-good cable.
+
+- Keep the controller connected.
+• Note the indicator color.
+
+Reply with <script>alert("unsafe")</script> only as literal text.`;
+  const html = renderToStaticMarkup(SupportMessage({ message }));
+  assert.match(html, /<ol>/);
+  assert.match(html, /<ul>/);
+  assert.equal((html.match(/<li/g) ?? []).length, 4);
+  for (const text of ['Start with these checks.', 'Restart the controller.', 'Test a known-good cable.',
+    'Keep the controller connected.', 'Note the indicator color.', 'Reply with']) assert.ok(html.includes(text));
+  assert.match(html, /&lt;script&gt;alert\(&quot;unsafe&quot;\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
 });
 after(async () => { await server?.close(); });
 
@@ -169,6 +202,10 @@ test('list loading, subject/status/date, detail fetch, all detail fields, and Ba
         action: 'REQUEST_MORE_EVIDENCE',
         customer_message: 'Please upload a clear photo of the damaged item.', decided_at: '2026-10-06T12:00:00Z',
       } }
+      : url.endsWith('/customer-communications/latest') ? {
+        message: 'Try another USB port and let us know whether the controller still disconnects.',
+        sent_at: '2026-10-07T12:00:00Z',
+      }
       : supportCase({ status: 'in_review' }) };
   });
   const page = view(api);
@@ -190,6 +227,9 @@ test('list loading, subject/status/date, detail fetch, all detail fields, and Ba
   for (const value of [id(1), id(2), 'Wrong item', 'Please help with my order.', 'in_review',
     '2026-10-04T10:00:00Z', '2026-10-05T12:00:00Z']) assert.ok(detail.includes(value));
   assert.match(detail, /Latest case decision/);
+  assert.match(detail, /Latest Support Update/);
+  assert.match(detail, /Try another USB port and let us know whether the controller still disconnects/);
+  assert.match(detail, /dateTime="2026-10-07T12:00:00Z"/i);
   assert.match(detail, /More evidence requested/);
   assert.match(detail, /Please upload a clear photo of the damaged item/);
   assert.doesNotMatch(detail, /We need a clear photo of the damage/);
@@ -200,7 +240,8 @@ test('list loading, subject/status/date, detail fetch, all detail fields, and Ba
   await tick();
   assert.match(renderToStaticMarkup(page.render()), /View details/);
   assert.deepEqual(calls, [['/api/cases', 'GET'], [`/api/cases/${id(1)}`, 'GET'],
-    [`/api/cases/${id(1)}/resolution`, 'GET'], ['/api/cases', 'GET']]);
+    [`/api/cases/${id(1)}/resolution`, 'GET'],
+    [`/api/cases/${id(1)}/customer-communications/latest`, 'GET'], ['/api/cases', 'GET']]);
   page.unmount();
 });
 

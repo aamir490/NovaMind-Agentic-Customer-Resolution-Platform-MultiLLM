@@ -41,7 +41,18 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_curated_corpus_loads_in_stable_order(self):
         documents = load_documents(DEFAULT_CORPUS)
-        self.assertEqual(len(documents), 7)
+        self.assertEqual([document.source.document_id for document in documents], [
+            "delivery-fulfillment-policy",
+            "issue-evidence-guidance",
+            "novacontrol-inp-1-guide",
+            "novavault-sto-5-guide",
+            "proposal-review-sop",
+            "return-policy-guidance",
+            "returns-refunds-policy",
+            "warranty-troubleshooting-guidance",
+            "wrong-item-intake",
+        ])
+        self.assertEqual(len(documents), 9)
         self.assertEqual(documents, load_documents(DEFAULT_CORPUS))
         self.assertEqual([d.source.document_id for d in documents], sorted(d.source.document_id for d in documents))
         self.assertTrue(all(d.source.authority == "reference_only" for d in documents))

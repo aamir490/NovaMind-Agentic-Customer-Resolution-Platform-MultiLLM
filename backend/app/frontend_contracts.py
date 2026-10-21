@@ -13,6 +13,8 @@ from .knowledge import RetrievalHit
 from .observability import MAX_SCHEMA_ERRORS, MAX_SCHEMA_LOCATION
 from .security import AuthenticatedIdentity
 from .resolution_drafts import ResolutionDraft
+from .domain import InvestigationJobStatus, InvestigationMode
+from .workflow_metadata import WorkflowMetadataStatus
 
 
 class IdentityResponse(Contract):
@@ -22,6 +24,65 @@ class IdentityResponse(Contract):
     instance_id: UUID
     provider: Literal["unavailable", "local_scripted", "bedrock"]
     memory_available: bool
+
+
+class InvestigationStatusCounts(Contract):
+    total: int = Field(strict=True, ge=0)
+    pending: int = Field(strict=True, ge=0)
+    running: int = Field(strict=True, ge=0)
+    review_required: int = Field(strict=True, ge=0)
+    completed: int = Field(strict=True, ge=0)
+    failed: int = Field(strict=True, ge=0)
+    recovery_required: int = Field(strict=True, ge=0)
+
+
+class InvestigationControlUpdate(Contract):
+    mode: InvestigationMode
+    expected_version: int = Field(strict=True, ge=1)
+
+
+class InvestigationControlSnapshot(Contract):
+    configured_mode: InvestigationMode
+    effective_mode: InvestigationMode
+    automatic_capability_available: bool
+    version: int = Field(strict=True, ge=1)
+    updated_by: UUID | None = None
+    updated_at: datetime
+    counts: InvestigationStatusCounts
+
+
+class InvestigationModeAuditItem(Contract):
+    sequence: int = Field(strict=True, ge=1)
+    previous_mode: InvestigationMode | None = None
+    mode: InvestigationMode
+    version: int = Field(strict=True, ge=1)
+    admin_user_id: UUID | None = None
+    changed_at: datetime
+
+
+class InvestigationModeAuditPage(Contract):
+    items: tuple[InvestigationModeAuditItem, ...] = Field(max_length=100)
+    next_after: int = Field(strict=True, ge=0)
+    has_more: bool
+
+
+class CaseInvestigationSnapshot(Contract):
+    case_id: UUID
+    job_id: UUID | None = None
+    state: Literal[
+        "NOT_AVAILABLE", "PENDING", "RUNNING", "REVIEW_REQUIRED", "COMPLETED",
+        "FAILED", "RECOVERY_REQUIRED",
+    ]
+    job_status: InvestigationJobStatus | None = None
+    workflow_id: UUID | None = None
+    workflow_status: WorkflowMetadataStatus | None = None
+    provider: Literal["local_scripted", "bedrock"] | None = None
+    submission_mode: InvestigationMode | None = None
+    mode_version: int | None = Field(default=None, strict=True, ge=1)
+    submitted_at: datetime | None = None
+    execution_started: bool
+    can_start: bool
+    actions_executed: Literal[False] = False
 
 
 class RunStart(AgentRequest):

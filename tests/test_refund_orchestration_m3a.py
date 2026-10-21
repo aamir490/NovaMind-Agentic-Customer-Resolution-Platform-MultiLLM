@@ -1,6 +1,7 @@
 """Focused M3A/M3B coverage for deterministic LangGraph refund routing."""
 
 from datetime import datetime, timedelta, timezone
+import json
 from uuid import UUID, uuid4
 
 import test_agent as baseline
@@ -9,9 +10,10 @@ from pydantic import ValidationError
 from backend.app.agent import AgentRequest
 from backend.app.graph_agent import GraphResolutionAgent
 from backend.app.hitl import HITLWorkflow
-from backend.app.llm import ProviderFailure, StructuredLLM
+from backend.app.llm import LLMResponse, ProviderFailure, StructuredLLM
 from backend.app.operations import AuthoritativeDeliveryFact
 from backend.app.proposals import ProposalStatus
+from backend.app.resolution_drafts import RefundRecommendationOutcome
 from backend.app.schemas import CaseCreate, CustomerCreate, OrderCreate
 from backend.app.security import (AuthenticatedIdentity, LocalAuthenticationProvider,
                                   LocalCredential, SecurityError, authenticated)
@@ -251,4 +253,84 @@ class RefundOrchestrationTests(baseline.AgentTests):
         self.assertIn("selected SKU is not in the case-bound order", result.customer_response)
         self.assertEqual(self.proposals.list_for_case(self.case.id), [])
         self.assertEqual(provider.requests, [])
+
+    def test_refund_recommendation_is_python_owned_and_bound_to_trusted_evidence(self):
+        self.ingest_delivery_fact()
+        result = HITLWorkflow(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                              self.tools, self.proposals).start(self.refund_request())
+
+        recommendation = result.resolution_draft.refund_recommendation
+        self.assertEqual(recommendation.outcome, RefundRecommendationOutcome.ELIGIBLE)
+        self.assertEqual(recommendation.sku, "LAP-1")
+        self.assertFalse(recommendation.authorization_granted)
+        self.assertFalse(recommendation.actions_executed)
+        self.assertIn("eligibility_evidence_id:", " ".join(recommendation.verified_evidence))
+        self.assertEqual(result.review.action, "refund")
+
+    def test_missing_trusted_evidence_is_never_eligible(self):
+        result = HITLWorkflow(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                              self.tools, self.proposals).start(self.refund_request())
+
+        recommendation = result.resolution_draft.refund_recommendation
+        self.assertEqual(recommendation.outcome, RefundRecommendationOutcome.NEED_MORE_EVIDENCE)
+        self.assertTrue(recommendation.missing_evidence)
+        self.assertEqual(result.review.action, "refund_investigation")
+
+    def test_policy_denial_is_not_eligible_and_preserves_non_execution_boundary(self):
+        self.ingest_delivery_fact(delivered_days_ago=31)
+        result = HITLWorkflow(StructuredLLM(baseline.ScriptedProvider([baseline.FINAL])),
+                              self.tools, self.proposals).start(self.refund_request())
+
+        recommendation = result.resolution_draft.refund_recommendation
+        self.assertEqual(recommendation.outcome, RefundRecommendationOutcome.NOT_ELIGIBLE)
+        self.assertIn("outside_return_window", recommendation.decision_reason)
+        self.assertFalse(result.actions_executed)
+        self.assertEqual(result.review.action, "refund_investigation")
+
+    def test_bedrock_wording_cannot_change_the_python_refund_recommendation(self):
+        self.ingest_delivery_fact()
+
+        class GroundedProvider:
+            def generate(self, request, *, response_schema):
+                context = json.loads(request.messages[-1].content)
+                draft = context["grounded_resolution_draft"]
+                recommendation = draft["refund_recommendation"]
+                return LLMResponse(text=json.dumps({"decision": {"kind": "final"}, "grounded_response": {
+                    "issue_type": draft["issue_type"], "recommended_decision": draft["recommended_decision"],
+                    "verified_facts": draft["verified_facts"], "missing_evidence": draft["missing_evidence"],
+                    "policy_passages": context["grounded_policy_evidence"]["policy_passages"],
+                    "refund_outcome": recommendation["outcome"], "refund_sku": recommendation["sku"],
+                    "decision_reason": "Trusted evidence supports this staff-only recommendation. No refund, replacement, return, or payment action has been executed.",
+                    "customer_facing_response": "Our staff will review the verified evidence. No refund, replacement, return, or payment action has been executed.",
+                }}), finish_reason="stop")
+
+        result = HITLWorkflow(StructuredLLM(GroundedProvider()), self.tools, self.proposals,
+                              provider_label="bedrock").start(self.refund_request())
+        recommendation = result.resolution_draft.refund_recommendation
+        self.assertEqual(recommendation.outcome, RefundRecommendationOutcome.ELIGIBLE)
+        self.assertEqual(recommendation.sku, "LAP-1")
+        self.assertEqual(result.resolution_draft.response_source, "BEDROCK_VALIDATED")
+        self.assertEqual(result.review.action, "refund")
+
+    def test_bedrock_cannot_downgrade_or_upgrade_the_python_refund_outcome(self):
+        self.ingest_delivery_fact()
+
+        class AlteringProvider:
+            def generate(self, request, *, response_schema):
+                context = json.loads(request.messages[-1].content)
+                draft = context["grounded_resolution_draft"]
+                return LLMResponse(text=json.dumps({"decision": {"kind": "final"}, "grounded_response": {
+                    "issue_type": draft["issue_type"], "recommended_decision": draft["recommended_decision"],
+                    "verified_facts": draft["verified_facts"], "missing_evidence": draft["missing_evidence"],
+                    "policy_passages": context["grounded_policy_evidence"]["policy_passages"],
+                    "refund_outcome": "NOT_ELIGIBLE", "refund_sku": "LAP-1",
+                    "decision_reason": "Refund denied. No refund, replacement, return, or payment action has been executed.",
+                    "customer_facing_response": "No action has been taken. No refund, replacement, return, or payment action has been executed.",
+                }}), finish_reason="stop")
+
+        result = HITLWorkflow(StructuredLLM(AlteringProvider()), self.tools, self.proposals,
+                              provider_label="bedrock").start(self.refund_request())
+        self.assertEqual(result.resolution_draft.refund_recommendation.outcome,
+                         RefundRecommendationOutcome.ELIGIBLE)
+        self.assertEqual(result.resolution_draft.response_source, "DETERMINISTIC_FALLBACK")
 

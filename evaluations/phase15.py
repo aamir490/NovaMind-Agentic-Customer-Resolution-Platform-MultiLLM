@@ -172,7 +172,9 @@ class Fixture:
 
 
 def response_checks(result, records, failed):
-    expected = "Informational results only. No refund, return, replacement, or inventory action was executed."
+    expected = (result.resolution_draft.customer_facing_response
+                if result.resolution_draft is not None else
+                "Informational results only. No refund, return, replacement, or inventory action was executed.")
     if records:
         expected = ("Proposal(s) recorded as PENDING_REVIEW require separate human review: "
                     + ", ".join(str(p.id) for p in records) + ". No action was executed.")

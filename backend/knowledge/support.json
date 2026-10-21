@@ -61,5 +61,23 @@
       "source_uri": "local-knowledge://warranty-troubleshooting-guidance"
     },
     "text": "Local reference guidance for damaged and malfunctioning items. Record the affected item, reported symptom or condition, and case-specific supporting evidence. Warranty or troubleshooting language is not proof that the item qualifies for a remedy. A trusted delivery record does not by itself verify damage or malfunction. Missing condition, warranty, or supporting evidence requires REQUEST_EVIDENCE or ESCALATE for a staff decision. No replacement, refund, or repair is executed by this guidance."
+  },
+  {
+    "source": {
+      "document_id": "novacontrol-inp-1-guide",
+      "title": "NovaControl Input 1 approved troubleshooting",
+      "version": "support-v1",
+      "source_uri": "local-knowledge://novacontrol-inp-1-guide"
+    },
+    "text": "Approved product guidance for SKU INP-1, NovaControl Input 1. Use these steps only for a reported connection or response symptom; they do not diagnose a fault or authorize a remedy.\n1. Disconnect the NovaControl Input 1 from the current port.\n2. Connect the NovaControl Input 1 directly to a different compatible port.\n3. Restart the host device and report whether the symptom continues.\nRecord the reported result and any visible error indicator for support review. No replacement, refund, repair, or payment action is executed by these steps."
+  },
+  {
+    "source": {
+      "document_id": "novavault-sto-5-guide",
+      "title": "NovaVault Storage 5 approved troubleshooting",
+      "version": "support-v1",
+      "source_uri": "local-knowledge://novavault-sto-5-guide"
+    },
+    "text": "Approved product guidance for SKU STO-5, NovaVault Storage 5. Use these steps only for a reported detection or connection symptom; they do not diagnose a fault or authorize a remedy.\n1. Disconnect the NovaVault Storage 5 from the current port.\n2. Connect the NovaVault Storage 5 directly to a different compatible port.\n3. Restart the host device and report whether the storage device is detected.\nRecord the reported result and any visible error indicator for support review. No replacement, refund, repair, or payment action is executed by these steps."
   }
 ]

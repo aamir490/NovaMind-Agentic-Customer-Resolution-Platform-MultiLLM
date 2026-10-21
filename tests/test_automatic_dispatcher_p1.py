@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
-from backend.app.domain import Customer, InvestigationJobStatus
+from backend.app.domain import Customer, InvestigationJobStatus, InvestigationMode
 from backend.app.llm import FakeLLMProvider, LLMResponse, ProviderFailure
 from backend.app.main import create_app
 from backend.app.persistence import SQLitePersistence, SQLiteWorkflowMetadataRepository
@@ -20,6 +20,7 @@ from backend.app.security import AuthenticatedIdentity, LocalAuthenticationProvi
 CUSTOMER_ID = UUID("00000000-0000-4000-8000-0000000000c3")
 CUSTOMER_USER_ID = UUID("00000000-0000-4000-8000-0000000000c4")
 DISPATCHER_ID = UUID("00000000-0000-4000-8000-0000000000c5")
+ADMIN_ID = UUID("00000000-0000-4000-8000-0000000000c6")
 CUSTOMER_TOKEN = "p1-c3-customer-token"
 
 
@@ -34,7 +35,7 @@ class AutomaticDispatcherTests(unittest.TestCase):
         ))
         self.providers = []
 
-    def app(self, *, enabled=False, failure=False, review=False):
+    def app(self, *, enabled=False, failure=False, review=False, sku="LAP-1", name="Laptop"):
         def factory():
             if review:
                 provider = _ReviewProvider()
@@ -60,20 +61,24 @@ class AutomaticDispatcherTests(unittest.TestCase):
             startup_customers=(Customer(id=CUSTOMER_ID, name="Dispatcher customer"),),
             local_provider_factory=factory, **kwargs,
         )
+        if enabled:
+            app.state.investigation_control.set_mode(
+                InvestigationMode.AUTO, expected_version=1,
+                admin_user_id=ADMIN_ID, idempotency_key=uuid4(),
+            )
         order = app.state.case_service.create_order(OrderCreate(
             customer_id=CUSTOMER_ID,
-            items=[{"sku": "LAP-1", "name": "Laptop", "quantity": 1}],
+            items=[{"sku": sku, "name": name, "quantity": 1}],
         ))
         return app, order
 
     @staticmethod
-    def submit(client, order_id, key):
+    def submit(client, order_id, key, *, subject="Damaged item", description="The item arrived damaged."):
         return client.post(
             "/api/my/cases",
             headers={"Authorization": f"Bearer {CUSTOMER_TOKEN}", "Idempotency-Key": str(key)},
             json={
-                "order_id": str(order_id), "subject": "Damaged item",
-                "description": "The item arrived damaged.",
+                "order_id": str(order_id), "subject": subject, "description": description,
             },
         )
 
@@ -98,6 +103,7 @@ class AutomaticDispatcherTests(unittest.TestCase):
         self.assertEqual(first.json()["id"], repeated.json()["id"])
         job = self.wait_for_attempt(app, UUID(first.json()["id"]))
         self.assertEqual(job.claimed_by, DISPATCHER_ID)
+        self.assertEqual(job.submission_mode, InvestigationMode.AUTO)
         self.assertIsNotNone(job.execution_attempt_id)
         self.assertEqual(len(self.providers), 1)
         metadata = SQLiteWorkflowMetadataRepository(SQLitePersistence(self.path)).get(job.id)
@@ -111,6 +117,27 @@ class AutomaticDispatcherTests(unittest.TestCase):
         job = self.wait_for_attempt(app, UUID(response.json()["id"]))
         self.assertEqual(job.status, InvestigationJobStatus.RECOVERY_REQUIRED)
         self.assertIsNotNone(job.execution_attempt_id)
+        self.assertEqual(len(self.providers), 1)
+
+    def test_technical_case_completes_without_creating_a_fulfillment_proposal(self):
+        app, order = self.app(enabled=True, sku="INP-1", name="NovaControl Input 1")
+        with TestClient(app) as client:
+            response = self.submit(
+                client, order.id, uuid4(), subject="NovaControl Input 1 stops responding",
+                description="The input device has an intermittent connection during normal use.",
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        case_id = UUID(response.json()["id"])
+        job = self.wait_for_attempt(app, case_id)
+        self.assertEqual(job.claimed_by, DISPATCHER_ID)
+        metadata = SQLiteWorkflowMetadataRepository(SQLitePersistence(self.path)).get(job.id)
+        for _ in range(100):
+            if metadata.status.value == "COMPLETED":
+                break
+            time.sleep(0.01)
+            metadata = SQLiteWorkflowMetadataRepository(SQLitePersistence(self.path)).get(job.id)
+        self.assertEqual(metadata.status.value, "COMPLETED")
+        self.assertEqual(app.state.proposal_service.list_for_case(case_id), [])
         self.assertEqual(len(self.providers), 1)
 
     def test_proposal_path_pauses_for_staff_review(self):

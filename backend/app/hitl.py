@@ -93,6 +93,10 @@ class ResumeRejected(Contract):
     error: Literal["INVALID_INPUT", "UNKNOWN_WORKFLOW", "NOT_PAUSED", "REVIEW_MISMATCH", "ALREADY_REVIEWED"]
 
 
+class _ReviewAlreadyRecorded(Exception):
+    """A concurrent durable review won before this graph could checkpoint."""
+
+
 class HITLWorkflow:
     def __init__(self, llm: StructuredLLM, tools: LocalTools, proposals: ProposalService,
                  config: AgentConfig | None = None, *, memory: ConversationService | None = None,
@@ -103,7 +107,10 @@ class HITLWorkflow:
         if (checkpointer is None) != (workflow_metadata is None):
             raise ValueError("Durable checkpoints require durable workflow metadata")
         self._config = config or AgentConfig()
-        self._baseline = GraphResolutionAgent(llm, tools, self._config, memory=memory)
+        self._baseline = GraphResolutionAgent(
+            llm, tools, self._config, memory=memory,
+            enable_refund_wording=provider_label == "bedrock",
+        )
         self._memory = memory
         self._on_transition = on_transition
         self._proposals = proposals
@@ -288,8 +295,13 @@ class HITLWorkflow:
             reviewed = self._proposals.review(proposal.id, status, HumanReview(
                 reviewer_name=str(identity.user_id), note=decision.note or "No note supplied.",
             ), workflow_id=decision.workflow_id, review_id=decision.review_id)
-        except (NotFoundError, ConflictError):
+        except NotFoundError:
             return self._failure(state, "REVIEW_CONFLICT")
+        except ConflictError:
+            # The proposal repository has already committed another review.
+            # Raising prevents this losing graph from writing a stale failure
+            # checkpoint that could race the durable winner's REVIEWED state.
+            raise _ReviewAlreadyRecorded() from None
         return self._update(state, reviewed_status=reviewed.status, audit=(*state.audit,
             self._event(state, "HUMAN_REVIEW", proposal_id=reviewed.id,
                         human_decision=decision, reviewer_user_id=identity.user_id, proposal_status=reviewed.status)))
@@ -298,19 +310,41 @@ class HITLWorkflow:
         return {"configurable": {"thread_id": str(workflow_id)},
                 "recursion_limit": 3 * self._config.max_steps + 8, "callbacks": []}
 
-    def _drive(self, workflow_id: UUID, value) -> WorkflowResult:
+    def _drive(self, workflow_id: UUID, value) -> WorkflowResult | ResumeRejected:
         config = self._runtime_config(workflow_id)
         with tracing_context(enabled=False):
             try:
                 self._graph.invoke(value, config=config)
+            except _ReviewAlreadyRecorded:
+                # ProposalService.review is the durable arbitration point. Do
+                # not checkpoint a loser-side error over the reviewer that
+                # atomically recorded the human decision.
+                # This recovered workflow is no longer paused.  Match the
+                # durable resume contract regardless of which writer won the
+                # metadata/proposal race.
+                return ResumeRejected(error="NOT_PAUSED")
             except Exception:
-                # Never retry a possibly committed review automatically.
-                self._runs[workflow_id] = "FAILED"
-                self._mark_recovery_or_failure(workflow_id)
+                # A concurrent reviewer can commit the human decision after
+                # this worker loaded the paused checkpoint.  Read that durable
+                # winner before attempting any recovery write; writing a
+                # failure state from the stale checkpoint would conflict with,
+                # or overwrite, the completed review.
                 snapshot = self._graph.get_state(config)
                 if snapshot.values:
                     state = HITLState.model_validate(snapshot.values)
-                    self._graph.update_state(config, self._failure(state, "WORKFLOW_ERROR"))
+                    if state.reviewed_status is not None:
+                        self._runs[workflow_id] = "REVIEWED"
+                        return ResumeRejected(error="NOT_PAUSED")
+                # Never retry a possibly committed review automatically.
+                self._runs[workflow_id] = "FAILED"
+                self._mark_recovery_or_failure(workflow_id)
+                if snapshot.values:
+                    try:
+                        self._graph.update_state(config, self._failure(state, "WORKFLOW_ERROR"))
+                    except Exception:
+                        # A concurrent durable writer remains authoritative;
+                        # do not replace its checkpoint with error recovery.
+                        pass
                 return WorkflowResult(workflow_id=workflow_id, status="FAILED", error="WORKFLOW_ERROR",
                     message="Workflow stopped. Inspect the proposal before retrying; no action was executed.")
             snapshot = self._graph.get_state(config)
@@ -330,9 +364,12 @@ class HITLWorkflow:
                 status="FAILED" if agent_result is None or agent_result.error else "COMPLETED",
                 agent_result=agent_result, error=agent_result.error if agent_result else "WORKFLOW_ERROR",
                 message=agent_result.customer_response if agent_result else "Workflow stopped. No action was executed.")
-        # The draft is built from verified application records before the LLM
-        # runs, so it remains available even while a proposal is paused for HITL.
-        result = result.model_copy(update={"resolution_draft": state.agent.resolution_draft})
+        # The checkpoint may contain validated Bedrock wording. Preserve that
+        # selected draft (including during a paused HITL review) instead of
+        # replacing it with the earlier deterministic seed draft.
+        result = result.model_copy(update={
+            "resolution_draft": GraphResolutionAgent.resolution_draft_for_state(state.agent),
+        })
         if state.agent.memory_started:
             result = result.model_copy(update={"conversation_id": state.agent.request.conversation_id})
             try:
@@ -417,7 +454,14 @@ class HITLWorkflow:
                     review_id=decision.review_id):
                 return ResumeRejected(error="REVIEW_MISMATCH")
             if proposal.status != ProposalStatus.PENDING_REVIEW:
-                return ResumeRejected(error="ALREADY_REVIEWED")
+                # Recovered durable workflows expose NOT_PAUSED after a
+                # competing reviewer commits, even if the proposal update is
+                # observed just before its metadata transition.
+                return ResumeRejected(
+                    error="NOT_PAUSED"
+                    if self._workflow_metadata is not None
+                    else "ALREADY_REVIEWED"
+                )
             if self._workflow_metadata is not None:
                 try:
                     self._transition_metadata(decision.workflow_id, WorkflowMetadataStatus.RESUMING)

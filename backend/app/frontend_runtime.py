@@ -9,7 +9,7 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 from .agent import AgentRequest
-from .graph_agent import GraphState
+from .graph_agent import GraphResolutionAgent, GraphState
 from .frontend_contracts import (
     AuditPage, AuditSummary, EventPage, PendingReviewPage, PendingReviewRun, RunEvent, RunPage, RunSnapshot,
 )
@@ -18,7 +18,7 @@ from .langgraph_checkpoints import SQLiteCheckpointSaver
 from .knowledge import RetrievalResult
 from .llm import ProviderFailure, StructuredLLM
 from .observability import ERRORS, TOOLS
-from .persistence import SQLiteWorkflowMetadataRepository
+from .persistence import SQLiteInvestigationJobRepository, SQLiteWorkflowMetadataRepository
 from .proposals import ProposalStatus, ResolutionProposal
 from .security import Authorization, Role, SecurityError, current_identity, require_roles
 from .service import NotFoundError
@@ -65,6 +65,7 @@ class FrontendRuntime:
                  agent_engine="langgraph", strands_model_factory=None,
                  checkpointer: SQLiteCheckpointSaver | None = None,
                  workflow_metadata: SQLiteWorkflowMetadataRepository | None = None,
+                 investigation_jobs: SQLiteInvestigationJobRepository | None = None,
                  max_runs=128, max_active=2, event_capacity=128):
         if not (1 <= max_runs <= 1024 and 1 <= max_active <= 8 and 1 <= event_capacity <= 1024):
             raise ValueError("Invalid local runtime bounds")
@@ -86,6 +87,7 @@ class FrontendRuntime:
         self.memory = memory
         self._checkpointer = checkpointer
         self._workflow_metadata = workflow_metadata
+        self._investigation_jobs = investigation_jobs
         self._cases, self._tools, self._proposals = cases, tools, proposals
         self._max_runs, self._max_active, self._event_capacity = max_runs, max_active, event_capacity
         self._runs, self._requests = {}, {}
@@ -163,7 +165,7 @@ class FrontendRuntime:
                 "conversation_id": restored.agent.request.conversation_id,
                 "review": review,
                 "reviewed_status": restored.reviewed_status,
-                "resolution_draft": restored.agent.resolution_draft,
+                "resolution_draft": GraphResolutionAgent.resolution_draft_for_state(restored.agent),
                 "error": safe_error(restored.error),
             })
             self._runs[metadata.run_id] = holder
@@ -218,7 +220,7 @@ class FrontendRuntime:
         with self._lock:
             run.snapshot = run.snapshot.model_copy(update={"workflow_id": state.workflow_id,
                 "conversation_id": state.agent.request.conversation_id, "review": state.review,
-                "resolution_draft": state.agent.resolution_draft})
+                "resolution_draft": GraphResolutionAgent.resolution_draft_for_state(state.agent)})
             self._publish(run, "NODE", phase, node=node)
             if node not in ("load_case", "execute_tool"):
                 return
@@ -249,6 +251,16 @@ class FrontendRuntime:
         identity = current_identity()
         Authorization(self._cases).case(body.case_id)
         self.check_instance(body.instance_id)
+        if self._investigation_jobs is not None:
+            try:
+                self._investigation_jobs.get_by_case(body.case_id)
+            except NotFoundError:
+                pass
+            else:
+                # Customer-intake cases must use the durable job claim path.
+                # A new request_id here must never create a second workflow or
+                # an additional billable provider call for the same case.
+                raise FrontendError(409, "CASE_INVESTIGATION_ALREADY_EXISTS")
         request = AgentRequest.model_validate(body.model_dump(exclude={"instance_id", "request_id"}))
         fingerprint = HITLWorkflow._fingerprint(request)
         key = (identity.user_id, body.request_id)
@@ -409,14 +421,18 @@ class FrontendRuntime:
                     }})
                     values = checkpoint.checkpoint.get("channel_values", {}) if checkpoint else {}
                     agent = GraphState.model_validate(values.get("agent"))
-                    if (agent.resolution_draft is not None
-                            and (newest is None or record.updated_at >= newest.updated_at)):
+                    draft = GraphResolutionAgent.admin_resolution_draft_for_state(agent)
+                    if (draft is not None and (newest is None
+                            or record.updated_at >= newest.updated_at
+                            # The append-only durable checkpoint is canonical
+                            # for a live snapshot of this same workflow.
+                            or newest.workflow_id == record.workflow_id)):
                         newest = RunSnapshot(
                             instance_id=self.instance_id, run_id=record.run_id,
                             case_id=case_id, workflow_id=record.workflow_id,
                             provider=record.provider, status=record.status.value,
                             created_at=record.created_at, updated_at=record.updated_at,
-                            resolution_draft=agent.resolution_draft,
+                            resolution_draft=draft,
                         )
                 except Exception:
                     # A malformed historical checkpoint must not result in a

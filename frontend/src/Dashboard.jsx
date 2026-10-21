@@ -174,6 +174,50 @@ function SystemStatus({ identity }) {
   );
 }
 
+export function InvestigationControlPanel({ control, isAdmin, phase, error, onChange }) {
+  if (!control) return <LoadingRow label="Loading AI investigation control…" />;
+  const auto = control.configuredMode === 'AUTO';
+  const effectiveAuto = control.effectiveMode === 'AUTO';
+  const counts = control.counts;
+  return (
+    <div className="db-investigation-control">
+      <div className="db-investigation-mode">
+        <div>
+          <p className="eyebrow">Current mode</p>
+          <strong>{auto ? 'AUTO' : 'MANUAL'}</strong>
+          <p className="case-caption">
+            {effectiveAuto
+              ? 'Only newly submitted customer cases are queued automatically.'
+              : auto
+                ? 'AUTO is configured but unavailable; no cases will be started automatically.'
+                : 'An ADMIN must start each pending investigation from Cases.'}
+          </p>
+        </div>
+        <label className="db-mode-switch">
+          <span>AUTO investigation</span>
+          <input type="checkbox" role="switch" checked={auto}
+            disabled={!isAdmin || phase === 'submitting'
+              || (!auto && !control.automaticCapabilityAvailable)}
+            onChange={(event) => onChange(event.target.checked ? 'AUTO' : 'MANUAL')} />
+        </label>
+      </div>
+      <div className="db-investigation-counts" aria-label="AI investigation status counts">
+        <span><strong>{counts.pending}</strong> pending</span>
+        <span><strong>{counts.running}</strong> running</span>
+        <span><strong>{counts.reviewRequired}</strong> human review</span>
+        <span><strong>{counts.completed}</strong> completed</span>
+        <span><strong>{counts.failed + counts.recoveryRequired}</strong> failed / recovery</span>
+      </div>
+      {!control.automaticCapabilityAvailable && (
+        <p className="case-caption">Automatic capability is disabled by server configuration.</p>
+      )}
+      {!isAdmin && <p className="case-caption">Only an ADMIN can change this setting.</p>}
+      {phase === 'submitting' && <p className="case-notice" role="status">Saving investigation mode…</p>}
+      {error && <p className="db-error" role="alert">{error}</p>}
+    </div>
+  );
+}
+
 // ─── Section: Agent / LLM operational metrics (diagnostics required) ──────────
 
 function MetricRow({ label, count, errors, extra }) {
@@ -446,8 +490,11 @@ export default function Dashboard({ api, identity, onNavigate }) {
   const [cases,    setCases]    = useState({ phase: 'loading', data: null, error: null });
   const [reviews,  setReviews]  = useState({ phase: 'loading', data: null, error: null });
   const [diag,     setDiag]     = useState({ phase: 'loading', data: null, error: null });
+  const [control,  setControl]  = useState({ phase: 'loading', data: null, error: null });
+  const [controlChange, setControlChange] = useState({ phase: 'idle', error: null });
   const [revision, setRevision] = useState(0);
   const abortRef = useRef(null);
+  const modeRequest = useRef(null);
 
   const canDiag = identity?.can_view_diagnostics === true;
 
@@ -461,6 +508,7 @@ export default function Dashboard({ api, identity, onNavigate }) {
 
     setCases(   { phase: 'loading', data: null, error: null });
     setReviews( { phase: 'loading', data: null, error: null });
+    setControl( { phase: 'loading', data: null, error: null });
     if (canDiag) setDiag({ phase: 'loading', data: null, error: null });
     else         setDiag({ phase: 'na',      data: null, error: null });
 
@@ -489,6 +537,18 @@ export default function Dashboard({ api, identity, onNavigate }) {
               : 'Review queue could not be loaded.' });
       });
 
+    api.investigationControl({ signal })
+      .then(data => {
+        if (!signal.aborted) setControl({ phase: 'ready', data, error: null });
+      })
+      .catch(err => {
+        if (!signal.aborted)
+          setControl({ phase: 'error', data: null,
+            error: [401, 403].includes(err.status)
+              ? 'Investigation control access denied.'
+              : 'Investigation control could not be loaded.' });
+      });
+
     if (canDiag) {
       api.diagnostics({ signal })
         .then(data => {
@@ -508,6 +568,28 @@ export default function Dashboard({ api, identity, onNavigate }) {
 
   function refresh() {
     setRevision(r => r + 1);
+  }
+
+  async function changeMode(mode) {
+    if (identity.role !== 'ADMIN' || control.phase !== 'ready'
+        || controlChange.phase === 'submitting') return;
+    setControlChange({ phase: 'submitting', error: null });
+    try {
+      if (!modeRequest.current || modeRequest.current.mode !== mode) {
+        const key = globalThis.crypto?.randomUUID?.();
+        if (!key) throw new Error('This browser cannot safely change investigation mode.');
+        modeRequest.current = { mode, key };
+      }
+      const updated = await api.updateInvestigationControl({ mode,
+        expectedVersion: control.data.version,
+        idempotencyKey: modeRequest.current.key });
+      modeRequest.current = null;
+      setControl({ phase: 'ready', data: updated, error: null });
+      setControlChange({ phase: 'idle', error: null });
+    } catch (cause) {
+      setControlChange({ phase: 'error',
+        error: cause.message || 'Investigation mode could not be changed.' });
+    }
   }
 
   if (!api || !identity) {
@@ -556,6 +638,17 @@ export default function Dashboard({ api, identity, onNavigate }) {
         <SectionHeader title="System status"
           note="Provider and memory state from current session" />
         <SystemStatus identity={identity} />
+      </section>
+
+      <section aria-labelledby="db-investigation-title">
+        <SectionHeader title="AI investigation control"
+          note="Persistent SQLite setting; changing mode never replays existing jobs" />
+        {control.phase === 'loading' && <LoadingRow label="Loading AI investigation control…" />}
+        {control.phase === 'error' && <ErrorRow message={control.error} />}
+        {control.phase === 'ready' && (
+          <InvestigationControlPanel control={control.data} isAdmin={identity.role === 'ADMIN'}
+            phase={controlChange.phase} error={controlChange.error} onChange={changeMode} />
+        )}
       </section>
 
       {/* Case tiles */}
@@ -634,7 +727,8 @@ export default function Dashboard({ api, identity, onNavigate }) {
 
       {/* Footer note */}
       <p className="db-footer-note">
-        Data is process-local and resets on server restart.
+        Investigation mode and workflow state are durable when SQLite is configured.
+        Operational metrics reset on server restart.
         Eligibility is not authorization. No business action is performed from this dashboard.
       </p>
     </div>

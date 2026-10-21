@@ -3,11 +3,15 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Request
 
-from .domain import CaseResolutionHistory, Customer, CustomerCaseResolution, CustomerResolutionDecision, Order, SupportCase
+from .domain import (
+    CaseResolutionHistory, Customer, CustomerCaseResolution, CustomerCommunication,
+    CustomerResolutionDecision, Order, SupportCase,
+)
 from .schemas import (
-    CaseResolutionCreate, CustomerCreate, InvestigationJobBind, OrderCreate,
+    CaseResolutionCreate, CustomerCommunicationCreate, CustomerCreate,
+    InvestigationJobBind, OrderCreate,
     CaseCreate, CaseStatusUpdate,
 )
 from .service import CaseService, ConflictError, NotFoundError
@@ -134,6 +138,46 @@ def create_resolution(case_id: UUID, body: CaseResolutionCreate, service: Servic
         evidence_reviewed=body.evidence_reviewed,
     )
     return _resolution_history(case_id, service)
+
+
+def _customer_communication(case_id: UUID, service: CaseService) -> CustomerCommunication | None:
+    communication = service.latest_customer_communication(case_id)
+    if communication is None:
+        return None
+    return CustomerCommunication(message=communication.message, sent_at=communication.sent_at)
+
+
+@router.post(
+    "/cases/{case_id}/customer-communications",
+    response_model=CustomerCommunication,
+    status_code=201,
+    tags=["cases"],
+)
+def send_customer_communication(
+    case_id: UUID, body: CustomerCommunicationCreate, service: Service,
+    idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+) -> CustomerCommunication:
+    """Persist explicit ADMIN-approved guidance; never mutate case state or execute an action."""
+    identity = require_roles(Role.ADMIN)
+    Authorization(service).case(case_id)
+    communication, _created = service.send_customer_communication(
+        case_id, message=body.message, admin_user_id=identity.user_id,
+        idempotency_key=idempotency_key,
+    )
+    return CustomerCommunication(message=communication.message, sent_at=communication.sent_at)
+
+
+@router.get(
+    "/cases/{case_id}/customer-communications/latest",
+    response_model=CustomerCommunication | None,
+    tags=["cases"],
+)
+def get_latest_customer_communication(
+    case_id: UUID, service: Service,
+) -> CustomerCommunication | None:
+    """Return only customer-safe text and time after enforcing case ownership."""
+    Authorization(service).case(case_id)
+    return _customer_communication(case_id, service)
 
 
 @router.patch("/cases/{case_id}/status", response_model=SupportCase, tags=["cases"])

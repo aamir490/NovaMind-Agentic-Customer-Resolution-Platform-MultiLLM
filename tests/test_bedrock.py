@@ -134,6 +134,10 @@ class BedrockTests(unittest.TestCase):
                 final = specs["submit_final_decision"]["inputSchema"]["json"]["properties"]["decision"]
                 self.assertEqual(final, {"type": "object", "properties": {
                     "kind": {"type": "string", "enum": ["final"]}}, "required": ["kind"]})
+                self.assertEqual(
+                    specs["submit_final_decision"]["inputSchema"]["json"]["properties"]["grounded_response"],
+                    {"type": "object"},
+                )
                 tool = specs["submit_tool_decision"]["inputSchema"]["json"]["properties"]["decision"]
                 self.assertEqual(tool, {"type": "object", "properties": {
                     "kind": {"type": "string", "enum": ["tool"]}, "name": {"type": "string"},
@@ -143,6 +147,30 @@ class BedrockTests(unittest.TestCase):
                 self.assertIn("formatting tools do not execute application actions",
                               body["system"][-1]["text"])
                 self.assertNotIn("outputConfig", body)
+
+    def test_nova_lite_final_tool_accepts_grounded_response_for_local_validation(self):
+        value = {"decision": {"kind": "final"}, "grounded_response": {
+            "issue_type": "malfunction", "recommended_decision": "REQUEST_EVIDENCE",
+            "verified_facts": ["case_id:case-1"], "missing_evidence": ["diagnostic evidence"],
+            "policy_passages": [{
+                "document_id": "warranty-policy", "chunk_id": "a" * 64,
+                "title": "Warranty guidance", "version": "v1",
+                "source_uri": "local-knowledge://warranty-policy", "passage": "Use safe diagnostics.",
+            }],
+            "decision_reason": "Verified records require diagnostic evidence before support review.",
+            "customer_facing_response": (
+                "Please share the requested diagnostic evidence. No refund, replacement, return, or payment "
+                "action has been executed."
+            ),
+        }}
+        self.client.converse.return_value = tool_completion(value)
+        provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)
+
+        result = StructuredLLM(provider).generate(self.request, AgentDecision)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data.grounded_response.customer_facing_response,
+                         value["grounded_response"]["customer_facing_response"])
 
     def test_nova_lite_rejects_text_fallback_and_ambiguous_tool_envelopes(self):
         provider = BedrockProvider(model_id="us.amazon.nova-lite-v1:0", client=self.client)

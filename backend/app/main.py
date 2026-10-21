@@ -34,7 +34,8 @@ from .langgraph_checkpoints import SQLiteCheckpointSaver
 from .dispatcher import AutomaticInvestigationDispatcher
 from .persistence import (
     SQLiteCaseRepository, SQLitePersistence, SQLiteProposalRepository,
-    SQLiteInvestigationJobRepository, SQLiteWorkflowMetadataRepository,
+    SQLiteInvestigationControlRepository, SQLiteInvestigationJobRepository,
+    SQLiteWorkflowMetadataRepository,
 )
 
 
@@ -75,9 +76,9 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
         try:
             yield
         finally:
-            dispatcher = app.state.investigation_dispatcher
-            if dispatcher is not None:
-                dispatcher.close()
+            executor = app.state.investigation_executor
+            if executor is not None:
+                executor.close()
             app.state.frontend_runtime.close()
 
     app = FastAPI(
@@ -98,6 +99,9 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     app.state.sqlite_persistence = persistence
     app.state.investigation_jobs = (
         SQLiteInvestigationJobRepository(persistence) if persistence is not None else None
+    )
+    app.state.investigation_control = (
+        SQLiteInvestigationControlRepository(persistence) if persistence is not None else None
     )
     app.state.case_service = CaseService(
         SQLiteCaseRepository(persistence) if persistence is not None else None
@@ -126,25 +130,37 @@ def create_app(*, auth_provider: AuthenticationProvider | None = None,
     app.state.auth_provider = auth_provider if auth_provider is not None else LocalAuthenticationProvider()
     app.state.observer = observer if observer is not None else LocalObserver()
     memory = ConversationService(conversation_store, app.state.case_service) if conversation_store is not None else None
+    workflow_checkpointer = (
+        SQLiteCheckpointSaver(persistence)
+        if persistence is not None and agent_engine == "langgraph" else None
+    )
+    workflow_metadata = (
+        SQLiteWorkflowMetadataRepository(persistence)
+        if persistence is not None and agent_engine == "langgraph" else None
+    )
+    app.state.workflow_metadata = workflow_metadata
     app.state.frontend_runtime = FrontendRuntime(app.state.case_service, app.state.local_tools,
         app.state.proposal_service, local_provider_factory=local_provider_factory,
         provider_label=provider_label, memory=memory,
         agent_engine=agent_engine, strands_model_factory=strands_model_factory,
-        checkpointer=(SQLiteCheckpointSaver(persistence)
-                      if persistence is not None and agent_engine == "langgraph" else None),
-        workflow_metadata=(SQLiteWorkflowMetadataRepository(persistence)
-                           if persistence is not None and agent_engine == "langgraph" else None))
+        checkpointer=workflow_checkpointer, workflow_metadata=workflow_metadata,
+        investigation_jobs=app.state.investigation_jobs)
+    app.state.investigation_executor = None
     app.state.investigation_dispatcher = None
-    if automatic_dispatcher:
-        # These dependencies are guaranteed above and are never read from an
-        # HTTP request or customer-owned record.
-        app.state.investigation_dispatcher = AutomaticInvestigationDispatcher(
-            app.state.investigation_jobs, worker_id=dispatcher_identity.user_id,
+    if (persistence is not None and agent_engine == "langgraph"
+            and local_provider_factory is not None):
+        # Manual and automatic starts share this one durable claim/bind/attempt
+        # path. Only the automatic capability receives a fixed server identity.
+        app.state.investigation_executor = AutomaticInvestigationDispatcher(
+            app.state.investigation_jobs,
+            worker_id=dispatcher_identity.user_id if automatic_dispatcher else None,
             provider_factory=local_provider_factory, provider_label=provider_label,
             tools=app.state.local_tools, proposals=app.state.proposal_service,
-            checkpointer=SQLiteCheckpointSaver(persistence),
-            workflow_metadata=SQLiteWorkflowMetadataRepository(persistence),
+            checkpointer=workflow_checkpointer,
+            workflow_metadata=workflow_metadata,
         )
+        if automatic_dispatcher:
+            app.state.investigation_dispatcher = app.state.investigation_executor
 
     @app.middleware("http")
     async def authentication(request: Request, call_next):
