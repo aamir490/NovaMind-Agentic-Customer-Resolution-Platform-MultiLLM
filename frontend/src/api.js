@@ -85,6 +85,7 @@ function adminResolutionDraft(payload) {
     && isTextList(payload.missing_evidence) && payload.missing_evidence.length >= 1 && payload.missing_evidence.length <= 6
     && isText(payload.decision_reason) && Array.from(payload.decision_reason).length <= 1200
     && isText(payload.customer_facing_response) && Array.from(payload.customer_facing_response).length <= 1200
+    && isTextList(payload.troubleshooting_steps) && payload.troubleshooting_steps.length <= 5
     && draftResponseSources.includes(payload.response_source)
     && Array.isArray(citations) && citations.length <= 5
     && citations.every((citation) => citation && isText(citation.document_id)
@@ -94,6 +95,7 @@ function adminResolutionDraft(payload) {
   return { issueType: payload.issue_type, recommendedDecision: payload.recommended_decision,
     verifiedFacts: payload.verified_facts, missingEvidence: payload.missing_evidence,
     decisionReason: payload.decision_reason, customerFacingResponse: payload.customer_facing_response,
+    troubleshootingSteps: payload.troubleshooting_steps,
     responseSource: payload.response_source, citations: citations.map((citation) => ({
       documentId: citation.document_id, chunkId: citation.chunk_id, title: citation.title,
       version: citation.version,

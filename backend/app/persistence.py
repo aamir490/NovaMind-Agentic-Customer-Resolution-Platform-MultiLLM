@@ -3085,7 +3085,10 @@ class SQLiteWorkflowMetadataRepository:
             rows = connection.execute(
                 f"""SELECT * FROM workflow_runs
                     WHERE {' AND '.join(clauses)}
-                    ORDER BY created_at, workflow_id
+                    -- UUIDs do not preserve reservation order when SQLite's
+                    -- timestamp precision produces a tie. rowid is the
+                    -- append-only insertion tie-breaker for stable paging.
+                    ORDER BY created_at, rowid
                     LIMIT ? OFFSET ?""",
                 parameters,
             ).fetchall()

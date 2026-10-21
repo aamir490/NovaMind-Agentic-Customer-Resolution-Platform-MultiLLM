@@ -38,6 +38,7 @@ class EvidenceGrounding(Record):
     policy_passages: tuple[PolicyPassage, ...] = Field(min_length=1, max_length=5)
     verified_customer_facts: tuple[str, ...] = Field(min_length=1, max_length=8)
     missing_evidence: tuple[str, ...] = Field(min_length=1, max_length=6)
+    product_skus: tuple[str, ...] = Field(default=(), max_length=8)
     policy_knowledge_authoritative: Literal[False] = False
     actions_executed: Literal[False] = False
 
@@ -52,6 +53,7 @@ class GroundedResponse(Record):
     policy_passages: tuple[PolicyPassage, ...] = Field(min_length=1, max_length=5)
     decision_reason: str = Field(min_length=1, max_length=1200)
     customer_facing_response: str = Field(min_length=1, max_length=1200)
+    troubleshooting_steps: tuple[str, ...] = Field(default=(), max_length=5)
     actions_executed: Literal[False] = False
 
 
@@ -66,12 +68,14 @@ _POLICY_QUERIES: dict[IssueType, str] = {
 }
 
 
-def policy_query_for(issue_type: IssueType) -> KnowledgeQuery:
+def policy_query_for(issue_type: IssueType, product_skus: tuple[str, ...] = ()) -> KnowledgeQuery:
     """Use a fixed server-side query; customer prose never controls retrieval."""
-    return KnowledgeQuery(query=_POLICY_QUERIES[IssueType(issue_type)], top_k=3)
+    skus = tuple(sorted({sku for sku in product_skus if isinstance(sku, str) and sku}))
+    return KnowledgeQuery(query=" ".join((_POLICY_QUERIES[IssueType(issue_type)], *skus)), top_k=3)
 
 
-def build_evidence_grounding(draft: ResolutionDraft, retrieval: RetrievalResult) -> EvidenceGrounding:
+def build_evidence_grounding(draft: ResolutionDraft, retrieval: RetrievalResult,
+                             *, product_skus: tuple[str, ...] = ()) -> EvidenceGrounding:
     """Create citations only by copying validated retriever hits.
 
     An empty result is not a policy conclusion.  The caller must fail closed
@@ -96,6 +100,7 @@ def build_evidence_grounding(draft: ResolutionDraft, retrieval: RetrievalResult)
         policy_passages=passages,
         verified_customer_facts=draft.verified_facts,
         missing_evidence=draft.missing_evidence,
+        product_skus=tuple(sorted(set(product_skus))),
     )
 
 
@@ -110,6 +115,21 @@ def attach_grounding_citations(draft: ResolutionDraft, grounding: EvidenceGround
         version=passage.version,
         source_uri=passage.source_uri,
     ) for passage in grounding.policy_passages)})
+
+
+def _approved_product_steps(grounding: EvidenceGrounding) -> tuple[str, ...]:
+    """Extract only numbered steps from passages that name the case-bound SKU."""
+    steps = []
+    for passage in grounding.policy_passages:
+        text = passage.passage
+        if not any(re.search(rf"\b{re.escape(sku)}\b", text, re.IGNORECASE)
+                   for sku in grounding.product_skus):
+            continue
+        for line in text.splitlines():
+            match = re.match(r"\s*\d+\.\s+(.+?)\s*$", line)
+            if match:
+                steps.append(match.group(1))
+    return tuple(dict.fromkeys(steps))
 
 
 def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding,
@@ -131,6 +151,17 @@ def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding
                 or candidate.missing_evidence != draft.missing_evidence
                 or candidate.policy_passages != grounding.policy_passages):
             return None
+        approved_steps = _approved_product_steps(grounding)
+        if candidate.troubleshooting_steps:
+            if not approved_steps or any(step not in approved_steps for step in candidate.troubleshooting_steps):
+                return None
+            numbered = tuple(f"{index}. {step}" for index, step in enumerate(candidate.troubleshooting_steps, 1))
+            if any(step not in candidate.customer_facing_response for step in numbered):
+                return None
+        elif draft.issue_type is IssueType.MALFUNCTION and approved_steps:
+            # Product-specific instructions exist, but the model did not bind
+            # its customer wording to them. Keep the deterministic fallback.
+            return None
         check_payload(candidate.model_dump(mode="json"))
         wording = (candidate.decision_reason + " " + candidate.customer_facing_response).casefold()
         if "no refund, replacement, return, or payment action has been executed" not in wording:
@@ -144,6 +175,7 @@ def apply_grounded_response(draft: ResolutionDraft, grounding: EvidenceGrounding
         return draft.model_copy(update={
             "decision_reason": candidate.decision_reason,
             "customer_facing_response": candidate.customer_facing_response,
+            "troubleshooting_steps": candidate.troubleshooting_steps,
             "response_source": ResponseSource.BEDROCK_VALIDATED,
             "citations": tuple(ResolutionCitation(
                 document_id=passage.document_id,

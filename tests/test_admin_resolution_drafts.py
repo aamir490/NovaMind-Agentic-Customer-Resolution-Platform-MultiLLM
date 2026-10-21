@@ -54,10 +54,10 @@ class AdminResolutionDraftTests(unittest.TestCase):
     def headers(token):
         return {"Authorization": f"Bearer {token}"}
 
-    def case(self, app, subject, description):
+    def case(self, app, subject, description, *, sku="LAP-1", name="Laptop"):
         order = app.state.case_service.create_order(OrderCreate(
             customer_id=CUSTOMER_ID,
-            items=[{"sku": "LAP-1", "name": "Laptop", "quantity": 1}],
+            items=[{"sku": sku, "name": name, "quantity": 1}],
         ))
         return app.state.case_service.create_case(CaseCreate(
             customer_id=CUSTOMER_ID, order_id=order.id, subject=subject, description=description,
@@ -170,6 +170,58 @@ class AdminResolutionDraftTests(unittest.TestCase):
             self.assertEqual(restored.json()["response_source"], "BEDROCK_VALIDATED")
             self.assertIn("Please send the requested evidence", restored.json()["customer_facing_response"])
             self.assertTrue(restored.json()["citations"])
+        self.assertEqual(len(self.provider_calls), calls_before_read)
+        restarted.state.frontend_runtime.close()
+
+    def test_product_steps_survive_the_durable_admin_draft_projection(self):
+        def product_final(request):
+            context = json.loads(request.messages[-1].content)
+            draft = context["grounded_resolution_draft"]
+            steps = (
+                "Disconnect the NovaControl Input 1 from the current port.",
+                "Connect the NovaControl Input 1 directly to a different compatible port.",
+                "Restart the host device and report whether the symptom continues.",
+            )
+            return {"decision": {"kind": "final"}, "grounded_response": {
+                "issue_type": draft["issue_type"], "recommended_decision": draft["recommended_decision"],
+                "verified_facts": draft["verified_facts"], "missing_evidence": draft["missing_evidence"],
+                "policy_passages": context["grounded_policy_evidence"]["policy_passages"],
+                "decision_reason": "Verified records require the listed diagnostic evidence for support review.",
+                "customer_facing_response": (
+                    "Please try these steps:\n1. " + steps[0] + "\n2. " + steps[1] + "\n3. " + steps[2]
+                    + "\nNo refund, replacement, return, or payment action has been executed."
+                ),
+                "troubleshooting_steps": steps,
+            }}
+
+        first = self.app(product_final)
+        support_case = self.case(first, "NovaControl Input 1 stops responding",
+                                 "The input device has an intermittent connection.",
+                                 sku="INP-1", name="NovaControl Input 1")
+        with TestClient(first) as client:
+            self.start(client, support_case, "Please investigate this technical issue.")
+            draft = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                               headers=self.headers(ADMIN_TOKEN))
+            self.assertEqual(draft.status_code, 200, draft.text)
+            self.assertEqual(draft.json()["response_source"], "BEDROCK_VALIDATED")
+            self.assertEqual(draft.json()["troubleshooting_steps"], [
+                "Disconnect the NovaControl Input 1 from the current port.",
+                "Connect the NovaControl Input 1 directly to a different compatible port.",
+                "Restart the host device and report whether the symptom continues.",
+            ])
+            self.assertIn("novacontrol-inp-1-guide", {
+                citation["document_id"] for citation in draft.json()["citations"]
+            })
+        first.state.frontend_runtime.close()
+
+        calls_before_read = len(self.provider_calls)
+        restarted = self.app()
+        with TestClient(restarted) as client:
+            restored = client.get(f"/api/cases/{support_case.id}/resolution-draft",
+                                  headers=self.headers(ADMIN_TOKEN))
+            self.assertEqual(restored.status_code, 200, restored.text)
+            self.assertEqual(restored.json()["troubleshooting_steps"][0],
+                             "Disconnect the NovaControl Input 1 from the current port.")
         self.assertEqual(len(self.provider_calls), calls_before_read)
         restarted.state.frontend_runtime.close()
 

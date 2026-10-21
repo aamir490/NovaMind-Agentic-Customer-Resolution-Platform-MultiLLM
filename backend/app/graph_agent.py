@@ -144,9 +144,12 @@ class GraphResolutionAgent:
             check_payload(state.request.model_dump(mode="json"))
             if resolution_draft is None:
                 raise ValueError("Resolution draft is unavailable")
+            product_skus = self._tools.case_order_skus(state.request.case_id)
             knowledge_grounding = build_evidence_grounding(
                 resolution_draft,
-                self._tools.retrieve_grounded_policy(policy_query_for(resolution_draft.issue_type)),
+                self._tools.retrieve_grounded_policy(
+                    policy_query_for(resolution_draft.issue_type, product_skus)),
+                product_skus=product_skus,
             )
         except SecurityError as failure:
             return self._update(state, "load_case", history=(event,), error=failure.code,

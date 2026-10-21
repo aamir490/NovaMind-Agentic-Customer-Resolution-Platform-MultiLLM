@@ -207,6 +207,9 @@ export function AdminCustomerGuidance({ api, supportCase, draft, latest, onCompl
       <Detail title="Decision reason">{draft.decisionReason}</Detail>
       <Detail title="Verified facts"><ul>{draft.verifiedFacts.map((fact) => <li key={fact}>{fact}</li>)}</ul></Detail>
       <Detail title="Missing evidence"><ul>{draft.missingEvidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></Detail>
+      {draft.troubleshootingSteps.length > 0 && <Detail title="Approved troubleshooting steps"><ol>{draft.troubleshootingSteps.map((step) => (
+        <li key={step}>{step}</li>
+      ))}</ol></Detail>}
       {draft.citations.length > 0 && <Detail title="Policy citations"><ul>{draft.citations.map((citation) => (
         <li key={citation.chunkId}>{citation.title} ({citation.documentId}, {citation.version})</li>
       ))}</ul></Detail>}

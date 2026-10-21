@@ -237,6 +237,86 @@ class ResolutionDraftTests(unittest.TestCase):
         self.assertEqual(self.app.state.proposal_service.list_for_case(support_case.id), [])
         self.assertFalse(result.actions_executed)
 
+    def test_product_specific_steps_require_the_case_bound_sku_and_exact_retrieved_text(self):
+        order = self.service.create_order(OrderCreate(
+            customer_id=self.customer.id,
+            items=[{"sku": "INP-1", "name": "NovaControl Input 1", "quantity": 1}],
+        ))
+        support_case = self.service.create_case(CaseCreate(
+            customer_id=self.customer.id, order_id=order.id,
+            subject="NovaControl Input 1 stops responding",
+            description="The input device has an intermittent connection.",
+        ))
+
+        class ProductGuidanceProvider:
+            def generate(self, request, *, response_schema):
+                prompt = json.loads(request.messages[-1].content)
+                draft = prompt["grounded_resolution_draft"]
+                steps = (
+                    "Disconnect the NovaControl Input 1 from the current port.",
+                    "Connect the NovaControl Input 1 directly to a different compatible port.",
+                    "Restart the host device and report whether the symptom continues.",
+                )
+                return LLMResponse(text=json.dumps({"decision": {"kind": "final"}, "grounded_response": {
+                    "issue_type": draft["issue_type"],
+                    "recommended_decision": draft["recommended_decision"],
+                    "verified_facts": draft["verified_facts"],
+                    "missing_evidence": draft["missing_evidence"],
+                    "policy_passages": prompt["grounded_policy_evidence"]["policy_passages"],
+                    "decision_reason": "The verified records require diagnostic evidence for support review.",
+                    "customer_facing_response": (
+                        "Please try these steps:\n1. " + steps[0] + "\n2. " + steps[1]
+                        + "\n3. " + steps[2]
+                        + "\nNo refund, replacement, return, or payment action has been executed."
+                    ),
+                    "troubleshooting_steps": steps,
+                }}), finish_reason="stop")
+
+        with authenticated(self.auth, self.token):
+            result = GraphResolutionAgent(StructuredLLM(ProductGuidanceProvider()), self.app.state.local_tools).run(
+                AgentRequest(case_id=support_case.id, message="Please investigate this technical issue."),
+            )
+        self.assertEqual(result.resolution_draft.response_source, "BEDROCK_VALIDATED")
+        self.assertEqual(result.resolution_draft.troubleshooting_steps, (
+            "Disconnect the NovaControl Input 1 from the current port.",
+            "Connect the NovaControl Input 1 directly to a different compatible port.",
+            "Restart the host device and report whether the symptom continues.",
+        ))
+        self.assertIn("1. Disconnect the NovaControl Input 1", result.customer_response)
+        self.assertIn("novacontrol-inp-1-guide", {citation.document_id for citation in result.resolution_draft.citations})
+        self.assertFalse(result.actions_executed)
+
+    def test_unapproved_product_step_uses_the_deterministic_fallback(self):
+        order = self.service.create_order(OrderCreate(
+            customer_id=self.customer.id,
+            items=[{"sku": "INP-1", "name": "NovaControl Input 1", "quantity": 1}],
+        ))
+        support_case = self.service.create_case(CaseCreate(
+            customer_id=self.customer.id, order_id=order.id,
+            subject="NovaControl Input 1 stops responding", description="The input device is intermittent.",
+        ))
+
+        class UnsafeStepProvider:
+            def generate(self, request, *, response_schema):
+                prompt = json.loads(request.messages[-1].content)
+                draft = prompt["grounded_resolution_draft"]
+                return LLMResponse(text=json.dumps({"decision": {"kind": "final"}, "grounded_response": {
+                    "issue_type": draft["issue_type"], "recommended_decision": draft["recommended_decision"],
+                    "verified_facts": draft["verified_facts"], "missing_evidence": draft["missing_evidence"],
+                    "policy_passages": prompt["grounded_policy_evidence"]["policy_passages"],
+                    "decision_reason": "Support review needs evidence.",
+                    "customer_facing_response": "1. Open the device casing. No refund, replacement, return, or payment action has been executed.",
+                    "troubleshooting_steps": ["Open the device casing."],
+                }}), finish_reason="stop")
+
+        with authenticated(self.auth, self.token):
+            result = GraphResolutionAgent(StructuredLLM(UnsafeStepProvider()), self.app.state.local_tools).run(
+                AgentRequest(case_id=support_case.id, message="Please investigate this technical issue."),
+            )
+        self.assertEqual(result.resolution_draft.response_source, "DETERMINISTIC_FALLBACK")
+        self.assertEqual(result.resolution_draft.troubleshooting_steps, ())
+        self.assertFalse(result.actions_executed)
+
     def test_mismatched_model_citation_uses_the_safe_deterministic_draft(self):
         support_case = self.case("Delayed order", "The delivery is overdue.")
 

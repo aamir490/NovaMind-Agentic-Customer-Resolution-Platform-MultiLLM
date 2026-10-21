@@ -174,6 +174,7 @@ test('admin draft projection is bounded and never accepts an executed action', a
     missing_evidence: ['trusted shipment tracking status'],
     decision_reason: 'Tracking evidence is required before a delivery conclusion.',
     customer_facing_response: 'We are escalating this request for review.',
+    troubleshooting_steps: [],
     response_source: 'BEDROCK_VALIDATED', citations: [{
       document_id: 'delivery-policy', chunk_id: 'a'.repeat(64), title: 'Delivery policy',
       version: 'v1', source_uri: 'local-knowledge://delivery-policy',
@@ -187,6 +188,7 @@ test('admin draft projection is bounded and never accepts an executed action', a
     issueType: 'delayed_delivery', recommendedDecision: 'ESCALATE',
     verifiedFacts: draft.verified_facts, missingEvidence: draft.missing_evidence,
     decisionReason: draft.decision_reason, customerFacingResponse: draft.customer_facing_response,
+    troubleshootingSteps: [],
     responseSource: draft.response_source, citations: [{ documentId: 'delivery-policy',
       chunkId: 'a'.repeat(64), title: 'Delivery policy', version: 'v1' }],
   });

@@ -316,7 +316,10 @@ class HITLWorkflow:
                 # ProposalService.review is the durable arbitration point. Do
                 # not checkpoint a loser-side error over the reviewer that
                 # atomically recorded the human decision.
-                return ResumeRejected(error="ALREADY_REVIEWED")
+                # This recovered workflow is no longer paused.  Match the
+                # durable resume contract regardless of which writer won the
+                # metadata/proposal race.
+                return ResumeRejected(error="NOT_PAUSED")
             except Exception:
                 # A concurrent reviewer can commit the human decision after
                 # this worker loaded the paused checkpoint.  Read that durable
@@ -328,7 +331,7 @@ class HITLWorkflow:
                     state = HITLState.model_validate(snapshot.values)
                     if state.reviewed_status is not None:
                         self._runs[workflow_id] = "REVIEWED"
-                        return ResumeRejected(error="ALREADY_REVIEWED")
+                        return ResumeRejected(error="NOT_PAUSED")
                 # Never retry a possibly committed review automatically.
                 self._runs[workflow_id] = "FAILED"
                 self._mark_recovery_or_failure(workflow_id)
@@ -448,7 +451,14 @@ class HITLWorkflow:
                     review_id=decision.review_id):
                 return ResumeRejected(error="REVIEW_MISMATCH")
             if proposal.status != ProposalStatus.PENDING_REVIEW:
-                return ResumeRejected(error="ALREADY_REVIEWED")
+                # Recovered durable workflows expose NOT_PAUSED after a
+                # competing reviewer commits, even if the proposal update is
+                # observed just before its metadata transition.
+                return ResumeRejected(
+                    error="NOT_PAUSED"
+                    if self._workflow_metadata is not None
+                    else "ALREADY_REVIEWED"
+                )
             if self._workflow_metadata is not None:
                 try:
                     self._transition_metadata(decision.workflow_id, WorkflowMetadataStatus.RESUMING)

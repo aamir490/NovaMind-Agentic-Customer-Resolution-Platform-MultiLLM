@@ -75,6 +75,7 @@ class ResolutionDraft(Record):
     missing_evidence: tuple[str, ...] = Field(min_length=1, max_length=6)
     decision_reason: str = Field(min_length=1, max_length=1200)
     customer_facing_response: str = Field(min_length=1, max_length=1200)
+    troubleshooting_steps: tuple[str, ...] = Field(default=(), max_length=5)
     response_source: ResponseSource = ResponseSource.DETERMINISTIC_FALLBACK
     citations: tuple[ResolutionCitation, ...] = Field(default=(), max_length=5)
     actions_executed: Literal[False] = False
